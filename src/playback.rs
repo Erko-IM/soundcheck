@@ -5,10 +5,8 @@
 //! feeder sleeps until it is told something, so a paused player costs
 //! nothing.
 
-use std::cell::Cell;
-use std::collections::VecDeque;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::cell::{Cell, RefCell};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
@@ -19,8 +17,7 @@ use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
 
-use crate::audio::{Coded, Source};
-use crate::wav::SampleKind;
+use crate::audio::{Info, Reader, Source};
 
 /// Speed multipliers offered. Pitch moves with speed, as on tape.
 pub const SPEEDS: [u32; 4] = [1, 2, 4, 8];
@@ -39,6 +36,9 @@ struct Shared {
     position: AtomicU64,
     /// `FINISHED` with the seek number, once that seek has played to the end.
     finished: AtomicU32,
+    /// Linear gain as `f32` bits, applied on the way out so a change is
+    /// heard at once rather than after the second of audio already queued.
+    gain: AtomicU32,
     failure: Mutex<Option<String>>,
 }
 
@@ -70,14 +70,31 @@ struct Playhead {
     position: f64,
     /// Source frames per output frame.
     step: f64,
+    /// The frames being repeated: `position` wraps where the rendered audio
+    /// did.
+    looping: Option<Range<f64>>,
+}
+
+impl Playhead {
+    fn advance(&mut self) {
+        self.position += self.step;
+        if let Some(r) = &self.looping
+            && self.position >= r.end
+        {
+            self.position -= r.end - r.start;
+        }
+    }
+}
+
+struct Restart {
+    frame: usize,
+    speed: u32,
+    seek: u16,
+    looping: Option<Range<usize>>,
 }
 
 enum Command {
-    Restart {
-        frame: usize,
-        speed: u32,
-        seek: u16,
-    },
+    Restart(Restart),
     /// Playback resumed, so the ring needs topping up again.
     Wake,
     Quit,
@@ -90,6 +107,7 @@ pub struct Player {
     stream: cpal::Stream,
     frames: usize,
     speed: Cell<u32>,
+    looping: RefCell<Option<Range<usize>>>,
     /// Seeks sent so far, and where the last one went: until the feeder has
     /// acted on it, playback is wherever it was last sent.
     seeks: Cell<u16>,
@@ -97,13 +115,9 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn new(
-        source: &Source,
-        sample_rate: u32,
-        frames: usize,
-        start: usize,
-        speed: u32,
-    ) -> Result<Self, String> {
+    pub fn new(source: &Source, info: &Info, start: usize, speed: u32) -> Result<Self, String> {
+        let (sample_rate, frames) = (info.sample_rate, info.frames);
+        let channels = usize::from(info.channels);
         let device = cpal::default_host()
             .default_output_device()
             .ok_or("no audio output device")?;
@@ -118,6 +132,7 @@ impl Player {
             playing: AtomicBool::new(false),
             position: AtomicU64::new(pack(0, start as f64)),
             finished: AtomicU32::new(0),
+            gain: AtomicU32::new(1.0f32.to_bits()),
             failure: Mutex::new(None),
         });
         // A second of stereo.
@@ -127,6 +142,7 @@ impl Player {
             seek: 0,
             position: start as f64,
             step: step(sample_rate, speed, device_rate),
+            looping: None,
         }));
         let stream = match format {
             SampleFormat::F32 => build::<f32>(&device, config, &playhead, &shared),
@@ -140,9 +156,14 @@ impl Player {
         let feeder = std::thread::spawn({
             let (shared, source) = (Arc::clone(&shared), source.clone());
             move || {
-                // Opened here rather than on the UI thread: finding a place
-                // in a long compressed file can take a moment.
-                let renderer = open(&source, frames).and_then(|input| {
+                // Opened here rather than on the UI thread, which a slow
+                // disk would stall.
+                let renderer = Reader::open(&source, channels).and_then(|reader| {
+                    let input = Box::new(Stereo {
+                        reader,
+                        channels,
+                        scratch: Vec::new(),
+                    });
                     Renderer::new(input, frames, sample_rate, device_rate, speed, start)
                 });
                 match renderer {
@@ -158,6 +179,7 @@ impl Player {
             stream,
             frames,
             speed: Cell::new(speed),
+            looping: RefCell::new(None),
             seeks: Cell::new(0),
             target: Cell::new(start),
         })
@@ -220,14 +242,40 @@ impl Player {
         self.restart(self.position(), speed);
     }
 
+    /// Output gain in dB, applied to what is already queued too.
+    pub fn set_gain(&self, db: f32) {
+        let gain = 10f32.powf(db / 20.0);
+        self.shared.gain.store(gain.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Repeats `range` from its start, or stops repeating where playback
+    /// now is.
+    pub fn set_loop(&self, range: Option<Range<usize>>) {
+        let range = range
+            .map(|r| r.start.min(self.frames)..r.end.min(self.frames))
+            .filter(|r| !r.is_empty());
+        let from = range.as_ref().map_or_else(|| self.position(), |r| r.start);
+        self.looping.replace(range);
+        self.seek(from);
+    }
+
     fn restart(&self, frame: usize, speed: u32) {
         let seek = self.seeks.get().wrapping_add(1);
-        let frame = frame.min(self.frames);
+        let looping = self.looping.borrow().clone();
+        let frame = match &looping {
+            Some(r) if frame >= r.end => r.start,
+            _ => frame.min(self.frames),
+        };
         self.seeks.set(seek);
         self.target.set(frame);
         // The feeder only stops on `Quit`, which only `Drop` sends, so this
         // always reaches it.
-        let _ = self.commands.send(Command::Restart { frame, speed, seek });
+        let _ = self.commands.send(Command::Restart(Restart {
+            frame,
+            speed,
+            seek,
+            looping,
+        }));
     }
 }
 
@@ -268,22 +316,18 @@ where
                     out.fill(T::EQUILIBRIUM);
                     return;
                 };
-                let Playhead {
-                    ring,
-                    seek,
-                    position,
-                    step,
-                } = &mut *head;
+                let gain = f32::from_bits(state.gain.load(Ordering::Relaxed));
+                let level = |s: f32| (s * gain).clamp(-1.0, 1.0);
                 for frame in out.chunks_mut(channels) {
                     // Blocks go in whole, so two queued samples are always a
                     // left and its right.
-                    if ring.slots() < 2 {
+                    if head.ring.slots() < 2 {
                         frame.fill(T::EQUILIBRIUM);
                         continue;
                     }
-                    let left = ring.pop().unwrap_or(0.0);
-                    let right = ring.pop().unwrap_or(0.0);
-                    *position += *step;
+                    let left = level(head.ring.pop().unwrap_or(0.0));
+                    let right = level(head.ring.pop().unwrap_or(0.0));
+                    head.advance();
                     match frame {
                         [mono] => *mono = T::from_sample(0.5 * (left + right)),
                         [l, r, rest @ ..] => {
@@ -296,7 +340,7 @@ where
                 }
                 state
                     .position
-                    .store(pack(*seek, *position), Ordering::Release);
+                    .store(pack(head.seek, head.position), Ordering::Release);
             },
             move |e: cpal::Error| {
                 // Glitches, and the system moving sound to other speakers or
@@ -330,13 +374,20 @@ fn feed(
         let mut restart = None;
         for command in waiting.take().into_iter().chain(inbox.try_iter()) {
             match command {
-                Command::Restart { frame, speed, seek } => restart = Some((frame, speed, seek)),
+                Command::Restart(r) => restart = Some(r),
                 Command::Wake => {}
                 Command::Quit => return,
             }
         }
-        if let Some((frame, speed, number)) = restart {
-            if let Err(e) = renderer.restart(frame, speed) {
+        if let Some(Restart {
+            frame,
+            speed,
+            seek: number,
+            looping,
+        }) = restart
+        {
+            let wrap = looping.as_ref().map(|r| r.start as f64..r.end as f64);
+            if let Err(e) = renderer.restart(frame, speed, looping) {
                 shared.fail(e);
                 return;
             }
@@ -348,6 +399,7 @@ fn feed(
             head.seek = number;
             head.position = frame as f64;
             head.step = renderer.step();
+            head.looping = wrap;
             shared
                 .position
                 .store(pack(number, frame as f64), Ordering::Release);
@@ -407,6 +459,9 @@ struct Renderer {
     /// Output frames still to drop after a (re)start: the resampler's delay,
     /// which would otherwise play as a gap and put the playhead late.
     skip: usize,
+    /// Frames played over and over: reading wraps from the end to the start
+    /// and never finishes.
+    looping: Option<Range<usize>>,
     block: Vec<[f32; 2]>,
     output: Vec<f32>,
 }
@@ -438,6 +493,7 @@ impl Renderer {
             speed,
             next: start,
             heard: start as f64,
+            looping: None,
             block: Vec::new(),
         })
     }
@@ -451,7 +507,12 @@ impl Renderer {
         self.output.len()
     }
 
-    fn restart(&mut self, frame: usize, speed: u32) -> Result<(), String> {
+    fn restart(
+        &mut self,
+        frame: usize,
+        speed: u32,
+        looping: Option<Range<usize>>,
+    ) -> Result<(), String> {
         if speed != self.speed {
             self.resampler = resampler(self.sample_rate, self.device_rate, speed)?;
             self.output
@@ -462,23 +523,41 @@ impl Renderer {
         self.skip = self.resampler.output_delay();
         self.next = frame;
         self.heard = frame as f64;
+        self.looping = looping;
         Ok(())
     }
 
     /// The next block of interleaved stereo, or `None` once all of the
     /// source has been played.
     fn render(&mut self) -> Result<Option<&[f32]>, String> {
-        if self.heard >= self.frames as f64 {
+        if self.looping.is_none() && self.heard >= self.frames as f64 {
             return Ok(None);
         }
         let count = self.resampler.input_frames_next();
         self.block.clear();
         self.block.resize(count, [0.0; 2]);
-        let available = self.frames.saturating_sub(self.next).min(count);
-        if available > 0 {
-            self.input.read(self.next, &mut self.block[..available])?;
+        match self.looping.clone() {
+            None => {
+                let available = self.frames.saturating_sub(self.next).min(count);
+                if available > 0 {
+                    self.input.read(self.next, &mut self.block[..available])?;
+                }
+                self.next += count;
+            }
+            Some(range) => {
+                let mut filled = 0;
+                while filled < count {
+                    if self.next >= range.end {
+                        self.next = range.start;
+                    }
+                    let n = (range.end - self.next).min(count - filled);
+                    self.input
+                        .read(self.next, &mut self.block[filled..filled + n])?;
+                    filled += n;
+                    self.next += n;
+                }
+            }
         }
-        self.next += count;
         let input = InterleavedSlice::new(self.block.as_flattened(), 2, count)
             .map_err(|e| e.to_string())?;
         let capacity = self.output.len() / 2;
@@ -490,114 +569,43 @@ impl Renderer {
             .map_err(|e| e.to_string())?;
         let dropped = produced.min(self.skip);
         self.skip -= dropped;
-        // Up to the last source frame and no further, so playback ends when
-        // the recording does.
-        let remaining = ((self.frames as f64 - self.heard) / self.step()).ceil() as usize;
-        let kept = (produced - dropped).min(remaining);
+        let kept = if self.looping.is_some() {
+            produced - dropped
+        } else {
+            // Up to the last source frame and no further, so playback ends
+            // when the recording does.
+            let remaining = ((self.frames as f64 - self.heard) / self.step()).ceil() as usize;
+            (produced - dropped).min(remaining)
+        };
         self.heard += kept as f64 * self.step();
         Ok(Some(&self.output[2 * dropped..2 * (dropped + kept)]))
     }
 }
 
-/// Stereo frames of a file by position: mono is doubled, and channels past
-/// the second are left out.
+/// Stereo frames of a file by position.
 trait Frames {
     /// Fills `out` with the frames from `first` on. Never asked for frames
     /// past the end.
     fn read(&mut self, first: usize, out: &mut [[f32; 2]]) -> Result<(), String>;
 }
 
-fn open(source: &Source, frames: usize) -> Result<Box<dyn Frames>, String> {
-    Ok(match source {
-        Source::Pcm {
-            path,
-            data,
-            kind,
-            channels,
-        } => Box::new(Pcm {
-            file: File::open(path).map_err(|e| format!("cannot open for playback: {e}"))?,
-            data_start: data.start,
-            kind: *kind,
-            channels: *channels,
-            bytes: Vec::new(),
-        }),
-        Source::Coded(path) => Box::new(Decoded {
-            coded: Coded::open(path)?,
-            queue: VecDeque::new(),
-            from: 0,
-            frames,
-        }),
-    })
-}
-
-struct Pcm {
-    file: File,
-    data_start: u64,
-    kind: SampleKind,
+/// The first two channels of a file: mono is doubled, and channels past
+/// the second are left out.
+struct Stereo {
+    reader: Reader,
     channels: usize,
-    bytes: Vec<u8>,
+    scratch: Vec<f32>,
 }
 
-impl Frames for Pcm {
+impl Frames for Stereo {
     fn read(&mut self, first: usize, out: &mut [[f32; 2]]) -> Result<(), String> {
-        let width = self.kind.bytes();
-        let frame_bytes = width * self.channels;
-        self.bytes.resize(out.len() * frame_bytes, 0);
-        self.file
-            .seek(SeekFrom::Start(
-                self.data_start + (first * frame_bytes) as u64,
-            ))
-            .and_then(|_| self.file.read_exact(&mut self.bytes))
-            .map_err(|e| format!("playback read failed: {e}"))?;
-        let right = if self.channels > 1 { width } else { 0 };
-        for (pair, frame) in out.iter_mut().zip(self.bytes.chunks_exact(frame_bytes)) {
-            *pair = [
-                self.kind.decode(&frame[..width]),
-                self.kind.decode(&frame[right..right + width]),
-            ];
+        let ch = self.channels;
+        self.scratch.resize(out.len() * ch, 0.0);
+        self.reader.read(first, &mut self.scratch)?;
+        let right = usize::from(ch > 1);
+        for (pair, frame) in out.iter_mut().zip(self.scratch.chunks_exact(ch)) {
+            *pair = [frame[0], frame[right]];
         }
-        Ok(())
-    }
-}
-
-/// A compressed file, decoded ahead of the reads by up to a packet.
-struct Decoded {
-    coded: Coded,
-    queue: VecDeque<[f32; 2]>,
-    /// Frame of the file at the front of `queue`.
-    from: usize,
-    frames: usize,
-}
-
-impl Frames for Decoded {
-    fn read(&mut self, first: usize, out: &mut [[f32; 2]]) -> Result<(), String> {
-        if first != self.from {
-            self.coded.seek(first)?;
-            self.queue.clear();
-            self.from = first;
-        }
-        while self.queue.len() < out.len() {
-            let Some(block) = self.coded.next()? else {
-                break;
-            };
-            let end = self.from + self.queue.len();
-            let frames = block.samples.chunks_exact(block.channels);
-            // After a seek the first packet usually starts before `first`.
-            let skip = end.saturating_sub(block.at);
-            let silence = block
-                .at
-                .saturating_sub(end)
-                .min(self.frames.saturating_sub(end));
-            self.queue.extend(std::iter::repeat_n([0.0; 2], silence));
-            let right = usize::from(block.channels > 1);
-            self.queue
-                .extend(frames.skip(skip).map(|frame| [frame[0], frame[right]]));
-        }
-        let ready = out.len().min(self.queue.len());
-        for (slot, frame) in out.iter_mut().zip(self.queue.drain(..ready)) {
-            *slot = frame;
-        }
-        self.from = first + out.len();
         Ok(())
     }
 }
@@ -605,8 +613,7 @@ impl Frames for Decoded {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::tests::{aiff, temp_file};
-    use crate::spectrogram::spectrum_at;
+    use crate::spectrogram::spectrum_around;
     use crate::wav;
 
     fn tone(frequency: f64, rate: u32, seconds: f64) -> Vec<f32> {
@@ -627,13 +634,18 @@ mod tests {
         }
     }
 
-    /// Everything the renderer produces, left channel only.
-    fn render_left(samples: Vec<f32>, rate: u32, device: u32, speed: u32) -> Vec<f32> {
+    fn renderer(samples: Vec<f32>, rate: u32, device: u32, speed: u32) -> Renderer {
         let frames = samples.len();
-        let mut renderer =
-            Renderer::new(Box::new(Memory(samples)), frames, rate, device, speed, 0).unwrap();
+        Renderer::new(Box::new(Memory(samples)), frames, rate, device, speed, 0).unwrap()
+    }
+
+    /// Up to `limit` frames of what the renderer produces, left channel
+    /// only.
+    fn render_left(mut renderer: Renderer, limit: usize) -> Vec<f32> {
         let mut left = Vec::new();
-        while let Some(block) = renderer.render().unwrap() {
+        while left.len() < limit
+            && let Some(block) = renderer.render().unwrap()
+        {
             left.extend(block.as_chunks::<2>().0.iter().map(|pair| pair[0]));
         }
         left
@@ -641,7 +653,7 @@ mod tests {
 
     fn peak(signal: &[f32], rate: u32) -> (f32, f32) {
         let fft = 8192;
-        let s = spectrum_at(signal, signal.len() / 2, fft);
+        let s = spectrum_around(signal, signal.len() / 2, fft);
         let (bin, level) = s
             .iter()
             .copied()
@@ -660,7 +672,7 @@ mod tests {
     fn speed_multiplies_pitch_and_shortens_the_file() {
         let samples = tone(1_000.0, 48_000, 2.0);
         let frames = samples.len();
-        let out = render_left(samples, 48_000, 48_000, 2);
+        let out = render_left(renderer(samples, 48_000, 48_000, 2), usize::MAX);
         let (hz, _) = peak(&out, 48_000);
         assert!((hz - 2_000.0).abs() < 12.0, "peak at {hz} Hz");
         assert!(
@@ -674,7 +686,7 @@ mod tests {
     fn playback_ends_exactly_where_the_recording_does() {
         let mut samples = vec![0.0; 48_000];
         samples[47_900..].fill(0.5);
-        let out = render_left(samples, 48_000, 44_100, 1);
+        let out = render_left(renderer(samples, 48_000, 44_100, 1), usize::MAX);
         assert!(out.len().abs_diff(44_100) <= 1, "{} frames", out.len());
         let last = &out[out.len() - 50..];
         assert!(
@@ -684,8 +696,42 @@ mod tests {
     }
 
     #[test]
+    fn a_loop_repeats_its_range_and_never_ends() {
+        // Silence, then a steady level: a loop over the second half never
+        // plays the first, however long it runs.
+        let mut samples = vec![0.0; 48_000];
+        samples[24_000..].fill(0.5);
+        let mut looped = renderer(samples, 48_000, 44_100, 1);
+        looped.restart(30_000, 1, Some(24_000..48_000)).unwrap();
+        let out = render_left(looped, 200_000);
+        assert!(out.len() >= 200_000, "stopped after {} frames", out.len());
+        let settled = &out[1_000..];
+        assert!(
+            settled.iter().all(|s| (s - 0.5).abs() < 0.05),
+            "the loop left its range"
+        );
+    }
+
+    #[test]
+    fn the_playhead_wraps_where_the_loop_does() {
+        let (_, ring) = rtrb::RingBuffer::new(2);
+        let mut head = Playhead {
+            ring,
+            seek: 0,
+            position: 2_999.5,
+            step: 1.0,
+            looping: Some(1_000.0..3_000.0),
+        };
+        head.advance();
+        assert_eq!(head.position, 1_000.5);
+    }
+
+    #[test]
     fn ultrasound_is_filtered_rather_than_folded_into_the_audible_band() {
-        let out = render_left(tone(100_000.0, 384_000, 1.0), 384_000, 48_000, 1);
+        let out = render_left(
+            renderer(tone(100_000.0, 384_000, 1.0), 384_000, 48_000, 1),
+            usize::MAX,
+        );
         assert!(middle_rms(&out) < 1e-3, "rms {}", middle_rms(&out));
     }
 
@@ -694,7 +740,10 @@ mod tests {
         // Exactly on a bin of the measuring FFT, so window scalloping cannot
         // stand in for passband loss.
         let frequency = 1707.0 * 48_000.0 / 8192.0;
-        let out = render_left(tone(frequency, 384_000, 1.0), 384_000, 48_000, 1);
+        let out = render_left(
+            renderer(tone(frequency, 384_000, 1.0), 384_000, 48_000, 1),
+            usize::MAX,
+        );
         let (hz, level) = peak(&out, 48_000);
         assert!((f64::from(hz) - frequency).abs() < 1.0, "peak at {hz} Hz");
         assert!(level > -0.5, "level {level} dBFS");
@@ -702,48 +751,45 @@ mod tests {
 
     #[test]
     fn eight_times_a_384k_file_still_resamples_cleanly() {
-        let out = render_left(tone(2_000.0, 384_000, 1.0), 384_000, 48_000, 8);
+        let out = render_left(
+            renderer(tone(2_000.0, 384_000, 1.0), 384_000, 48_000, 8),
+            usize::MAX,
+        );
         let (hz, _) = peak(&out, 48_000);
         assert!((hz - 16_000.0).abs() < 12.0, "peak at {hz} Hz");
     }
 
-    #[test]
-    fn pcm_is_read_from_disk_as_doubled_mono() {
-        let file = wav::tests::build(false, &[], &[0, 16_384, -16_384, 8_192]);
-        let path = temp_file("pcm.wav", &file);
-        let w = wav::parse(&mut std::io::Cursor::new(&file)).unwrap();
+    fn stereo_of(file: &[u8], channels: u16) -> (Stereo, std::path::PathBuf) {
+        let path = crate::audio::tests::temp_file(&format!("stereo-{channels}.wav"), file);
+        let w = wav::parse(&mut std::io::Cursor::new(file)).unwrap();
         let source = Source::Pcm {
             path: path.clone(),
             data: w.data.clone(),
             kind: w.kind,
-            channels: 1,
         };
-        let mut input = open(&source, w.frames()).unwrap();
-        let mut out = [[0.0; 2]; 3];
-        input.read(1, &mut out).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(out, [[0.5, 0.5], [-0.5, -0.5], [0.25, 0.25]]);
+        let reader = Reader::open(&source, usize::from(channels)).unwrap();
+        let stereo = Stereo {
+            reader,
+            channels: usize::from(channels),
+            scratch: Vec::new(),
+        };
+        (stereo, path)
     }
 
     #[test]
-    fn compressed_files_play_from_any_position() {
-        let samples: Vec<i16> = (0..30_000).map(|i| (i % 20_000) as i16).collect();
-        let path = temp_file("seek.aiff", &aiff(&samples, 48_000));
-        let source = Source::Coded(path.clone());
-        let mut input = open(&source, samples.len()).unwrap();
-        let expect = |frame: usize| f32::from(samples[frame]) / 32_768.0;
-
-        let mut out = [[0.0; 2]; 700];
-        input.read(0, &mut out).unwrap();
-        assert_eq!(out[699], [expect(699); 2]);
-        input.read(700, &mut out).unwrap();
-        assert_eq!(out[0], [expect(700); 2]);
-        input.read(21_234, &mut out).unwrap();
-        assert_eq!(out[0], [expect(21_234); 2]);
-        assert_eq!(out[699], [expect(21_933); 2]);
-        input.read(5, &mut out[..10]).unwrap();
-        assert_eq!(out[0], [expect(5); 2]);
+    fn mono_is_doubled_and_channels_past_two_are_left_out() {
+        let (mut mono, path) = stereo_of(&wav::tests::build(false, &[], &[0, 16_384, -16_384]), 1);
+        let mut out = [[0.0; 2]; 2];
+        mono.read(1, &mut out).unwrap();
         std::fs::remove_file(&path).unwrap();
+        assert_eq!(out, [[0.5, 0.5], [-0.5, -0.5]]);
+
+        let samples = [8_192, -8_192, 16_384, 0, 16_384, -16_384, 1, 2, 3];
+        let file = wav::tests::build_channels(false, 3, &[], &samples);
+        let (mut three, path) = stereo_of(&file, 3);
+        three.read(1, &mut out).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(out[0], [0.0, 0.5]);
     }
 
     #[test]

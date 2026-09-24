@@ -1,0 +1,785 @@
+//! Drawing for each view: axes and lanes, the waveform, the timeline, the
+//! meters, the spectrum and the metadata.
+
+use std::ops::Range;
+
+use eframe::egui::{
+    self, Align, Align2, Color32, FontId, Label, Layout, Painter, Pos2, Rect, RichText, Sense,
+    Shape, Stroke, StrokeKind, TextureId, Ui, Vec2,
+};
+
+use crate::levels::{FLOOR_DB, Level};
+use crate::meta::Details;
+
+pub const CURSOR: Color32 = Color32::from_rgb(235, 70, 60);
+pub const AXIS: Color32 = Color32::from_gray(150);
+const GRID: Color32 = Color32::from_gray(48);
+const ELAPSED: Color32 = Color32::from_gray(220);
+const WALL_CLOCK: Color32 = Color32::from_gray(115);
+const SELECTION: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 51);
+const SELECTION_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 178);
+const VIEWPORT: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 64);
+const VIEWPORT_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 153);
+const TIMELINE_BACK: Color32 = Color32::from_gray(17);
+const TIMELINE_WAVE: Color32 = Color32::from_gray(85);
+const METER_BACK: Color32 = Color32::from_gray(28);
+const METER_LOW: Color32 = Color32::from_rgb(70, 190, 110);
+const METER_MID: Color32 = Color32::from_rgb(235, 160, 50);
+const METER_HIGH: Color32 = Color32::from_rgb(230, 60, 50);
+
+/// One colour per channel, repeating past eight.
+pub const PALETTE: [Color32; 8] = [
+    Color32::from_rgb(120, 175, 220),
+    Color32::from_rgb(235, 160, 80),
+    Color32::from_rgb(130, 200, 120),
+    Color32::from_rgb(220, 110, 160),
+    Color32::from_rgb(190, 160, 230),
+    Color32::from_rgb(230, 210, 100),
+    Color32::from_rgb(100, 200, 200),
+    Color32::from_rgb(200, 130, 110),
+];
+
+/// Frames spread across a strip of the screen.
+#[derive(Clone, Copy)]
+pub struct Span {
+    pub left: f32,
+    pub width: f32,
+    pub start: f64,
+    pub len: f64,
+}
+
+impl Span {
+    pub fn new(rect: Rect, view: &Range<f64>) -> Self {
+        Self {
+            left: rect.left(),
+            width: rect.width().max(1.0),
+            start: view.start,
+            len: (view.end - view.start).max(1.0),
+        }
+    }
+
+    pub fn x(self, frame: f64) -> f32 {
+        self.left + ((frame - self.start) / self.len) as f32 * self.width
+    }
+
+    /// The frame at `x`, anywhere along the line through the strip.
+    fn at(self, x: f32) -> f64 {
+        self.start + f64::from((x - self.left) / self.width) * self.len
+    }
+
+    /// The frame under `x`, held to the strip.
+    pub fn frame(self, x: f32) -> f64 {
+        self.at(x.clamp(self.left, self.left + self.width))
+    }
+}
+
+/// `rect` cut into `count` lanes, one above the other.
+pub fn lanes(rect: Rect, count: usize) -> Vec<Rect> {
+    let count = count.max(1);
+    let gap = if count > 1 { 4.0 } else { 0.0 };
+    let height = (rect.height() - gap * (count - 1) as f32) / count as f32;
+    (0..count)
+        .map(|i| {
+            let top = rect.top() + i as f32 * (height + gap);
+            Rect::from_x_y_ranges(rect.x_range(), top..=top + height)
+        })
+        .collect()
+}
+
+pub fn lane_label(painter: &Painter, lane: Rect, text: &str) {
+    let galley =
+        painter.layout_no_wrap(text.to_owned(), FontId::proportional(12.0), Color32::WHITE);
+    let back = Rect::from_min_size(
+        lane.min + Vec2::new(4.0, 4.0),
+        galley.size() + Vec2::new(8.0, 4.0),
+    );
+    painter.rect_filled(back, 3.0, Color32::from_black_alpha(150));
+    painter.galley(back.min + Vec2::new(4.0, 2.0), galley, Color32::WHITE);
+}
+
+/// Draws the part of `texture`, which shows the frames in `range`, that
+/// falls inside `lane`.
+pub fn place(painter: &Painter, lane: Rect, span: Span, texture: TextureId, range: &Range<usize>) {
+    let (x0, x1) = (span.x(range.start as f64), span.x(range.end as f64));
+    let (left, right) = (x0.max(lane.left()), x1.min(lane.right()));
+    if right <= left {
+        return;
+    }
+    let u = |x: f32| (x - x0) / (x1 - x0);
+    let uv = Rect::from_min_max(Pos2::new(u(left), 0.0), Pos2::new(u(right), 1.0));
+    let rect = Rect::from_x_y_ranges(left..=right, lane.y_range());
+    painter.image(texture, rect, uv, Color32::WHITE);
+}
+
+pub fn selection(painter: &Painter, plot: Rect, span: Span, range: &Range<f64>) {
+    let (x0, x1) = (span.x(range.start), span.x(range.end));
+    let (left, right) = (x0.max(plot.left()), x1.min(plot.right()));
+    if right <= left {
+        return;
+    }
+    painter.rect_filled(
+        Rect::from_x_y_ranges(left..=right, plot.y_range()),
+        0.0,
+        SELECTION,
+    );
+    for x in [x0, x1] {
+        if (plot.left()..=plot.right()).contains(&x) {
+            painter.vline(x, plot.y_range(), Stroke::new(1.0, SELECTION_EDGE));
+        }
+    }
+}
+
+pub fn cursor(painter: &Painter, plot: Rect, span: Span, frame: f64) {
+    let x = span.x(frame);
+    if (plot.left()..=plot.right()).contains(&x) {
+        painter.vline(x, plot.y_range(), Stroke::new(1.5, CURSOR));
+    }
+}
+
+/// Elapsed time under `plot`, and under that the time of day when the
+/// recording says when it started.
+pub fn time_axis(painter: &Painter, plot: Rect, span: Span, rate: f64, wall_start: Option<f64>) {
+    let step = time_step(span.len / rate, plot.width());
+    let decimals = decimals(step);
+    let first = (span.start / rate / step).ceil() as i64;
+    let last = ((span.start + span.len) / rate / step).floor() as i64;
+    for i in first..=last {
+        let t = i as f64 * step;
+        let x = span.x(t * rate);
+        painter.vline(
+            x,
+            plot.bottom()..=plot.bottom() + 5.0,
+            Stroke::new(1.0, AXIS),
+        );
+        painter.text(
+            Pos2::new(x, plot.bottom() + 7.0),
+            Align2::CENTER_TOP,
+            clock_with(t, decimals),
+            FontId::monospace(13.0),
+            ELAPSED,
+        );
+        if let Some(start) = wall_start {
+            painter.text(
+                Pos2::new(x, plot.bottom() + 25.0),
+                Align2::CENTER_TOP,
+                wall_with(start + t, decimals),
+                FontId::monospace(10.0),
+                WALL_CLOCK,
+            );
+        }
+    }
+}
+
+pub fn freq_axis(painter: &Painter, lane: Rect, lo: f32, hi: f32, log: bool) {
+    for f in freq_ticks(lo, hi, log, lane.height(), 16.0) {
+        let y = lane.bottom() - freq_t(f, lo, hi, log) * lane.height();
+        painter.hline(lane.left() - 5.0..=lane.left(), y, Stroke::new(1.0, AXIS));
+        painter.text(
+            Pos2::new(lane.left() - 8.0, y),
+            Align2::RIGHT_CENTER,
+            hz(f),
+            FontId::monospace(11.0),
+            AXIS,
+        );
+    }
+}
+
+/// Where `f` sits between `lo` (0) and `hi` (1).
+pub fn freq_t(f: f32, lo: f32, hi: f32, log: bool) -> f32 {
+    if log {
+        (f / lo).ln() / (hi / lo).ln()
+    } else {
+        (f - lo) / (hi - lo)
+    }
+}
+
+pub fn freq_at(t: f32, lo: f32, hi: f32, log: bool) -> f32 {
+    if log {
+        lo * (hi / lo).powf(t)
+    } else {
+        lo + (hi - lo) * t
+    }
+}
+
+/// One channel's lowest and highest sample per column of `range`, drawn as
+/// a band per point across `lane`, with full scale at its edges.
+pub fn waveform(
+    painter: &Painter,
+    lane: Rect,
+    span: Span,
+    envelope: &[[f32; 2]],
+    range: &Range<usize>,
+    color: Color32,
+) {
+    let columns = envelope.len();
+    if columns == 0 || range.is_empty() {
+        return;
+    }
+    let per_column = range.len() as f64 / columns as f64;
+    let (mid, half) = (lane.center().y, lane.height() / 2.0 - 1.0);
+    let right = span.x(range.end as f64).min(lane.right());
+    let mut x = span.x(range.start as f64).max(lane.left()).floor();
+    let mut shapes = Vec::new();
+    while x < right {
+        let from = (span.at(x) - range.start as f64) / per_column;
+        let to = (span.at(x + 1.0) - range.start as f64) / per_column;
+        let first = from.floor().max(0.0) as usize;
+        if first >= columns {
+            break;
+        }
+        let last = (to.ceil() as usize).clamp(first + 1, columns);
+        let (lo, hi) = envelope[first..last]
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(l, h), e| (l.min(e[0]), h.max(e[1])));
+        let top = mid - hi.clamp(-1.0, 1.0) * half;
+        let bottom = (mid - lo.clamp(-1.0, 1.0) * half).max(top + 1.0);
+        shapes.push(Shape::line_segment(
+            [Pos2::new(x + 0.5, top), Pos2::new(x + 0.5, bottom)],
+            Stroke::new(1.0, color),
+        ));
+        x += 1.0;
+    }
+    painter.extend(shapes);
+}
+
+pub fn centre_line(painter: &Painter, lane: Rect) {
+    painter.hline(lane.x_range(), lane.center().y, Stroke::new(1.0, GRID));
+}
+
+/// The whole file, as in the original's minimap: the loudest channel
+/// mirrored about the middle, the part in view, and the playhead.
+pub fn timeline(
+    painter: &Painter,
+    rect: Rect,
+    overview: &[Vec<[f32; 2]>],
+    frames: usize,
+    view: &Range<f64>,
+    playhead: Option<usize>,
+) {
+    painter.rect_filled(rect, 0.0, TIMELINE_BACK);
+    let columns = overview.first().map_or(0, Vec::len);
+    if columns == 0 || frames == 0 {
+        return;
+    }
+    let (mid, half) = (rect.center().y, rect.height() / 2.0);
+    let pixels = rect.width().ceil().max(1.0) as usize;
+    let mut shapes = Vec::with_capacity(pixels);
+    for p in 0..pixels {
+        let first = (p * columns / pixels).min(columns - 1);
+        let last = ((p + 1) * columns)
+            .div_ceil(pixels)
+            .clamp(first + 1, columns);
+        let amplitude = overview
+            .iter()
+            .flat_map(|channel| &channel[first..last])
+            .fold(0.0f32, |a, e| a.max(e[0].abs()).max(e[1].abs()))
+            .min(1.0);
+        let x = rect.left() + p as f32;
+        shapes.push(Shape::rect_filled(
+            Rect::from_x_y_ranges(x..=x + 1.0, mid - amplitude * half..=mid + amplitude * half),
+            0.0,
+            TIMELINE_WAVE,
+        ));
+    }
+    painter.extend(shapes);
+    let x_of = |frame: f64| rect.left() + (frame / frames as f64) as f32 * rect.width();
+    let shown = Rect::from_x_y_ranges(x_of(view.start)..=x_of(view.end), rect.y_range());
+    painter.rect_filled(shown, 0.0, VIEWPORT);
+    painter.rect_stroke(
+        shown,
+        0.0,
+        Stroke::new(1.0, VIEWPORT_EDGE),
+        StrokeKind::Inside,
+    );
+    if let Some(frame) = playhead {
+        painter.vline(x_of(frame as f64), rect.y_range(), Stroke::new(1.0, CURSOR));
+    }
+}
+
+const METER_FLOOR: f32 = -60.0;
+const METER_SCALE: [f32; 8] = [-60.0, -48.0, -36.0, -24.0, -12.0, -6.0, -3.0, 0.0];
+/// How long the highest peak stays put before it falls, and how fast.
+const HOLD_SECONDS: f64 = 1.5;
+const DECAY_DB_PER_SECOND: f32 = 15.0;
+/// Numbers change this often at most, so they can be read.
+const NUMBERS_EVERY: f64 = 0.15;
+const METER_ROW: f32 = 12.0;
+const METER_GAP: f32 = 4.0;
+const METER_LABEL: f32 = 22.0;
+const METER_NUMBERS: f32 = 116.0;
+
+/// Per-channel level bars on the original's -60 to 0 dBFS scale: the peak
+/// as a bar, the highest recent peak held as a line, and RMS and held peak
+/// as numbers.
+#[derive(Default)]
+pub struct Meters {
+    held: Vec<(f32, f64)>,
+    numbers: Vec<String>,
+    numbers_at: f64,
+    last: f64,
+}
+
+fn meter_t(db: f32) -> f32 {
+    ((db - METER_FLOOR) / -METER_FLOOR).clamp(0.0, 1.0)
+}
+
+fn level_text(db: f32) -> String {
+    if db <= FLOOR_DB {
+        "-∞".to_owned()
+    } else {
+        format!("{db:.1}")
+    }
+}
+
+impl Meters {
+    /// `levels` is `None` while nothing plays, which empties the meters.
+    pub fn ui(&mut self, ui: &mut Ui, levels: Option<&[Level]>, labels: &[String]) {
+        let channels = labels.len();
+        let now = ui.input(|i| i.time);
+        let dt = (now - self.last).max(0.0) as f32;
+        self.last = now;
+        if self.held.len() != channels || levels.is_none() {
+            self.held = vec![(FLOOR_DB, now); channels];
+        }
+        if let Some(levels) = levels {
+            for (held, level) in self.held.iter_mut().zip(levels) {
+                if level.peak_db >= held.0 {
+                    *held = (level.peak_db, now);
+                } else if now - held.1 > HOLD_SECONDS {
+                    held.0 = (held.0 - DECAY_DB_PER_SECOND * dt).max(FLOOR_DB);
+                }
+            }
+        }
+        if self.numbers.len() != channels || now - self.numbers_at >= NUMBERS_EVERY {
+            self.numbers_at = now;
+            self.numbers = (0..channels)
+                .map(|c| {
+                    let rms = levels.and_then(|l| l.get(c)).map_or(FLOOR_DB, |l| l.rms_db);
+                    format!("{} / {}", level_text(rms), level_text(self.held[c].0))
+                })
+                .collect();
+        }
+
+        let height = channels as f32 * (METER_ROW + METER_GAP) + 18.0;
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+        let painter = ui.painter_at(rect);
+        let track_x = rect.left() + METER_LABEL + 6.0..=rect.right() - METER_NUMBERS - 8.0;
+        let track_width = track_x.end() - track_x.start();
+        let x_of = |db: f32| track_x.start() + meter_t(db) * track_width;
+        for (c, label) in labels.iter().enumerate() {
+            let y = rect.top() + 2.0 + c as f32 * (METER_ROW + METER_GAP);
+            let track = Rect::from_x_y_ranges(track_x.clone(), y..=y + METER_ROW);
+            painter.text(
+                Pos2::new(rect.left() + METER_LABEL, track.center().y),
+                Align2::RIGHT_CENTER,
+                label,
+                FontId::monospace(11.0),
+                AXIS,
+            );
+            painter.rect_filled(track, 2.0, METER_BACK);
+            if let Some(level) = levels.and_then(|l| l.get(c)) {
+                let bands: [(f32, f32, Color32); 3] = [
+                    (METER_FLOOR, -10.0, METER_LOW),
+                    (-10.0, -3.0, METER_MID),
+                    (-3.0, 0.0, METER_HIGH),
+                ];
+                for (from, to, color) in bands {
+                    let (a, b) = (x_of(from), x_of(to.min(level.peak_db)));
+                    if b > a {
+                        painter.rect_filled(
+                            Rect::from_x_y_ranges(a..=b, track.y_range()),
+                            0.0,
+                            color,
+                        );
+                    }
+                }
+                if level.peak_db >= -0.1 {
+                    painter.rect_stroke(
+                        track,
+                        2.0,
+                        Stroke::new(1.0, METER_HIGH),
+                        StrokeKind::Outside,
+                    );
+                }
+            }
+            let held = self.held[c].0;
+            if held > METER_FLOOR {
+                painter.vline(
+                    x_of(held),
+                    track.y_range(),
+                    Stroke::new(2.0, Color32::WHITE),
+                );
+            }
+            painter.text(
+                Pos2::new(rect.right(), track.center().y),
+                Align2::RIGHT_CENTER,
+                &self.numbers[c],
+                FontId::monospace(11.0),
+                ELAPSED,
+            );
+        }
+        let y = rect.bottom() - 14.0;
+        for db in METER_SCALE {
+            painter.text(
+                Pos2::new(x_of(db), y),
+                Align2::CENTER_TOP,
+                format!("{db:.0}"),
+                FontId::monospace(9.0),
+                AXIS,
+            );
+        }
+        painter.text(
+            Pos2::new(rect.right(), y),
+            Align2::RIGHT_TOP,
+            "RMS / Peak",
+            FontId::proportional(10.0),
+            AXIS,
+        );
+    }
+}
+
+pub struct Curve<'a> {
+    pub name: String,
+    pub color: Color32,
+    /// dBFS per bin, from 0 Hz to Nyquist.
+    pub levels: &'a [f32],
+}
+
+/// Level against log frequency, `top` to `bottom` dB, with a legend once
+/// there is more than one curve.
+pub fn spectrum(
+    painter: &Painter,
+    plot: Rect,
+    curves: &[Curve<'_>],
+    nyquist: f32,
+    (lo, hi): (f32, f32),
+    (top, bottom): (f32, f32),
+) {
+    let x_of = |f: f32| plot.left() + freq_t(f, lo, hi, true) * plot.width();
+    let y_of = |db: f32| plot.top() + ((top - db) / (top - bottom)).clamp(0.0, 1.0) * plot.height();
+    for f in freq_ticks(lo, hi, true, plot.width(), 34.0) {
+        let x = x_of(f);
+        painter.vline(x, plot.y_range(), Stroke::new(1.0, GRID));
+        painter.text(
+            Pos2::new(x, plot.bottom() + 4.0),
+            Align2::CENTER_TOP,
+            hz(f),
+            FontId::monospace(10.0),
+            AXIS,
+        );
+    }
+    let mut db = (top / 20.0).floor() * 20.0;
+    while db >= bottom {
+        let y = y_of(db);
+        painter.hline(plot.x_range(), y, Stroke::new(1.0, GRID));
+        painter.text(
+            Pos2::new(plot.left() - 6.0, y),
+            Align2::RIGHT_CENTER,
+            format!("{db:.0}"),
+            FontId::monospace(10.0),
+            AXIS,
+        );
+        db -= 20.0;
+    }
+    for curve in curves.iter().filter(|c| c.levels.len() > 1) {
+        let bin_hz = nyquist / (curve.levels.len() - 1) as f32;
+        let points: Vec<Pos2> = curve
+            .levels
+            .iter()
+            .enumerate()
+            .map(|(k, &level)| (k as f32 * bin_hz, level))
+            .filter(|(f, _)| (lo..=hi).contains(f))
+            .map(|(f, level)| Pos2::new(x_of(f), y_of(level)))
+            .collect();
+        painter.add(Shape::line(points, Stroke::new(1.2, curve.color)));
+    }
+    if curves.len() > 1 {
+        let mut y = plot.top() + 6.0;
+        for curve in curves {
+            let galley =
+                painter.layout_no_wrap(curve.name.clone(), FontId::proportional(11.0), curve.color);
+            let (size, x) = (galley.size(), plot.right() - 6.0 - galley.size().x);
+            painter.hline(
+                x - 18.0..=x - 4.0,
+                y + size.y / 2.0,
+                Stroke::new(2.0, curve.color),
+            );
+            painter.galley(Pos2::new(x, y), galley, curve.color);
+            y += size.y + 2.0;
+        }
+    }
+}
+
+/// Every section the file carries, as label and value rows whose values
+/// can be selected and copied.
+pub fn metadata(ui: &mut Ui, details: &Details) {
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            for (title, rows) in &details.sections {
+                ui.add_space(6.0);
+                ui.label(RichText::new(title).strong().size(14.0));
+                ui.add_space(2.0);
+                for (label, value) in rows {
+                    let width = (ui.available_width() * 0.38).clamp(80.0, 180.0);
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(width, 0.0),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_width(width);
+                                ui.add(
+                                    Label::new(RichText::new(label.as_str()).color(AXIS)).wrap(),
+                                );
+                            },
+                        );
+                        ui.add(Label::new(value.as_str()).selectable(true).wrap());
+                    });
+                }
+                ui.add_space(4.0);
+                ui.separator();
+            }
+        });
+}
+
+pub fn hz(f: f32) -> String {
+    if f < 1000.0 {
+        return format!("{f:.0}");
+    }
+    let k = f / 1000.0;
+    if (k - k.round()).abs() < 0.05 {
+        format!("{k:.0}k")
+    } else {
+        format!("{k:.1}k")
+    }
+}
+
+/// A frequency as a slider shows it.
+pub fn hz_field(f: f64) -> String {
+    if f >= 10_000.0 {
+        format!("{:.1} kHz", f / 1000.0)
+    } else if f >= 1000.0 {
+        format!("{:.2} kHz", f / 1000.0)
+    } else {
+        format!("{f:.0} Hz")
+    }
+}
+
+/// A frequency as typed: `12000`, `12k`, `12.5 kHz`, `440 Hz`, `1,5k`.
+pub fn parse_hz(text: &str) -> Option<f64> {
+    let text = text.trim().to_lowercase().replace(',', ".");
+    let text = text.strip_suffix("hz").unwrap_or(&text).trim_end();
+    let (number, scale) = match text.strip_suffix('k') {
+        Some(number) => (number, 1000.0),
+        None => (text, 1.0),
+    };
+    let value: f64 = number.trim().parse().ok()?;
+    (value.is_finite() && value >= 0.0).then_some(value * scale)
+}
+
+/// Elapsed time as `m:ss`, or `h:mm:ss` from an hour on.
+pub fn clock(seconds: f64) -> String {
+    clock_with(seconds, 0)
+}
+
+pub fn clock_fine(seconds: f64) -> String {
+    clock_with(seconds, 2)
+}
+
+fn clock_with(seconds: f64, decimals: usize) -> String {
+    let scale = 10u64.pow(decimals as u32);
+    let ticks = (seconds.max(0.0) * scale as f64).round() as u64;
+    let whole = ticks / scale;
+    let (h, m, s) = (whole / 3600, whole / 60 % 60, whole % 60);
+    let mut text = if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    };
+    if decimals > 0 {
+        text.push_str(&format!(".{:0decimals$}", ticks % scale));
+    }
+    text
+}
+
+/// Time of day, wrapping past midnight.
+pub fn wall(seconds: f64) -> String {
+    wall_with(seconds, 0)
+}
+
+fn wall_with(seconds: f64, decimals: usize) -> String {
+    let scale = 10u64.pow(decimals as u32);
+    let ticks = (seconds.rem_euclid(86_400.0) * scale as f64).round() as u64 % (86_400 * scale);
+    let whole = ticks / scale;
+    let mut text = format!(
+        "{:02}:{:02}:{:02}",
+        whole / 3600,
+        whole / 60 % 60,
+        whole % 60
+    );
+    if decimals > 0 {
+        text.push_str(&format!(".{:0decimals$}", ticks % scale));
+    }
+    text
+}
+
+/// The smallest tick spacing, in seconds, that leaves room for each label.
+fn time_step(seconds: f64, width: f32) -> f64 {
+    const STEPS: [f64; 24] = [
+        0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0,
+        60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 14_400.0,
+    ];
+    let fits = f64::from(width / 90.0).max(1.0);
+    STEPS
+        .into_iter()
+        .find(|step| seconds / step <= fits)
+        .unwrap_or(28_800.0)
+}
+
+/// Decimals a label needs to tell ticks `step` seconds apart.
+fn decimals(step: f64) -> usize {
+    match step {
+        s if s >= 1.0 => 0,
+        s if s >= 0.1 => 1,
+        s if s >= 0.01 => 2,
+        _ => 3,
+    }
+}
+
+fn nice_step(raw: f32) -> f32 {
+    let magnitude = 10f32.powf(raw.log10().floor());
+    let mantissa = match raw / magnitude {
+        m if m <= 1.0 => 1.0,
+        m if m <= 2.0 => 2.0,
+        m if m <= 2.5 => 2.5,
+        m if m <= 5.0 => 5.0,
+        _ => 10.0,
+    };
+    magnitude * mantissa
+}
+
+/// Tick frequencies along an axis `length` long. A log axis gets 1, 2 and
+/// 5 per decade, or only the decades where `room` per label would not fit.
+fn freq_ticks(lo: f32, hi: f32, log: bool, length: f32, room: f32) -> Vec<f32> {
+    if !log {
+        let step = nice_step((hi - lo) / (length / 55.0).max(2.0));
+        let mut ticks = Vec::new();
+        let mut f = (lo / step).ceil() * step;
+        while f <= hi {
+            ticks.push(f);
+            f += step;
+        }
+        return ticks;
+    }
+    let decades = |multiples: &[f32]| {
+        let mut ticks = Vec::new();
+        let mut decade = 10f32.powf(lo.log10().floor());
+        while decade <= hi {
+            ticks.extend(
+                multiples
+                    .iter()
+                    .map(|m| decade * m)
+                    .filter(|f| (lo..=hi).contains(f)),
+            );
+            decade *= 10.0;
+        }
+        ticks
+    };
+    let ticks = decades(&[1.0, 2.0, 5.0]);
+    if ticks.len() as f32 * room > length {
+        decades(&[1.0])
+    } else {
+        ticks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_meter_holds_its_peak_then_lets_it_fall() {
+        let ctx = egui::Context::default();
+        let mut meters = Meters::default();
+        let labels = ["1".to_owned()];
+        let at = |time: f64, peak_db: f32, meters: &mut Meters| {
+            let level = [Level {
+                rms_db: peak_db - 3.0,
+                peak_db,
+            }];
+            let input = egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| meters.ui(ui, Some(&level), &labels));
+            out.textures_delta.clear();
+            meters.held[0].0
+        };
+        assert_eq!(at(0.0, -6.0, &mut meters), -6.0);
+        assert_eq!(meters.numbers[0], "-9.0 / -6.0");
+        // Quieter now, but inside the hold time the peak stays put.
+        assert_eq!(at(1.0, -20.0, &mut meters), -6.0);
+        // Past it, the held peak falls at 15 dB a second.
+        assert_eq!(at(1.6, -30.0, &mut meters), -6.0 - 15.0 * 0.6);
+        let input = egui::RawInput {
+            time: Some(2.0),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| meters.ui(ui, None, &labels));
+        out.textures_delta.clear();
+        assert_eq!(meters.held[0].0, FLOOR_DB, "stopping empties the meters");
+    }
+
+    #[test]
+    fn frequency_labels_read_naturally() {
+        assert_eq!(hz(440.0), "440");
+        assert_eq!(hz(2_500.0), "2.5k");
+        assert_eq!(hz(192_000.0), "192k");
+        assert_eq!(hz_field(12_345.0), "12.3 kHz");
+        assert_eq!(hz_field(440.0), "440 Hz");
+    }
+
+    #[test]
+    fn typed_frequencies_take_k_and_hz() {
+        assert_eq!(parse_hz("12000"), Some(12_000.0));
+        assert_eq!(parse_hz("12k"), Some(12_000.0));
+        assert_eq!(parse_hz(" 12.5 kHz "), Some(12_500.0));
+        assert_eq!(parse_hz("440 Hz"), Some(440.0));
+        assert_eq!(parse_hz("1,5k"), Some(1_500.0));
+        assert_eq!(parse_hz("loud"), None);
+        assert_eq!(parse_hz("-3"), None);
+    }
+
+    #[test]
+    fn clocks_format_elapsed_and_wall_time() {
+        assert_eq!(clock(364.0), "6:04");
+        assert_eq!(clock(3_725.0), "1:02:05");
+        assert_eq!(clock_fine(59.994), "0:59.99");
+        assert_eq!(wall(61_454.0 + 86_400.0), "17:04:14");
+        assert_eq!(wall_with(86_399.999_6, 3), "00:00:00.000");
+    }
+
+    #[test]
+    fn zoomed_in_ticks_step_below_a_second_with_decimals_to_match() {
+        let step = time_step(0.5, 900.0);
+        assert_eq!(step, 0.05);
+        assert_eq!(clock_with(12.35, decimals(step)), "0:12.35");
+        assert_eq!(decimals(time_step(3_600.0, 900.0)), 0);
+    }
+
+    #[test]
+    fn linear_ticks_step_nicely() {
+        let expected: Vec<f32> = (0..=4).map(|i| i as f32 * 5_000.0).collect();
+        assert_eq!(freq_ticks(0.0, 24_000.0, false, 275.0, 16.0), expected);
+    }
+
+    #[test]
+    fn a_short_log_axis_keeps_only_the_decades() {
+        assert_eq!(
+            freq_ticks(20.0, 20_000.0, true, 60.0, 16.0),
+            [100.0, 1_000.0, 10_000.0]
+        );
+        assert_eq!(freq_ticks(20.0, 20_000.0, true, 600.0, 16.0).len(), 10);
+    }
+}

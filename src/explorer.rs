@@ -155,8 +155,8 @@ impl Default for Explorer {
 }
 
 impl Explorer {
-    pub fn has_root(&self) -> bool {
-        self.root.is_some()
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
     }
 
     pub fn set_root(&mut self, dir: &Path) {

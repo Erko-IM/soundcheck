@@ -6,9 +6,12 @@ mod app;
 mod audio;
 mod explorer;
 mod finder;
+mod levels;
 mod meta;
 mod playback;
+mod probe;
 mod spectrogram;
+mod views;
 mod wav;
 
 use eframe::egui;

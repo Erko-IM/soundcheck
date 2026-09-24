@@ -1,28 +1,40 @@
-//! Window layout, and the glue between the UI thread and the workers.
+//! Window layout, input, and the glue between the UI thread and the
+//! workers.
 
+use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align2, Color32, FontId, Key, KeyboardShortcut, Modifiers, Pos2, Rect, RichText, Sense,
-    Stroke, TextureOptions, Vec2,
+    self, Align2, Color32, CursorIcon, FontId, Key, KeyboardShortcut, Modifiers, Painter,
+    PointerButton, Rect, Response, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::audio::{self, Loaded};
 use crate::explorer::Explorer;
 use crate::finder::Inbox;
+use crate::levels::{FLOOR_DB, Level};
 use crate::playback::{self, Player};
-use crate::spectrogram::{self, Analysis, View};
+use crate::probe::{self, Probe};
+use crate::spectrogram::{self, Analysis, Channels, Spec, Target, View};
+use crate::views::{self, Meters, Span};
 
-const CURSOR: Color32 = Color32::from_rgb(235, 70, 60);
-const AXIS: Color32 = Color32::from_gray(150);
-const GRID: Color32 = Color32::from_gray(48);
-const ELAPSED: Color32 = Color32::from_gray(220);
-const WALL_CLOCK: Color32 = Color32::from_gray(115);
+const BRIGHTNESS: RangeInclusive<f32> = -20.0..=80.0;
+const CONTRAST: RangeInclusive<f32> = 20.0..=160.0;
+const GAIN: RangeInclusive<f32> = -60.0..=60.0;
+/// Room around a plot for its labels, which also keeps the plot's own
+/// dragging clear of the handles that resize the panels around it.
+const PLOT_LEFT: f32 = 54.0;
+const PLOT_RIGHT: f32 = 10.0;
+const PLOT_EDGE: f32 = 6.0;
+const TIME_AXIS: f32 = 44.0;
+/// How long the view must rest before the part in view is analysed again.
+const SETTLE: Duration = Duration::from_millis(150);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Colormap {
     Viridis,
     Inferno,
@@ -61,14 +73,107 @@ impl Colormap {
     }
 }
 
+/// What the window remembers between runs.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+struct Settings {
+    views: Views,
+    explorer: bool,
+    folder: Option<PathBuf>,
+    fft: usize,
+    colormap: Colormap,
+    brightness: f32,
+    contrast: f32,
+    /// The band as last set by hand, applied to every file within its
+    /// reach: a raised low end stays raised, and a top left at the Nyquist
+    /// limit follows each file's own.
+    band_low: f32,
+    band_high: Option<f32>,
+    log: bool,
+    channels: Channels,
+    speed: u32,
+    /// Playback gain, in dB.
+    gain: f32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            views: Views::default(),
+            explorer: true,
+            folder: None,
+            fft: 2048,
+            colormap: Colormap::Viridis,
+            brightness: 0.0,
+            contrast: 90.0,
+            band_low: 0.0,
+            band_high: None,
+            log: false,
+            channels: Channels::Mix,
+            speed: 1,
+            gain: 0.0,
+        }
+    }
+}
+
+impl Settings {
+    /// Values from an older or hand-edited settings file, brought within
+    /// what the controls offer.
+    fn sanitized(mut self) -> Self {
+        let within = |value: f32, range: RangeInclusive<f32>, default: f32| {
+            if value.is_finite() {
+                value.clamp(*range.start(), *range.end())
+            } else {
+                default
+            }
+        };
+        if !spectrogram::FFT_SIZES.contains(&self.fft) {
+            self.fft = 2048;
+        }
+        if !playback::SPEEDS.contains(&self.speed) {
+            self.speed = 1;
+        }
+        self.brightness = within(self.brightness, BRIGHTNESS, 0.0);
+        self.contrast = within(self.contrast, CONTRAST, 90.0);
+        self.gain = within(self.gain, GAIN, 0.0);
+        self.band_low = within(self.band_low, 0.0..=f32::MAX, 0.0);
+        self.band_high = self.band_high.filter(|f| f.is_finite() && *f > 0.0);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+struct Views {
+    spectrogram: bool,
+    waveform: bool,
+    spectrum: bool,
+    metadata: bool,
+    timeline: bool,
+    meters: bool,
+}
+
+impl Default for Views {
+    fn default() -> Self {
+        Self {
+            spectrogram: true,
+            waveform: true,
+            spectrum: true,
+            metadata: false,
+            timeline: true,
+            meters: true,
+        }
+    }
+}
+
 enum Job {
     Loaded {
         generation: u64,
-        result: Result<Loaded, String>,
+        result: Result<Box<(Loaded, Analysis)>, String>,
     },
     Analysed {
         generation: u64,
-        fft: usize,
+        id: u64,
         result: Result<Analysis, String>,
     },
 }
@@ -90,78 +195,159 @@ impl Drop for Cancel {
     }
 }
 
+/// A job under way: how far it has got, in thousandths, and the handle
+/// that stops it.
+struct Running {
+    id: u64,
+    progress: Arc<AtomicU32>,
+    _cancel: Cancel,
+}
+
+impl Running {
+    fn percent(&self) -> u32 {
+        self.progress.load(Ordering::Relaxed) / 10
+    }
+}
+
+/// An analysis and its images, one per lane.
+struct Shown {
+    analysis: Analysis,
+    textures: Vec<TextureHandle>,
+    /// What the images were coloured with.
+    look: Option<Look>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Look {
+    view: View,
+    colormap: Colormap,
+}
+
+impl Shown {
+    fn new(analysis: Analysis) -> Self {
+        Self {
+            analysis,
+            textures: Vec::new(),
+            look: None,
+        }
+    }
+
+    fn refresh(&mut self, ctx: &egui::Context, look: Look, sample_rate: u32, name: &str) {
+        if self.look == Some(look) {
+            return;
+        }
+        self.look = Some(look);
+        let planes = self.analysis.planes.len();
+        // Lanes share the height, so they can share the rows.
+        let rows = (1024 / planes.max(1)).max(256);
+        for plane in 0..planes {
+            let image = spectrogram::colorize(
+                &self.analysis,
+                plane,
+                sample_rate,
+                &look.view,
+                look.colormap.gradient(),
+                rows,
+            );
+            match self.textures.get_mut(plane) {
+                Some(texture) => texture.set(image, TextureOptions::LINEAR),
+                None => self.textures.push(ctx.load_texture(
+                    format!("{name}-{plane}"),
+                    image,
+                    TextureOptions::LINEAR,
+                )),
+            }
+        }
+    }
+}
+
 pub struct App {
+    settings: Settings,
     explorer: Explorer,
-    explorer_open: bool,
     inbox: Inbox,
     tx: mpsc::Sender<Job>,
     rx: mpsc::Receiver<Job>,
     /// Bumped for every opened file, so results for an earlier one are dropped.
     generation: u64,
+    jobs: u64,
     /// The file the window is about: loading, loaded or failed to load.
     file: Option<PathBuf>,
-    loading: bool,
-    load_job: Option<Cancel>,
-    analysis_job: Option<Cancel>,
+    loading: Option<Running>,
     current: Option<Loaded>,
     error: Option<String>,
-    analysis: Option<Analysis>,
-    texture: Option<egui::TextureHandle>,
-    texture_stale: bool,
-    fft: usize,
-    view: View,
-    /// The band as last set by hand, applied to every file within its
-    /// reach: a raised low end stays raised, and a top left at the Nyquist
-    /// limit follows each file's own.
-    band_low: f32,
-    band_high: Option<f32>,
-    colormap: Colormap,
-    /// The sample the spectrum panel describes, and where playback starts.
+    /// The whole file analysed: drawn wherever nothing finer is ready.
+    whole: Option<Shown>,
+    whole_job: Option<Running>,
+    /// The part in view analysed, once zoomed in.
+    detail: Option<Shown>,
+    detail_job: Option<Running>,
+    detail_due: Option<Instant>,
+    /// Frames in view.
+    view: Range<f64>,
+    selection: Option<Range<usize>>,
+    /// A selection being dragged out: where the drag started, and where the
+    /// pointer is now.
+    selecting: Option<Range<f64>>,
+    /// The frame the spectrum describes, and where playback starts.
     cursor: Option<usize>,
-    spectrum: Vec<f32>,
+    probe: Option<Probe>,
+    asked: Option<probe::Request>,
+    spectrum: Option<probe::Spectrum>,
     /// Created on first play, dropped when another file opens.
     player: Option<Player>,
-    speed: u32,
+    meters: Meters,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>, inbox: Inbox) -> Self {
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
         inbox.wake(&cc.egui_ctx);
+        let settings = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Settings>(s, eframe::APP_KEY))
+            .unwrap_or_default()
+            .sanitized();
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
+            settings,
             explorer: Explorer::default(),
-            explorer_open: true,
             inbox,
             tx,
             rx,
             generation: 0,
+            jobs: 0,
             file: None,
-            loading: false,
-            load_job: None,
-            analysis_job: None,
+            loading: None,
             current: None,
             error: None,
-            analysis: None,
-            texture: None,
-            texture_stale: false,
-            fft: 2048,
-            view: View::default(),
-            band_low: 0.0,
-            band_high: None,
-            colormap: Colormap::Viridis,
+            whole: None,
+            whole_job: None,
+            detail: None,
+            detail_job: None,
+            detail_due: None,
+            view: 0.0..0.0,
+            selection: None,
+            selecting: None,
             cursor: None,
-            spectrum: Vec::new(),
+            probe: None,
+            asked: None,
+            spectrum: None,
             player: None,
-            speed: 1,
+            meters: Meters::default(),
         };
         if let Some(path) = initial.or_else(|| app.inbox.latest()) {
             app.open_external(&cc.egui_ctx, path);
         }
-        if !app.explorer.has_root()
-            && let Some(home) = std::env::home_dir()
-        {
-            app.explorer.set_root(&home);
+        if app.explorer.root().is_none() {
+            let folder = app
+                .settings
+                .folder
+                .clone()
+                .filter(|f| f.is_dir())
+                .or_else(std::env::home_dir);
+            if let Some(folder) = folder {
+                app.explorer.set_root(&folder);
+            }
         }
         app
     }
@@ -172,7 +358,7 @@ impl App {
     fn open_external(&mut self, ctx: &egui::Context, path: PathBuf) {
         if path.is_dir() {
             self.explorer.set_root(&path);
-            self.explorer_open = true;
+            self.settings.explorer = true;
         } else if path.exists() {
             self.explorer.reveal(&path);
             self.open(ctx, path);
@@ -185,23 +371,36 @@ impl App {
         self.generation += 1;
         self.explorer.selected = Some(path.clone());
         self.file = Some(path.clone());
-        self.loading = true;
         self.current = None;
         self.error = None;
-        self.analysis = None;
-        self.texture = None;
+        self.whole = None;
+        self.whole_job = None;
+        self.detail = None;
+        self.detail_job = None;
+        self.detail_due = None;
+        self.view = 0.0..0.0;
+        self.selection = None;
+        self.selecting = None;
         self.cursor = None;
-        self.spectrum.clear();
+        self.probe = None;
+        self.asked = None;
+        self.spectrum = None;
         self.player = None;
-        self.analysis_job = None;
         let (job, cancel) = Cancel::new();
-        self.load_job = Some(job);
-        let (tx, ctx, generation) = (self.tx.clone(), ctx.clone(), self.generation);
+        let progress = Arc::new(AtomicU32::new(0));
+        self.loading = Some(Running {
+            id: 0,
+            progress: Arc::clone(&progress),
+            _cancel: job,
+        });
+        let (tx, ctx, generation, spec) =
+            (self.tx.clone(), ctx.clone(), self.generation, self.spec());
         std::thread::spawn(move || {
             // A decoder panic on a hostile or damaged file must end as an
             // error, not as a spinner that never stops.
-            let result = std::panic::catch_unwind(|| audio::load(&path, &cancel))
-                .unwrap_or_else(|_| Err("the decoder crashed on this file".into()));
+            let result = std::panic::catch_unwind(|| audio::load(&path, spec, &cancel, &progress))
+                .unwrap_or_else(|_| Err("the decoder crashed on this file".into()))
+                .map(Box::new);
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
@@ -211,22 +410,104 @@ impl App {
         });
     }
 
-    fn analyse(&mut self, ctx: &egui::Context) {
+    fn spec(&self) -> Spec {
+        Spec {
+            fft: self.settings.fft,
+            channels: self.settings.channels,
+        }
+    }
+
+    fn frames(&self) -> usize {
+        self.current.as_ref().map_or(0, |c| c.info.frames)
+    }
+
+    fn rate(&self) -> f64 {
+        self.current
+            .as_ref()
+            .map_or(48_000.0, |c| f64::from(c.info.sample_rate))
+    }
+
+    fn channel_count(&self) -> usize {
+        self.current
+            .as_ref()
+            .map_or(1, |c| usize::from(c.info.channels))
+    }
+
+    fn targets(&self) -> Vec<Target> {
+        self.settings.channels.targets(self.channel_count())
+    }
+
+    fn channel_name(&self, channel: usize) -> String {
+        let name = self
+            .current
+            .as_ref()
+            .and_then(|c| c.meta.channel_names.get(channel))
+            .and_then(Option::as_deref);
+        match name {
+            Some(name) => format!("{} · {name}", channel + 1),
+            None => (channel + 1).to_string(),
+        }
+    }
+
+    fn target_name(&self, target: Target) -> String {
+        match target {
+            Target::Mix => "Mix".to_owned(),
+            Target::Channel(c) => self.channel_name(c),
+        }
+    }
+
+    fn look(&self) -> Look {
+        let nyquist = self.current.as_ref().map_or(f32::MAX, |c| c.info.nyquist());
+        let f_max = self.settings.band_high.map_or(nyquist, |f| f.min(nyquist));
+        Look {
+            view: View {
+                brightness: self.settings.brightness,
+                contrast: self.settings.contrast,
+                f_min: self.settings.band_low.min(f_max),
+                f_max,
+                log: self.settings.log,
+            },
+            colormap: self.settings.colormap,
+        }
+    }
+
+    /// Analyses the whole file, or the part in view, with the current
+    /// settings, replacing any analysis of the same kind still under way.
+    fn analyse(&mut self, ctx: &egui::Context, whole: bool) {
         let Some(current) = &self.current else { return };
-        let (tx, ctx, generation) = (self.tx.clone(), ctx.clone(), self.generation);
-        let (mono, fft) = (Arc::clone(&current.mono), self.fft);
+        let frames = current.info.frames;
+        let range = if whole {
+            0..frames
+        } else {
+            self.view.start.floor() as usize..(self.view.end.ceil() as usize).min(frames)
+        };
+        let (source, info) = (current.source.clone(), current.info.clone());
+        self.jobs += 1;
+        let (id, generation, spec) = (self.jobs, self.generation, self.spec());
         let (job, cancel) = Cancel::new();
-        self.analysis_job = Some(job);
+        let progress = Arc::new(AtomicU32::new(0));
+        let running = Running {
+            id,
+            progress: Arc::clone(&progress),
+            _cancel: job,
+        };
+        if whole {
+            self.whole_job = Some(running);
+        } else {
+            self.detail_job = Some(running);
+        }
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let result =
-                match std::panic::catch_unwind(|| spectrogram::analyse(&mono, fft, &cancel)) {
-                    Ok(Some(analysis)) => Ok(analysis),
-                    Ok(None) => return,
-                    Err(_) => Err("the analysis crashed on this file".to_owned()),
-                };
+            let run = || audio::analyse(&source, &info, spec, range, &cancel, &progress);
+            let result = match std::panic::catch_unwind(run) {
+                Ok(Ok(Some(analysis))) => Ok(analysis),
+                Ok(Ok(None)) => return,
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err("the analysis crashed on this file".to_owned()),
+            };
             let _ = tx.send(Job::Analysed {
                 generation,
-                fft,
+                id,
                 result,
             });
             ctx.request_repaint();
@@ -237,113 +518,281 @@ impl App {
         while let Ok(job) = self.rx.try_recv() {
             match job {
                 Job::Loaded { generation, result } if generation == self.generation => {
-                    self.loading = false;
+                    self.loading = None;
                     match result {
-                        Ok(loaded) => {
-                            let nyquist = loaded.info.nyquist();
-                            self.view.f_max = self.band_high.map_or(nyquist, |f| f.min(nyquist));
-                            self.view.f_min = self.band_low.min(self.view.f_max);
+                        Ok(done) => {
+                            let (loaded, analysis) = *done;
+                            let stale = analysis.spec != self.spec();
+                            self.view = 0.0..loaded.info.frames as f64;
+                            self.probe = Some(Probe::new(
+                                loaded.source.clone(),
+                                usize::from(loaded.info.channels),
+                                loaded.info.frames,
+                                ctx.clone(),
+                            ));
+                            self.meters = Meters::default();
                             self.current = Some(loaded);
-                            self.analyse(ctx);
+                            self.whole = Some(Shown::new(analysis));
+                            // The settings changed while the file loaded.
+                            if stale {
+                                self.analyse(ctx, true);
+                            }
                         }
                         Err(e) => self.error = Some(e),
                     }
                 }
                 Job::Analysed {
                     generation,
-                    fft,
+                    id,
                     result,
-                } if generation == self.generation && fft == self.fft => match result {
-                    Ok(analysis) => {
-                        self.analysis = Some(analysis);
-                        self.texture_stale = true;
+                } if generation == self.generation => {
+                    let slot = if self.whole_job.as_ref().is_some_and(|j| j.id == id) {
+                        self.whole_job = None;
+                        &mut self.whole
+                    } else if self.detail_job.as_ref().is_some_and(|j| j.id == id) {
+                        self.detail_job = None;
+                        &mut self.detail
+                    } else {
+                        continue;
+                    };
+                    match result {
+                        Ok(analysis) => *slot = Some(Shown::new(analysis)),
+                        Err(e) => self.error = Some(e),
                     }
-                    Err(e) => self.error = Some(e),
-                },
-                // Superseded by a newer file or a different FFT size.
+                }
+                // Superseded by a newer file or a newer analysis.
                 _ => {}
             }
         }
     }
 
-    fn refresh_texture(&mut self, ctx: &egui::Context) {
-        if !std::mem::take(&mut self.texture_stale) {
+    fn settings_changed(&mut self, ctx: &egui::Context) {
+        if self.current.is_none() {
             return;
         }
-        let (Some(analysis), Some(current)) = (&self.analysis, &self.current) else {
+        self.analyse(ctx, true);
+        if self.zoomed() {
+            self.analyse(ctx, false);
+        } else {
+            self.detail = None;
+            self.detail_job = None;
+        }
+    }
+
+    fn update_probe(&mut self) {
+        let Some(probe) = &self.probe else { return };
+        match probe.take() {
+            Some(Ok(spectrum)) => self.spectrum = Some(spectrum),
+            Some(Err(e)) => self.error = Some(e),
+            None => {}
+        }
+        let wanted = self.cursor.map(|frame| probe::Request {
+            frame,
+            fft: self.settings.fft,
+            channels: self.settings.channels,
+        });
+        if let Some(request) = wanted
+            && wanted != self.asked
+        {
+            probe.ask(request);
+            self.asked = wanted;
+        }
+    }
+
+    fn refresh_textures(&mut self, ctx: &egui::Context) {
+        if !self.settings.views.spectrogram {
+            return;
+        }
+        let Some(rate) = self.current.as_ref().map(|c| c.info.sample_rate) else {
             return;
         };
-        let image = spectrogram::colorize(
-            analysis,
-            current.info.sample_rate,
-            &self.view,
-            self.colormap.gradient(),
-        );
-        match &mut self.texture {
-            Some(texture) => texture.set(image, TextureOptions::LINEAR),
-            None => {
-                self.texture = Some(ctx.load_texture("spectrogram", image, TextureOptions::LINEAR));
+        let look = self.look();
+        for (shown, name) in [(&mut self.whole, "whole"), (&mut self.detail, "detail")] {
+            if let Some(shown) = shown {
+                shown.refresh(ctx, look, rate, name);
             }
         }
     }
 
-    /// Points the cursor, and the spectrum panel, at `sample`.
-    fn show_moment(&mut self, sample: usize) {
-        self.cursor = Some(sample);
-        if let Some(current) = &self.current {
-            self.spectrum = spectrogram::spectrum_at(&current.mono, sample, self.fft);
+    fn zoomed(&self) -> bool {
+        self.view.start > 0.5 || self.view.end < self.frames() as f64 - 0.5
+    }
+
+    /// Shows `len` frames from `start`, kept within the file.
+    fn set_view(&mut self, start: f64, len: f64) {
+        let frames = self.frames() as f64;
+        if frames <= 0.0 {
+            return;
+        }
+        let shortest = (self.rate() / 1000.0).max(64.0).min(frames);
+        let len = len.clamp(shortest, frames);
+        let start = start.clamp(0.0, frames - len);
+        let view = start..start + len;
+        if view == self.view {
+            return;
+        }
+        self.view = view;
+        if self.zoomed() {
+            self.detail_due = Some(Instant::now() + SETTLE);
+        } else {
+            self.detail = None;
+            self.detail_job = None;
+            self.detail_due = None;
         }
     }
 
-    fn seek(&mut self, sample: usize) {
-        self.show_moment(sample);
+    fn view_len(&self) -> f64 {
+        self.view.end - self.view.start
+    }
+
+    fn pan(&mut self, frames: f64) {
+        self.set_view(self.view.start + frames, self.view_len());
+    }
+
+    /// Zooms by `factor` with `anchor` staying where it is on screen.
+    fn zoom_at(&mut self, anchor: f64, factor: f64) {
+        let len = self.view_len();
+        let t = (anchor - self.view.start) / len;
+        let new = len * factor;
+        self.set_view(anchor - t * new, new);
+    }
+
+    /// Zooms by `factor` around the cursor, or the middle of the view.
+    fn zoom(&mut self, factor: f64) {
+        let centre = self
+            .cursor
+            .map_or((self.view.start + self.view.end) / 2.0, |c| c as f64);
+        let new = self.view_len() * factor;
+        self.set_view(centre - new / 2.0, new);
+    }
+
+    fn fit(&mut self) {
+        self.set_view(0.0, self.frames() as f64);
+    }
+
+    fn zoom_to_selection(&mut self) {
+        if let Some(s) = &self.selection {
+            let pad = s.len() as f64 * 0.05;
+            self.set_view(s.start as f64 - pad, s.len() as f64 + 2.0 * pad);
+        }
+    }
+
+    /// Pages the view along under the playhead as the original does: once
+    /// it passes nine tenths of the view, it moves back to one tenth.
+    fn keep_in_view(&mut self, frame: f64) {
+        let len = self.view_len();
+        let past = frame > self.view.start + 0.9 * len && self.view.end < self.frames() as f64;
+        if past || frame < self.view.start {
+            self.set_view(frame - 0.1 * len, len);
+        }
+    }
+
+    fn start_due_analysis(&mut self, ctx: &egui::Context) {
+        let Some(due) = self.detail_due else { return };
+        let now = Instant::now();
+        if now >= due {
+            self.detail_due = None;
+            self.analyse(ctx, false);
+        } else {
+            ctx.request_repaint_after(due - now);
+        }
+    }
+
+    fn seek(&mut self, frame: usize) {
+        let frame = frame.min(self.frames());
+        self.cursor = Some(frame);
         if let Some(player) = &self.player {
-            player.seek(sample);
+            player.seek(frame);
+        }
+    }
+
+    fn seek_by(&mut self, seconds: f64) {
+        let at = self.cursor.unwrap_or(0) as f64 + seconds * self.rate();
+        self.seek(at.max(0.0) as usize);
+    }
+
+    /// Makes `selection` the selection. As in the original, a new one
+    /// repeats and starts playing at once, and clearing it stops the
+    /// repeat.
+    fn select(&mut self, selection: Option<Range<usize>>) {
+        let had = self.selection.is_some();
+        self.selection = selection.clone();
+        match selection {
+            Some(range) => {
+                self.cursor = Some(range.start);
+                if self.ensure_player(range.start)
+                    && let Some(player) = &self.player
+                {
+                    player.set_loop(Some(range));
+                    player.play();
+                }
+            }
+            None if had => {
+                if let Some(player) = &self.player {
+                    player.set_loop(None);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn ensure_player(&mut self, start: usize) -> bool {
+        if self.player.is_some() {
+            return true;
+        }
+        let Some(current) = &self.current else {
+            return false;
+        };
+        match Player::new(&current.source, &current.info, start, self.settings.speed) {
+            Ok(player) => {
+                player.set_gain(self.settings.gain);
+                if let Some(range) = &self.selection {
+                    player.set_loop(Some(range.clone()));
+                }
+                self.player = Some(player);
+                true
+            }
+            Err(e) => {
+                self.error = Some(e);
+                false
+            }
         }
     }
 
     fn toggle_play(&mut self) {
-        let Some(current) = &self.current else { return };
-        if self.player.is_none() {
-            let frames = current.info.frames;
-            // From the cursor, or from the start when it sits at the end.
-            let start = self.cursor.filter(|&c| c < frames).unwrap_or(0);
-            match Player::new(
-                &current.source,
-                current.info.sample_rate,
-                frames,
-                start,
-                self.speed,
-            ) {
-                Ok(player) => self.player = Some(player),
-                Err(e) => {
-                    self.error = Some(e);
-                    return;
-                }
-            }
+        let frames = self.frames();
+        if frames == 0 {
+            return;
+        }
+        // From the cursor, or from the start when it sits at the end.
+        let start = self.cursor.filter(|&c| c < frames).unwrap_or(0);
+        if !self.ensure_player(start) {
+            return;
         }
         let Some(player) = &self.player else { return };
         if player.is_playing() {
             player.pause();
-            let at = player.position();
-            self.show_moment(at);
+            self.cursor = Some(player.position());
         } else {
             player.play();
         }
     }
 
+    /// Back to the start: of the selection when there is one, else of the
+    /// file.
     fn stop(&mut self) {
+        let home = self.selection.as_ref().map_or(0, |s| s.start);
         if let Some(player) = &self.player {
             player.pause();
-            player.seek(0);
+            player.seek(home);
         }
         if self.current.is_some() {
-            self.show_moment(0);
+            self.cursor = Some(home);
         }
     }
 
     fn set_speed(&mut self, speed: u32) {
-        self.speed = speed;
+        self.settings.speed = speed;
         if let Some(player) = &self.player {
             player.set_speed(speed);
         }
@@ -365,31 +814,88 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
         let at = player.position();
-        if self.cursor != Some(at) {
-            self.show_moment(at);
+        self.cursor = Some(at);
+        if self.selection.is_none() {
+            self.keep_in_view(at as f64);
         }
     }
 
     fn input(&mut self, ctx: &egui::Context) {
         let toggle_explorer = KeyboardShortcut::new(Modifiers::COMMAND, Key::B);
         if ctx.input_mut(|i| i.consume_shortcut(&toggle_explorer)) {
-            self.explorer_open = !self.explorer_open;
-        }
-        // Taken before any widget draws, so a focused button cannot also
-        // treat this Space as a click and toggle playback straight back.
-        if !ctx.egui_wants_keyboard_input()
-            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Space))
-        {
-            self.toggle_play();
+            self.settings.explorer = !self.settings.explorer;
         }
         if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_owned()))
         {
             self.open_external(ctx, path);
         }
+        // Taken before any widget draws, so a focused button cannot also
+        // act on these keys, and never while text is being typed.
+        if ctx.egui_wants_keyboard_input() || self.current.is_none() {
+            return;
+        }
+        let pressed = |modifiers, key| ctx.input_mut(|i| i.consume_key(modifiers, key));
+        let plain = |key| pressed(Modifiers::NONE, key);
+        if plain(Key::Space) {
+            self.toggle_play();
+        }
+        // Shift first: a plain arrow would take the shifted one too.
+        if pressed(Modifiers::SHIFT, Key::ArrowLeft) {
+            self.seek_by(-10.0);
+        }
+        if pressed(Modifiers::SHIFT, Key::ArrowRight) {
+            self.seek_by(10.0);
+        }
+        if plain(Key::ArrowLeft) {
+            self.seek_by(-1.0);
+        }
+        if plain(Key::ArrowRight) {
+            self.seek_by(1.0);
+        }
+        if plain(Key::Home) {
+            self.seek(0);
+        }
+        if plain(Key::End) {
+            self.seek(self.frames());
+        }
+        for (key, step) in [(Key::ArrowUp, 5.0), (Key::ArrowDown, -5.0)] {
+            if plain(key) {
+                self.settings.brightness =
+                    (self.settings.brightness + step).clamp(*BRIGHTNESS.start(), *BRIGHTNESS.end());
+            }
+        }
+        if plain(Key::Plus) || plain(Key::Equals) {
+            self.zoom(0.5);
+        }
+        if plain(Key::Minus) {
+            self.zoom(2.0);
+        }
+        if plain(Key::F) {
+            self.fit();
+        }
+        if plain(Key::S) {
+            self.zoom_to_selection();
+        }
+        if plain(Key::Escape) {
+            self.select(None);
+        }
     }
 
-    fn header(&self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
+    fn header(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            let views = &mut self.settings.views;
+            ui.label(RichText::new("Show").color(views::AXIS));
+            ui.checkbox(&mut self.settings.explorer, "Files")
+                .on_hover_text("⌘B");
+            ui.checkbox(&mut views.spectrogram, "Spectrogram");
+            ui.checkbox(&mut views.waveform, "Waveform");
+            ui.checkbox(&mut views.spectrum, "Spectrum");
+            ui.checkbox(&mut views.metadata, "Metadata");
+            ui.checkbox(&mut views.timeline, "Timeline");
+            ui.checkbox(&mut views.meters, "Meters");
+        });
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             let name = self
                 .file
@@ -402,12 +908,13 @@ impl App {
                     .strong()
                     .color(Color32::WHITE),
             );
-            if self.loading {
+            if let Some(loading) = &self.loading {
                 ui.spinner();
+                ui.label(format!("{}%", loading.percent()));
             }
         });
         if let Some(error) = &self.error {
-            ui.label(RichText::new(error).color(CURSOR));
+            ui.label(RichText::new(error).color(views::CURSOR));
         }
         if let Some(current) = &self.current {
             match &current.meta.description {
@@ -422,16 +929,28 @@ impl App {
                 RichText::new(summary(current))
                     .monospace()
                     .size(12.0)
-                    .color(AXIS),
+                    .color(views::AXIS),
             );
         }
-        ui.add_space(8.0);
+        ui.add_space(6.0);
+    }
+
+    fn controls(&mut self, ui: &mut egui::Ui) {
+        let before = (self.settings.fft, self.settings.channels);
+        ui.add_space(4.0);
+        self.transport(ui);
+        ui.separator();
+        self.display(ui);
+        ui.add_space(4.0);
+        if (self.settings.fft, self.settings.channels) != before {
+            self.settings_changed(ui.ctx());
+        }
     }
 
     fn transport(&mut self, ui: &mut egui::Ui) {
         let playing = self.player.as_ref().is_some_and(Player::is_playing);
         let has_file = self.current.is_some();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let label = if playing { "Pause" } else { "Play" };
             let play = egui::Button::new(label).min_size(Vec2::new(64.0, 0.0));
             if ui
@@ -451,217 +970,287 @@ impl App {
             ui.label("Speed");
             for speed in playback::SPEEDS {
                 if ui
-                    .selectable_label(self.speed == speed, format!("{speed}×"))
+                    .selectable_label(self.settings.speed == speed, format!("{speed}×"))
                     .clicked()
                 {
                     self.set_speed(speed);
                 }
             }
+            ui.separator();
+            ui.label("Gain").on_hover_text(
+                "Playback volume: raise it for quiet recordings, lower it for 32-bit float files that go past full scale",
+            );
+            let mut gain = self.settings.gain;
+            ui.add(egui::Slider::new(&mut gain, GAIN).step_by(1.0).suffix(" dB"));
+            if gain != self.settings.gain {
+                self.settings.gain = gain;
+                if let Some(player) = &self.player {
+                    player.set_gain(gain);
+                }
+            }
+            ui.separator();
             if let Some(current) = &self.current {
-                ui.separator();
-                let at = self.cursor.unwrap_or(0) as f64 / f64::from(current.info.sample_rate);
+                let rate = f64::from(current.info.sample_rate);
+                let at = self.cursor.unwrap_or(0) as f64 / rate;
                 ui.label(
                     RichText::new(format!(
                         "{} / {}",
-                        clock_fine(at),
-                        clock(current.info.seconds())
+                        views::clock_fine(at),
+                        views::clock(current.info.seconds())
                     ))
                     .monospace(),
                 );
+                ui.separator();
+            }
+            ui.label("Zoom");
+            if ui
+                .add_enabled(has_file, egui::Button::new("−"))
+                .on_hover_text("-")
+                .clicked()
+            {
+                self.zoom(2.0);
+            }
+            if ui
+                .add_enabled(has_file, egui::Button::new("+"))
+                .on_hover_text("+")
+                .clicked()
+            {
+                self.zoom(0.5);
+            }
+            if ui
+                .add_enabled(has_file, egui::Button::new("Fit"))
+                .on_hover_text("F")
+                .clicked()
+            {
+                self.fit();
+            }
+            if ui
+                .add_enabled(self.selection.is_some(), egui::Button::new("Selection"))
+                .on_hover_text("S")
+                .clicked()
+            {
+                self.zoom_to_selection();
+            }
+            if let Some(s) = &self.selection {
+                let rate = self.rate();
+                let (from, to) = (s.start as f64 / rate, s.end as f64 / rate);
+                ui.label(
+                    RichText::new(format!(
+                        "{} to {} ({:.2} s)",
+                        views::clock_fine(from),
+                        views::clock_fine(to),
+                        to - from
+                    ))
+                    .monospace()
+                    .color(views::AXIS),
+                )
+                .on_hover_text("Esc clears it");
             }
         });
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui) {
-        let nyquist = self
-            .current
-            .as_ref()
-            .map_or(self.view.f_max, |c| c.info.nyquist());
-        let (fft, view, colormap) = (self.fft, self.view, self.colormap);
-        ui.add_space(4.0);
-        self.transport(ui);
-        ui.separator();
+    fn display(&mut self, ui: &mut egui::Ui) {
+        let nyquist = self.current.as_ref().map_or(96_000.0, |c| c.info.nyquist());
+        let channels = self.channel_count();
+        let names: Vec<String> = (0..channels).map(|c| self.channel_name(c)).collect();
+        let look = self.look().view;
         ui.horizontal_wrapped(|ui| {
             ui.label("FFT");
             egui::ComboBox::from_id_salt("fft")
-                .selected_text(self.fft.to_string())
+                .selected_text(self.settings.fft.to_string())
                 .show_ui(ui, |ui| {
                     for n in spectrogram::FFT_SIZES {
-                        ui.selectable_value(&mut self.fft, n, n.to_string());
+                        ui.selectable_value(&mut self.settings.fft, n, n.to_string());
                     }
                 });
             ui.label("Colours");
             egui::ComboBox::from_id_salt("colormap")
-                .selected_text(self.colormap.name())
+                .selected_text(self.settings.colormap.name())
                 .show_ui(ui, |ui| {
                     for c in Colormap::ALL {
-                        ui.selectable_value(&mut self.colormap, c, c.name());
+                        ui.selectable_value(&mut self.settings.colormap, c, c.name());
                     }
                 });
-            ui.separator();
-            // Gain lowers the level drawn at full brightness, so more of a
-            // quiet recording lights up; range is how far below it colour
-            // still reaches.
-            let mut gain = -self.view.top_db;
-            ui.add(
-                egui::Slider::new(&mut gain, -20.0..=80.0)
-                    .text("Gain")
-                    .suffix(" dB"),
-            );
-            self.view.top_db = -gain;
-            ui.add(
-                egui::Slider::new(&mut self.view.range_db, 20.0..=160.0)
-                    .text("Range")
-                    .suffix(" dB"),
-            );
-            ui.separator();
-            ui.label("Frequency");
-            let speed = f64::from(nyquist) / 400.0;
-            ui.add(
-                egui::DragValue::new(&mut self.view.f_min)
-                    .range(0.0..=self.view.f_max)
-                    .speed(speed)
-                    .suffix(" Hz"),
-            );
-            ui.label("to");
-            ui.add(
-                egui::DragValue::new(&mut self.view.f_max)
-                    .range(self.view.f_min..=nyquist)
-                    .speed(speed)
-                    .suffix(" Hz"),
-            );
-            if ui.button("Full").clicked() {
-                self.view.f_min = 0.0;
-                self.view.f_max = nyquist;
+            if channels > 1 {
+                ui.label("Channels");
+                let shown = match self.settings.channels.targets(channels).as_slice() {
+                    [Target::Mix] => "Mix".to_owned(),
+                    [Target::Channel(c)] => names[*c].clone(),
+                    _ => "All".to_owned(),
+                };
+                egui::ComboBox::from_id_salt("channels")
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        let choice = &mut self.settings.channels;
+                        ui.selectable_value(choice, Channels::Mix, "Mix");
+                        ui.selectable_value(choice, Channels::All, "All, one above another");
+                        for (c, name) in names.iter().enumerate() {
+                            ui.selectable_value(choice, Channels::One(c), name);
+                        }
+                    });
             }
-            ui.checkbox(&mut self.view.log, "Log");
+            ui.separator();
+            ui.label("Brightness").on_hover_text(
+                "Added to every level before colouring: right is brighter. ↑ and ↓ step it by 5 dB",
+            );
+            ui.add(
+                egui::Slider::new(&mut self.settings.brightness, BRIGHTNESS)
+                    .step_by(1.0)
+                    .suffix(" dB"),
+            );
+            ui.label("Contrast").on_hover_text(
+                "How far below full brightness a level still gets colour: lower is more contrast",
+            );
+            ui.add(
+                egui::Slider::new(&mut self.settings.contrast, CONTRAST)
+                    .step_by(1.0)
+                    .suffix(" dB"),
+            );
         });
-        ui.add_space(4.0);
-
-        if (self.view.f_min, self.view.f_max) != (view.f_min, view.f_max) {
-            self.band_low = self.view.f_min;
-            self.band_high = (self.view.f_max < nyquist).then_some(self.view.f_max);
-        }
-        if self.fft != fft {
-            self.analyse(ui.ctx());
-            if let Some(sample) = self.cursor {
-                self.show_moment(sample);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Frequency");
+            let (mut lo, mut hi) = (f64::from(look.f_min), f64::from(look.f_max));
+            ui.label("Min")
+                .on_hover_text("Drag, or click the number and type: 200, 1.5k, 12 kHz");
+            let min_changed = ui.add(frequency_slider(&mut lo, 0.0..=hi)).changed();
+            ui.label("Max")
+                .on_hover_text("Drag, or click the number and type: 200, 1.5k, 12 kHz");
+            let max_changed = ui
+                .add(frequency_slider(&mut hi, lo.max(10.0)..=f64::from(nyquist)))
+                .changed();
+            if min_changed || max_changed {
+                self.settings.band_low = lo as f32;
+                self.settings.band_high = ((hi as f32) < nyquist - 0.5).then_some(hi as f32);
             }
+            if ui.button("Full").clicked() {
+                self.settings.band_low = 0.0;
+                self.settings.band_high = None;
+            }
+            ui.checkbox(&mut self.settings.log, "Log");
+        });
+    }
+
+    fn placeholder(&self, ui: &mut egui::Ui) {
+        ui.centered_and_justified(|ui| {
+            if self.loading.is_some() {
+                ui.spinner();
+            } else if self.error.is_none() {
+                ui.label(RichText::new("Pick a file in the explorer, or drop one here").weak());
+            }
+        });
+    }
+
+    /// The views that follow time: the spectrogram over the waveform, with
+    /// the time axis under whichever is lower.
+    fn central(&mut self, ui: &mut egui::Ui) {
+        if self.current.is_none() {
+            self.placeholder(ui);
+            return;
         }
-        if self.view != view || self.colormap != colormap {
-            self.texture_stale = true;
+        let views = self.settings.views;
+        if views.spectrogram && views.waveform {
+            egui::Panel::bottom("waveform")
+                .frame(egui::Frame::NONE)
+                .resizable(true)
+                .default_size(180.0)
+                .min_size(70.0)
+                .show(ui, |ui| self.waveform_view(ui, true));
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| self.spectrogram_view(ui, false));
+        } else if views.spectrogram {
+            self.spectrogram_view(ui, true);
+        } else {
+            self.waveform_view(ui, true);
         }
     }
 
-    fn spectrogram_panel(&mut self, ui: &mut egui::Ui) {
-        let (Some(current), Some(texture), Some(analysis)) =
-            (&self.current, &self.texture, &self.analysis)
-        else {
-            ui.centered_and_justified(|ui| {
-                if self.loading || self.current.is_some() {
-                    ui.spinner();
-                } else {
-                    ui.label(RichText::new("Pick a file in the explorer, or drop one here").weak());
-                }
-            });
-            return;
-        };
+    fn side(&mut self, ui: &mut egui::Ui) {
+        Self::claim(ui);
+        let views = self.settings.views;
+        if views.spectrum && views.metadata {
+            egui::Panel::bottom("metadata")
+                .frame(egui::Frame::NONE)
+                .resizable(true)
+                .default_size(ui.available_height() / 2.0)
+                .min_size(80.0)
+                .show(ui, |ui| self.metadata_view(ui));
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| self.spectrum_view(ui));
+        } else if views.spectrum {
+            self.spectrum_view(ui);
+        } else {
+            self.metadata_view(ui);
+        }
+    }
 
+    /// Claims the whole of `ui`, whatever the view then shows: a panel keeps
+    /// only the size its contents take, so a view that just paints, or that
+    /// shows a line of text before a file opens, would shrink its panel back
+    /// to the minimum and keep it there.
+    fn claim(ui: &mut egui::Ui) -> Rect {
         let area = ui.available_rect_before_wrap();
-        let response = ui.allocate_rect(area, Sense::click_and_drag());
+        ui.take_available_space();
+        area
+    }
+
+    fn plot_rect(ui: &mut egui::Ui, axis: bool) -> (Rect, Rect) {
+        let area = Self::claim(ui);
+        let bottom = if axis { TIME_AXIS } else { PLOT_EDGE };
         let plot = Rect::from_min_max(
-            area.min + Vec2::new(54.0, 4.0),
-            area.max - Vec2::new(8.0, 44.0),
+            area.min + Vec2::new(PLOT_LEFT, PLOT_EDGE),
+            area.max - Vec2::new(PLOT_RIGHT, bottom),
         );
+        (area, plot)
+    }
+
+    fn spectrogram_view(&mut self, ui: &mut egui::Ui, axis: bool) {
+        let (area, plot) = Self::plot_rect(ui, axis);
+        if plot.width() < 20.0 || plot.height() < 20.0 {
+            return;
+        }
+        let Some(current) = &self.current else { return };
+        let response = ui.interact(plot, ui.id().with("spectrogram"), Sense::click_and_drag());
         let painter = ui.painter_at(area);
-        let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-        painter.image(texture.id(), plot, full_uv, Color32::WHITE);
-
-        let (lo, hi) = spectrogram::band(&self.view, current.info.sample_rate, analysis.fft);
-        let log = self.view.log;
-        let to_t = |f: f32| {
-            if log {
-                (f / lo).ln() / (hi / lo).ln()
-            } else {
-                (f - lo) / (hi - lo)
+        let span = Span::new(plot, &self.view);
+        let rate = f64::from(current.info.sample_rate);
+        let targets = self.targets();
+        let lanes = views::lanes(plot, targets.len());
+        let view = self.look().view;
+        let (lo, hi) = spectrogram::band(&view, current.info.sample_rate, self.settings.fft);
+        for (i, (lane, target)) in lanes.iter().zip(&targets).enumerate() {
+            painter.rect_filled(*lane, 0.0, Color32::BLACK);
+            for shown in [&self.whole, &self.detail].into_iter().flatten() {
+                if shown.analysis.targets == targets
+                    && let Some(texture) = shown.textures.get(i)
+                {
+                    views::place(&painter, *lane, span, texture.id(), &shown.analysis.range);
+                }
             }
-        };
-        let from_t = |t: f32| {
-            if log {
-                lo * (hi / lo).powf(t)
-            } else {
-                lo + (hi - lo) * t
+            views::freq_axis(&painter, *lane, lo, hi, view.log);
+            if current.info.channels > 1 {
+                views::lane_label(&painter, *lane, &self.target_name(*target));
             }
-        };
-        for f in freq_ticks(lo, hi, log, plot.height()) {
-            let y = plot.bottom() - to_t(f) * plot.height();
-            painter.line_segment(
-                [Pos2::new(plot.left() - 5.0, y), Pos2::new(plot.left(), y)],
-                Stroke::new(1.0, AXIS),
-            );
-            painter.text(
-                Pos2::new(plot.left() - 8.0, y),
-                Align2::RIGHT_CENTER,
-                hz(f),
-                FontId::monospace(11.0),
-                AXIS,
+        }
+        if axis {
+            views::time_axis(
+                &painter,
+                plot,
+                span,
+                rate,
+                current.meta.start.as_ref().map(|s| s.seconds),
             );
         }
-
-        let seconds = current.info.seconds();
-        let x_of = |t: f64| plot.left() + (t / seconds) as f32 * plot.width();
-        let step = time_step(seconds, plot.width());
-        let mut t = 0.0;
-        while t <= seconds {
-            let x = x_of(t);
-            painter.line_segment(
-                [
-                    Pos2::new(x, plot.bottom()),
-                    Pos2::new(x, plot.bottom() + 5.0),
-                ],
-                Stroke::new(1.0, AXIS),
-            );
-            painter.text(
-                Pos2::new(x, plot.bottom() + 7.0),
-                Align2::CENTER_TOP,
-                clock(t),
-                FontId::monospace(13.0),
-                ELAPSED,
-            );
-            if let Some(start) = &current.meta.start {
-                painter.text(
-                    Pos2::new(x, plot.bottom() + 25.0),
-                    Align2::CENTER_TOP,
-                    wall(start.seconds + t),
-                    FontId::monospace(10.0),
-                    WALL_CLOCK,
-                );
-            }
-            t += step;
-        }
-
-        let mut new_cursor = None;
-        if (response.clicked() || response.dragged())
-            && let Some(pos) = response.interact_pointer_pos()
+        self.overlays(&painter, plot, span);
+        if let Some(pos) = response.hover_pos()
+            && let Some(lane) = lanes.iter().find(|l| l.contains(pos))
         {
-            let t = ((pos.x - plot.left()) / plot.width()).clamp(0.0, 1.0);
-            new_cursor = Some((f64::from(t) * current.info.frames as f64) as usize);
-        }
-        if let Some(sample) = self.cursor {
-            let x = x_of(sample as f64 / f64::from(current.info.sample_rate));
-            painter.line_segment(
-                [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
-                Stroke::new(1.5, CURSOR),
-            );
-        }
-        if let Some(pos) = response.hover_pos().filter(|p| plot.contains(*p)) {
-            let f = from_t((plot.bottom() - pos.y) / plot.height());
-            let t = f64::from((pos.x - plot.left()) / plot.width()) * seconds;
-            painter.line_segment(
-                [
-                    Pos2::new(plot.left(), pos.y),
-                    Pos2::new(plot.right(), pos.y),
-                ],
+            let f = views::freq_at((lane.bottom() - pos.y) / lane.height(), lo, hi, view.log);
+            let t = span.frame(pos.x) / rate;
+            painter.hline(
+                lane.x_range(),
+                pos.y,
                 Stroke::new(0.5, Color32::from_white_alpha(60)),
             );
             // Readout on the side with room, so it is never cut off at the edge.
@@ -673,91 +1262,266 @@ impl App {
             painter.text(
                 pos + offset,
                 align,
-                format!("{}Hz  {}", hz(f), clock_fine(t)),
+                format!("{}Hz  {}", views::hz(f), views::clock_fine(t)),
                 FontId::monospace(12.0),
                 Color32::WHITE,
             );
         }
-        if let Some(sample) = new_cursor {
-            self.seek(sample);
+        self.busy(&painter, plot);
+        self.plot_input(ui, &response, span);
+    }
+
+    fn waveform_view(&mut self, ui: &mut egui::Ui, axis: bool) {
+        let (area, plot) = Self::plot_rect(ui, axis);
+        if plot.width() < 20.0 || plot.height() < 20.0 {
+            return;
+        }
+        let Some(current) = &self.current else { return };
+        let response = ui.interact(plot, ui.id().with("waveform"), Sense::click_and_drag());
+        let painter = ui.painter_at(area);
+        let span = Span::new(plot, &self.view);
+        let channels = usize::from(current.info.channels);
+        let detail = self.detail.as_ref().map(|d| &d.analysis);
+        for (c, lane) in views::lanes(plot, channels).into_iter().enumerate() {
+            painter.rect_filled(lane, 0.0, Color32::from_gray(12));
+            views::centre_line(&painter, lane);
+            let color = views::PALETTE[c % views::PALETTE.len()];
+            if let Some(whole) = &self.whole {
+                let a = &whole.analysis;
+                // Only where the finer analysis does not reach.
+                let gaps = match detail {
+                    Some(d) => vec![
+                        lane.left()..=span.x(d.range.start as f64),
+                        span.x(d.range.end as f64)..=lane.right(),
+                    ],
+                    None => vec![lane.x_range().into()],
+                };
+                for gap in gaps.into_iter().filter(|g| g.end() > g.start()) {
+                    let clipped =
+                        painter.with_clip_rect(Rect::from_x_y_ranges(gap, lane.y_range()));
+                    views::waveform(&clipped, lane, span, &a.envelope[c], &a.range, color);
+                }
+            }
+            if let Some(d) = detail {
+                views::waveform(&painter, lane, span, &d.envelope[c], &d.range, color);
+            }
+            if channels > 1 {
+                views::lane_label(&painter, lane, &self.channel_name(c));
+            }
+        }
+        if axis {
+            let rate = f64::from(current.info.sample_rate);
+            views::time_axis(
+                &painter,
+                plot,
+                span,
+                rate,
+                current.meta.start.as_ref().map(|s| s.seconds),
+            );
+        }
+        self.overlays(&painter, plot, span);
+        if !self.settings.views.spectrogram {
+            self.busy(&painter, plot);
+        }
+        self.plot_input(ui, &response, span);
+    }
+
+    fn overlays(&self, painter: &Painter, plot: Rect, span: Span) {
+        let selection = match &self.selecting {
+            Some(s) => Some(s.start.min(s.end)..s.start.max(s.end)),
+            None => self
+                .selection
+                .as_ref()
+                .map(|s| s.start as f64..s.end as f64),
+        };
+        if let Some(s) = &selection {
+            views::selection(painter, plot, span, s);
+        }
+        if let Some(c) = self.cursor {
+            views::cursor(painter, plot, span, c as f64);
         }
     }
 
-    fn spectrum_panel(&self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        let (Some(current), Some(sample)) = (&self.current, self.cursor) else {
+    fn busy(&self, painter: &Painter, plot: Rect) {
+        if let Some(job) = self.detail_job.as_ref().or(self.whole_job.as_ref()) {
+            painter.text(
+                plot.right_top() + Vec2::new(-8.0, 8.0),
+                Align2::RIGHT_TOP,
+                format!("Analysing {}%", job.percent()),
+                FontId::proportional(12.0),
+                Color32::WHITE,
+            );
+        }
+    }
+
+    /// Mouse on a plot, as in the original: click to seek, drag to select,
+    /// right-drag to pan, pinch or ⌘/Ctrl-scroll to zoom, sideways scroll to
+    /// pan.
+    fn plot_input(&mut self, ui: &egui::Ui, response: &Response, span: Span) {
+        let (frames, rate) = (self.frames(), self.rate());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+        }
+        if response.drag_started_by(PointerButton::Primary) {
+            let from = ui
+                .input(|i| i.pointer.press_origin())
+                .map_or(span.start, |p| span.frame(p.x));
+            self.selecting = Some(from..from);
+        }
+        if response.dragged_by(PointerButton::Primary)
+            && let (Some(selecting), Some(pos)) =
+                (&mut self.selecting, response.interact_pointer_pos())
+        {
+            selecting.end = span.frame(pos.x);
+        }
+        if response.drag_stopped_by(PointerButton::Primary)
+            && let Some(s) = self.selecting.take()
+        {
+            let (from, to) = (s.start.min(s.end), s.start.max(s.end));
+            // Under a tenth of a second is a slip of the hand, as in the
+            // original.
+            if to - from >= 0.1 * rate {
+                self.select(Some(from as usize..(to as usize).min(frames)));
+            } else {
+                self.select(None);
+            }
+        }
+        if response.clicked_by(PointerButton::Primary)
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            self.select(None);
+            self.seek(span.frame(pos.x) as usize);
+        }
+        if response.dragged_by(PointerButton::Secondary) {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            self.pan(-f64::from(response.drag_delta().x / span.width) * span.len);
+        }
+        if let Some(pos) = response.hover_pos() {
+            let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta()));
+            if zoom != 1.0 {
+                self.zoom_at(span.frame(pos.x), 1.0 / f64::from(zoom));
+            }
+            if scroll.x != 0.0 {
+                self.pan(-f64::from(scroll.x / span.width) * span.len);
+            }
+        }
+    }
+
+    fn timeline_view(&mut self, ui: &mut egui::Ui) {
+        let Some(current) = &self.current else { return };
+        let area = Self::claim(ui);
+        let rect = Rect::from_min_max(area.min + Vec2::new(0.0, 4.0), area.max);
+        if rect.height() < 4.0 {
+            return;
+        }
+        let response = ui.interact(rect, ui.id().with("timeline"), Sense::click_and_drag());
+        let painter = ui.painter_at(area);
+        let frames = current.info.frames;
+        views::timeline(
+            &painter,
+            rect,
+            &current.timeline,
+            frames,
+            &self.view,
+            self.cursor,
+        );
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        // Click or drag moves the view to be centred there.
+        if (response.clicked() || response.dragged())
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let centre =
+                f64::from(((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0)) * frames as f64;
+            let len = self.view_len();
+            self.set_view(centre - len / 2.0, len);
+        }
+    }
+
+    fn meters_view(&mut self, ui: &mut egui::Ui) {
+        let Some(current) = &self.current else { return };
+        let channels = usize::from(current.info.channels);
+        let labels: Vec<String> = if channels == 1 {
+            vec!["M".to_owned()]
+        } else {
+            (1..=channels).map(|c| c.to_string()).collect()
+        };
+        // What is heard: the file's level plus the playback gain, over the
+        // stretch of file one screen refresh covers at this speed.
+        let levels = self
+            .player
+            .as_ref()
+            .filter(|p| p.is_playing())
+            .map(|player| {
+                let span =
+                    f64::from(current.info.sample_rate) * f64::from(self.settings.speed) / 20.0;
+                let gain = self.settings.gain;
+                current
+                    .levels
+                    .at(player.position(), span as usize)
+                    .into_iter()
+                    .map(|level| lift(level, gain))
+                    .collect::<Vec<_>>()
+            });
+        ui.add_space(4.0);
+        self.meters.ui(ui, levels.as_deref(), &labels);
+    }
+
+    fn spectrum_view(&mut self, ui: &mut egui::Ui) {
+        Self::claim(ui);
+        ui.add_space(4.0);
+        let (Some(current), Some(spectrum)) = (&self.current, &self.spectrum) else {
             ui.strong("Spectrum");
             ui.add_space(6.0);
             ui.weak("Click the spectrogram to inspect a moment");
             return;
         };
-        let at = sample as f64 / f64::from(current.info.sample_rate);
-        ui.strong(format!("Spectrum at {}", clock_fine(at)));
-        if self.spectrum.len() < 2 {
-            return;
-        }
-
+        let at = spectrum.request.frame as f64 / f64::from(current.info.sample_rate);
+        ui.strong(format!("Spectrum at {}", views::clock_fine(at)));
         let area = ui.available_rect_before_wrap();
         let plot = Rect::from_min_max(
             area.min + Vec2::new(42.0, 10.0),
             area.max - Vec2::new(10.0, 26.0),
         );
+        if plot.width() < 20.0 || plot.height() < 20.0 {
+            return;
+        }
         let painter = ui.painter_at(area);
         let nyquist = current.info.nyquist();
-        let lo = self.view.f_min.max(10.0).min(nyquist / 4.0);
-        let hi = self.view.f_max.clamp(lo * 4.0, nyquist);
+        let view = self.look().view;
+        let lo = view.f_min.max(10.0).min(nyquist / 4.0);
+        let hi = view.f_max.clamp(lo * 4.0, nyquist);
         // The floor follows the spectrogram's, but the top stays at full
-        // scale or above, so raising the spectrogram's gain never flattens
-        // the peaks here.
-        let (top, bottom) = (
-            self.view.top_db.max(0.0),
-            self.view.top_db - self.view.range_db,
-        );
-        let x_of = |f: f32| plot.left() + (f / lo).ln() / (hi / lo).ln() * plot.width();
-        let y_of =
-            |db: f32| plot.top() + ((top - db) / (top - bottom)).clamp(0.0, 1.0) * plot.height();
-
-        for f in freq_ticks(lo, hi, true, plot.width()) {
-            let x = x_of(f);
-            painter.line_segment(
-                [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
-                Stroke::new(1.0, GRID),
-            );
-            painter.text(
-                Pos2::new(x, plot.bottom() + 4.0),
-                Align2::CENTER_TOP,
-                hz(f),
-                FontId::monospace(10.0),
-                AXIS,
-            );
-        }
-        let mut db = (top / 20.0).floor() * 20.0;
-        while db >= bottom {
-            let y = y_of(db);
-            painter.line_segment(
-                [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
-                Stroke::new(1.0, GRID),
-            );
-            painter.text(
-                Pos2::new(plot.left() - 6.0, y),
-                Align2::RIGHT_CENTER,
-                format!("{db:.0}"),
-                FontId::monospace(10.0),
-                AXIS,
-            );
-            db -= 20.0;
-        }
-
-        let bin_hz = nyquist / (self.spectrum.len() - 1) as f32;
-        let points: Vec<Pos2> = self
-            .spectrum
+        // scale or above, so a brighter spectrogram never flattens the
+        // peaks here.
+        let top = (-view.brightness).max(0.0);
+        let bottom = -view.brightness - view.contrast;
+        let curves: Vec<views::Curve<'_>> = spectrum
+            .curves
             .iter()
-            .enumerate()
-            .map(|(k, &level)| (k as f32 * bin_hz, level))
-            .filter(|(f, _)| (lo..=hi).contains(f))
-            .map(|(f, level)| Pos2::new(x_of(f), y_of(level)))
+            .map(|(target, levels)| views::Curve {
+                name: self.target_name(*target),
+                color: match target {
+                    Target::Mix => Color32::WHITE,
+                    Target::Channel(c) => views::PALETTE[c % views::PALETTE.len()],
+                },
+                levels,
+            })
             .collect();
-        painter.add(egui::Shape::line(points, Stroke::new(1.2, Color32::WHITE)));
+        views::spectrum(&painter, plot, &curves, nyquist, (lo, hi), (top, bottom));
+    }
+
+    fn metadata_view(&self, ui: &mut egui::Ui) {
+        Self::claim(ui);
+        ui.add_space(4.0);
+        ui.strong("Metadata");
+        match &self.current {
+            Some(current) => views::metadata(ui, &current.details),
+            None => {
+                ui.weak("Open a file to see what it says about itself");
+            }
+        }
     }
 }
 
@@ -770,6 +1534,11 @@ impl eframe::App for App {
         self.poll(&ctx);
         self.input(&ctx);
         self.follow_playback(&ctx);
+        self.start_due_analysis(&ctx);
+        self.update_probe();
+        if self.loading.is_some() || self.whole_job.is_some() || self.detail_job.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
 
         let widest = (ui.available_width() / 6.0).max(140.0);
         let mut clicked = None;
@@ -778,7 +1547,7 @@ impl eframe::App for App {
             .default_size(widest.min(240.0))
             .min_size(140.0)
             .max_size(widest)
-            .show_collapsible(ui, &mut self.explorer_open, |ui| {
+            .show_collapsible(ui, &mut self.settings.explorer, |ui| {
                 clicked = self.explorer.ui(ui)
             });
         if let Some(path) = clicked {
@@ -787,13 +1556,69 @@ impl eframe::App for App {
 
         egui::Panel::top("header").show(ui, |ui| self.header(ui));
         egui::Panel::bottom("controls").show(ui, |ui| self.controls(ui));
-        self.refresh_texture(&ctx);
-        egui::Panel::right("spectrum")
-            .resizable(true)
-            .default_size(360.0)
-            .min_size(220.0)
-            .show(ui, |ui| self.spectrum_panel(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.spectrogram_panel(ui));
+        let views = self.settings.views;
+        if self.current.is_some() && views.meters {
+            egui::Panel::bottom("meters").show(ui, |ui| self.meters_view(ui));
+        }
+        if self.current.is_some() && views.timeline {
+            egui::Panel::bottom("timeline")
+                .resizable(true)
+                .default_size(44.0)
+                .size_range(28.0..=240.0)
+                .show(ui, |ui| self.timeline_view(ui));
+        }
+        self.refresh_textures(&ctx);
+        let central = views.spectrogram || views.waveform;
+        let side = views.spectrum || views.metadata;
+        if central && side {
+            egui::Panel::right("side")
+                .resizable(true)
+                .default_size(360.0)
+                .min_size(220.0)
+                .show(ui, |ui| self.side(ui));
+        }
+        egui::CentralPanel::default().show(ui, |ui| {
+            if central {
+                self.central(ui);
+            } else if side {
+                self.side(ui);
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new("Every view is switched off: tick one at the top").weak(),
+                    );
+                });
+            }
+        });
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.settings.folder = self.explorer.root().map(Path::to_owned);
+        eframe::set_value(storage, eframe::APP_KEY, &self.settings);
+    }
+}
+
+/// A frequency slider on a log scale, with the value typed in Hz or kHz.
+fn frequency_slider(value: &mut f64, range: RangeInclusive<f64>) -> egui::Slider<'_> {
+    egui::Slider::new(value, range)
+        .logarithmic(true)
+        .smallest_positive(10.0)
+        .custom_formatter(|v, _| views::hz_field(v))
+        .custom_parser(views::parse_hz)
+}
+
+/// `level` played with `gain` dB on: silence stays silence.
+fn lift(level: Level, gain: f32) -> Level {
+    let raise = |db: f32| {
+        if db > FLOOR_DB {
+            (db + gain).max(FLOOR_DB)
+        } else {
+            FLOOR_DB
+        }
+    };
+    Level {
+        rms_db: raise(level.rms_db),
+        peak_db: raise(level.peak_db),
     }
 }
 
@@ -801,14 +1626,14 @@ fn summary(c: &Loaded) -> String {
     let info = &c.info;
     let mut parts = vec![
         info.container.clone(),
-        format!("{}Hz", hz(info.sample_rate as f32)),
+        format!("{}Hz", views::hz(info.sample_rate as f32)),
     ];
     parts.extend(info.bits.map(|b| format!("{b}-bit")));
     parts.push(format!("{} ch", info.channels));
-    parts.push(clock(info.seconds()));
+    parts.push(views::clock(info.seconds()));
     parts.extend(c.meta.recorder.clone());
     if let Some(start) = &c.meta.start {
-        let time = wall(start.seconds);
+        let time = views::wall(start.seconds);
         parts.push(match &start.date {
             Some(date) => format!("{date} {time}"),
             None => time,
@@ -817,114 +1642,88 @@ fn summary(c: &Loaded) -> String {
     parts.join("  ·  ")
 }
 
-fn hz(f: f32) -> String {
-    if f < 1000.0 {
-        return format!("{f:.0}");
-    }
-    let k = f / 1000.0;
-    if (k - k.round()).abs() < 0.05 {
-        format!("{k:.0}k")
-    } else {
-        format!("{k:.1}k")
-    }
-}
-
-/// Elapsed time as `m:ss`, or `h:mm:ss` from an hour on.
-fn clock(seconds: f64) -> String {
-    let s = seconds.max(0.0).round() as u64;
-    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        format!("{m}:{s:02}")
-    }
-}
-
-fn clock_fine(seconds: f64) -> String {
-    let hundredths = (seconds.max(0.0) * 100.0).round() as u64;
-    format!(
-        "{}.{:02}",
-        clock((hundredths / 100) as f64),
-        hundredths % 100
-    )
-}
-
-/// Time of day, wrapping past midnight.
-fn wall(seconds: f64) -> String {
-    let s = seconds.rem_euclid(86_400.0) as u64;
-    format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
-}
-
-/// The smallest tick spacing that leaves room for each label.
-fn time_step(seconds: f64, width: f32) -> f64 {
-    const STEPS: [f64; 14] = [
-        1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0,
-    ];
-    let fits = f64::from(width / 90.0).max(1.0);
-    STEPS
-        .into_iter()
-        .find(|step| seconds / step <= fits)
-        .unwrap_or(14_400.0)
-}
-
-fn nice_step(raw: f32) -> f32 {
-    let magnitude = 10f32.powf(raw.log10().floor());
-    let mantissa = match raw / magnitude {
-        m if m <= 1.0 => 1.0,
-        m if m <= 2.0 => 2.0,
-        m if m <= 2.5 => 2.5,
-        m if m <= 5.0 => 5.0,
-        _ => 10.0,
-    };
-    magnitude * mantissa
-}
-
-fn freq_ticks(lo: f32, hi: f32, log: bool, length: f32) -> Vec<f32> {
-    let mut ticks = Vec::new();
-    if log {
-        let mut decade = 10f32.powf(lo.log10().floor());
-        while decade <= hi {
-            ticks.extend(
-                [1.0, 2.0, 5.0]
-                    .map(|m| decade * m)
-                    .into_iter()
-                    .filter(|f| (lo..=hi).contains(f)),
-            );
-            decade *= 10.0;
-        }
-    } else {
-        let step = nice_step((hi - lo) / (length / 55.0).max(2.0));
-        let mut f = (lo / step).ceil() * step;
-        while f <= hi {
-            ticks.push(f);
-            f += step;
-        }
-    }
-    ticks
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::Storage;
+    use std::collections::HashMap;
 
-    #[test]
-    fn frequency_labels_read_naturally() {
-        assert_eq!(hz(440.0), "440");
-        assert_eq!(hz(2_500.0), "2.5k");
-        assert_eq!(hz(192_000.0), "192k");
+    #[derive(Default)]
+    struct Memory(HashMap<String, String>);
+
+    impl eframe::Storage for Memory {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+
+        fn remove_string(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+
+        fn flush(&mut self) {}
     }
 
     #[test]
-    fn clocks_format_elapsed_and_wall_time() {
-        assert_eq!(clock(364.0), "6:04");
-        assert_eq!(clock(3_725.0), "1:02:05");
-        assert_eq!(clock_fine(59.994), "0:59.99");
-        assert_eq!(wall(61_454.0 + 86_400.0), "17:04:14");
+    fn settings_come_back_as_they_were_left() {
+        let mut storage = Memory::default();
+        let mut settings = Settings::default();
+        settings.views.metadata = true;
+        settings.views.waveform = false;
+        settings.channels = Channels::One(3);
+        settings.brightness = 25.0;
+        eframe::set_value(&mut storage, eframe::APP_KEY, &settings);
+        let back: Settings = eframe::get_value(&storage, eframe::APP_KEY).unwrap();
+        assert!(back.views.metadata && !back.views.waveform);
+        assert_eq!((back.channels, back.brightness), (Channels::One(3), 25.0));
     }
 
     #[test]
-    fn linear_ticks_step_nicely() {
-        let expected: Vec<f32> = (0..=4).map(|i| i as f32 * 5_000.0).collect();
-        assert_eq!(freq_ticks(0.0, 24_000.0, false, 275.0), expected);
+    fn settings_missing_from_an_older_file_take_their_defaults() {
+        let mut storage = Memory::default();
+        storage.set_string(
+            eframe::APP_KEY,
+            "(fft: 4096, views: (meters: false))".to_owned(),
+        );
+        let back: Settings = eframe::get_value(&storage, eframe::APP_KEY).unwrap();
+        assert_eq!((back.fft, back.contrast), (4096, 90.0));
+        assert!(!back.views.meters && back.views.spectrogram);
+    }
+
+    #[test]
+    fn settings_out_of_range_are_brought_back() {
+        let settings = Settings {
+            fft: 1000,
+            speed: 3,
+            brightness: 500.0,
+            contrast: f32::NAN,
+            gain: -90.0,
+            ..Settings::default()
+        }
+        .sanitized();
+        assert_eq!((settings.fft, settings.speed), (2048, 1));
+        assert_eq!(
+            (settings.brightness, settings.contrast, settings.gain),
+            (80.0, 90.0, -60.0)
+        );
+    }
+
+    #[test]
+    fn gain_lifts_levels_but_silence_stays_silent() {
+        let quiet = Level {
+            rms_db: -40.0,
+            peak_db: FLOOR_DB,
+        };
+        assert_eq!(
+            lift(quiet, 30.0),
+            Level {
+                rms_db: -10.0,
+                peak_db: FLOOR_DB
+            }
+        );
+        assert_eq!(lift(quiet, -70.0).rms_db, FLOOR_DB);
     }
 }

@@ -8,9 +8,6 @@
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use rayon::prelude::*;
 
 /// Metadata chunks are read whole; past this they are cut short, so a
 /// damaged size field cannot ask for gigabytes of memory.
@@ -47,17 +44,26 @@ impl SampleKind {
         }
     }
 
-    pub fn decode(self, s: &[u8]) -> f32 {
-        match self {
-            Self::U8 => (f32::from(s[0]) - 128.0) / 128.0,
-            Self::I16 => f32::from(i16::from_le_bytes([s[0], s[1]])) / 32_768.0,
-            // Top-align the 24 bits so the arithmetic shift sign-extends them.
-            Self::I24 => (i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8) as f32 / 8_388_608.0,
-            Self::I32 => i32::from_le_bytes([s[0], s[1], s[2], s[3]]) as f32 / 2_147_483_648.0,
-            Self::F32 => f32::from_le_bytes([s[0], s[1], s[2], s[3]]),
-            Self::F64 => {
-                f64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32
+    /// Every sample in `bytes`, with the format chosen once rather than per
+    /// sample.
+    pub fn decode_all(self, bytes: &[u8], out: &mut [f32]) {
+        fn each<const N: usize>(bytes: &[u8], out: &mut [f32], f: impl Fn([u8; N]) -> f32) {
+            for (o, s) in out.iter_mut().zip(bytes.as_chunks::<N>().0) {
+                *o = f(*s);
             }
+        }
+        match self {
+            Self::U8 => each::<1>(bytes, out, |[a]| (f32::from(a) - 128.0) / 128.0),
+            Self::I16 => each::<2>(bytes, out, |s| f32::from(i16::from_le_bytes(s)) / 32_768.0),
+            // Top-align the 24 bits so the arithmetic shift sign-extends them.
+            Self::I24 => each::<3>(bytes, out, |[a, b, c]| {
+                (i32::from_le_bytes([0, a, b, c]) >> 8) as f32 / 8_388_608.0
+            }),
+            Self::I32 => each::<4>(bytes, out, |s| {
+                i32::from_le_bytes(s) as f32 / 2_147_483_648.0
+            }),
+            Self::F32 => each::<4>(bytes, out, f32::from_le_bytes),
+            Self::F64 => each::<8>(bytes, out, |s| f64::from_le_bytes(s) as f32),
         }
     }
 }
@@ -66,10 +72,12 @@ impl SampleKind {
 pub struct Bext {
     pub description: String,
     pub originator: String,
+    pub originator_reference: String,
     pub origination_date: String,
     pub origination_time: String,
     /// Samples since midnight at the first sample of the file.
     pub time_reference: u64,
+    pub coding_history: String,
 }
 
 #[derive(Debug)]
@@ -155,6 +163,9 @@ pub fn parse<R: Read + Seek>(file: &mut R) -> Result<Wav, Error> {
         let size = u32::from_le_bytes(size);
         let size = match data_size_64 {
             Some(real) if &id == b"data" && size == u32::MAX => real,
+            // A recorder that lost power mid-take can leave the size it
+            // writes at the end as zero: the audio is still all there.
+            _ if &id == b"data" && size == 0 => len - pos - 8,
             _ => u64::from(size),
         };
         let start = pos + 8;
@@ -230,9 +241,11 @@ fn parse_bext(b: &[u8]) -> Option<Bext> {
     Some(Bext {
         description: text(b.get(0..256)?),
         originator: text(b.get(256..288)?),
+        originator_reference: text(b.get(288..320)?),
         origination_date: text(b.get(320..330)?),
         origination_time: text(b.get(330..338)?),
         time_reference: u64::from_le_bytes(le(b, 338)?),
+        coding_history: b.get(602..).map(text).unwrap_or_default(),
     })
 }
 
@@ -248,56 +261,12 @@ fn parse_info(mut b: &[u8]) -> Vec<([u8; 4], String)> {
 }
 
 impl Wav {
-    fn frame_bytes(&self) -> usize {
+    pub fn frame_bytes(&self) -> usize {
         self.kind.bytes() * usize::from(self.channels)
     }
 
     pub fn frames(&self) -> usize {
         usize::try_from(self.data.end - self.data.start).unwrap_or(usize::MAX) / self.frame_bytes()
-    }
-
-    /// The channels averaged into one signal, which is what gets analysed.
-    ///
-    /// Slices are read in parallel, each worker through its own handle from
-    /// `open`. Unlike a memory-mapped file, a card pulled out mid-read ends
-    /// in an error rather than a crash.
-    pub fn mono<R: Read + Seek>(
-        &self,
-        open: impl Fn() -> io::Result<R> + Sync,
-        cancel: &AtomicBool,
-    ) -> io::Result<Vec<f32>> {
-        const SLICE_FRAMES: usize = 1 << 18;
-        let (frame, width) = (self.frame_bytes(), self.kind.bytes());
-        let scale = 1.0 / f32::from(self.channels);
-        let mut out = vec![0.0; self.frames()];
-        out.par_chunks_mut(SLICE_FRAMES)
-            .enumerate()
-            .try_for_each_init(
-                || (None, Vec::new()),
-                |(file, bytes): &mut (Option<R>, Vec<u8>), (i, slice)| {
-                    if cancel.load(Ordering::Relaxed) {
-                        return Err(io::Error::other("cancelled"));
-                    }
-                    let file = match file {
-                        Some(file) => file,
-                        None => file.insert(open()?),
-                    };
-                    bytes.resize(slice.len() * frame, 0);
-                    file.seek(SeekFrom::Start(
-                        self.data.start + (i * SLICE_FRAMES * frame) as u64,
-                    ))?;
-                    file.read_exact(bytes)?;
-                    for (mono, f) in slice.iter_mut().zip(bytes.chunks_exact(frame)) {
-                        *mono = f
-                            .chunks_exact(width)
-                            .map(|s| self.kind.decode(s))
-                            .sum::<f32>()
-                            * scale;
-                    }
-                    Ok(())
-                },
-            )?;
-        Ok(out)
     }
 }
 
@@ -306,9 +275,15 @@ pub(crate) mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// A minimal WAV, optionally RF64 with a placeholder data size, plus
-    /// whatever extra chunks the test wants, placed before `data`.
-    pub fn build(rf64: bool, extra: &[(&[u8; 4], Vec<u8>)], samples: &[i16]) -> Vec<u8> {
+    /// A minimal 16-bit WAV at 48 kHz, optionally RF64 with a placeholder
+    /// data size, plus whatever extra chunks the test wants, placed before
+    /// `data`. `samples` are interleaved over `channels`.
+    pub fn build_channels(
+        rf64: bool,
+        channels: u16,
+        extra: &[(&[u8; 4], Vec<u8>)],
+        samples: &[i16],
+    ) -> Vec<u8> {
         let mut body = b"WAVE".to_vec();
         let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
         let chunk = |out: &mut Vec<u8>, id: &[u8; 4], size: u32, bytes: &[u8]| {
@@ -324,12 +299,13 @@ pub(crate) mod tests {
             ds64[8..16].copy_from_slice(&(data.len() as u64).to_le_bytes());
             chunk(&mut body, b"ds64", 28, &ds64);
         }
+        let block = 2 * channels;
         let mut fmt = Vec::new();
         fmt.extend_from_slice(&1u16.to_le_bytes());
-        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
         fmt.extend_from_slice(&48_000u32.to_le_bytes());
-        fmt.extend_from_slice(&96_000u32.to_le_bytes());
-        fmt.extend_from_slice(&2u16.to_le_bytes());
+        fmt.extend_from_slice(&(48_000 * u32::from(block)).to_le_bytes());
+        fmt.extend_from_slice(&block.to_le_bytes());
         fmt.extend_from_slice(&16u16.to_le_bytes());
         chunk(&mut body, b"fmt ", 16, &fmt);
         for (id, bytes) in extra {
@@ -347,10 +323,9 @@ pub(crate) mod tests {
         file
     }
 
-    fn mono(file: &[u8]) -> Vec<f32> {
-        let w = parse(&mut Cursor::new(file)).unwrap();
-        w.mono(|| Ok(Cursor::new(file)), &AtomicBool::new(false))
-            .unwrap()
+    /// Mono, as most tests want.
+    pub fn build(rf64: bool, extra: &[(&[u8; 4], Vec<u8>)], samples: &[i16]) -> Vec<u8> {
+        build_channels(rf64, 1, extra, samples)
     }
 
     #[test]
@@ -361,7 +336,7 @@ pub(crate) mod tests {
             (w.container, w.sample_rate, w.channels, w.kind),
             ("WAV", 48_000, 1, SampleKind::I16)
         );
-        assert_eq!(mono(&file), vec![0.0, 0.5, -0.5]);
+        assert_eq!(w.frames(), 3);
     }
 
     #[test]
@@ -377,34 +352,21 @@ pub(crate) mod tests {
         let mut file = build(false, &[], &[7; 100]);
         file.truncate(file.len() - 50);
         assert_eq!(parse(&mut Cursor::new(&file)).unwrap().frames(), 75);
-        assert_eq!(mono(&file).len(), 75);
     }
 
     #[test]
-    fn slices_join_up_in_order() {
-        let samples: Vec<i16> = (0..700_000).map(|i| (i % 32_000) as i16).collect();
-        let file = build(false, &[], &samples);
-        let mono = mono(&file);
-        assert_eq!(mono.len(), samples.len());
-        assert!(
-            mono.iter()
-                .zip(&samples)
-                .all(|(m, &s)| *m == f32::from(s) / 32_768.0)
-        );
-    }
-
-    #[test]
-    fn a_cancelled_read_stops() {
-        let file = build(false, &[], &[1; 16]);
-        let w = parse(&mut Cursor::new(&file)).unwrap();
-        let read = w.mono(|| Ok(Cursor::new(&file)), &AtomicBool::new(true));
-        assert!(read.is_err());
+    fn a_data_size_left_at_zero_still_reads_the_audio() {
+        let mut file = build(false, &[], &[7; 100]);
+        let at = file.len() - 200 - 4;
+        file[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(parse(&mut Cursor::new(&file)).unwrap().frames(), 100);
     }
 
     #[test]
     fn decodes_24_bit_sign_correctly() {
-        assert_eq!(SampleKind::I24.decode(&[0x00, 0x00, 0x80]), -1.0);
-        assert_eq!(SampleKind::I24.decode(&[0x00, 0x00, 0x40]), 0.5);
+        let mut out = [0.0; 2];
+        SampleKind::I24.decode_all(&[0x00, 0x00, 0x80, 0x00, 0x00, 0x40], &mut out);
+        assert_eq!(out, [-1.0, 0.5]);
     }
 
     #[test]
