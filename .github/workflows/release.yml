@@ -1,0 +1,73 @@
+name: Release
+
+# Builds the installable packages on each platform's own runner: a .dmg for
+# Apple silicon Macs, an NSIS installer .exe for Windows, and a .deb plus an
+# AppImage for Linux. Pushing a v* tag also publishes them as a GitHub
+# release; running it by hand just leaves them as downloadable artifacts.
+#
+# No build cache on purpose: anything able to write a cache entry would get
+# to shape the binaries people download.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            formats: dmg
+          - runner: windows-2025
+            formats: nsis
+          # The oldest supported Ubuntu, so the AppImage runs on older distros.
+          - runner: ubuntu-22.04
+            formats: deb,appimage
+    runs-on: ${{ matrix.runner }}
+    env:
+      FORMATS: ${{ matrix.formats }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libfuse2
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      - name: Package
+        run: cargo packager --release --formats "$FORMATS"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: soundcheck-${{ runner.os }}
+          path: target/packages/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: packages
+          merge-multiple: true
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" packages/* --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
