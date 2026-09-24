@@ -4,12 +4,14 @@
 
 mod app;
 mod audio;
+mod edit;
 mod explorer;
 mod finder;
 mod levels;
 mod meta;
 mod playback;
 mod probe;
+mod save;
 mod spectrogram;
 mod views;
 mod wav;

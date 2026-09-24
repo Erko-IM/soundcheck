@@ -1,15 +1,19 @@
 //! Drawing for each view: axes and lanes, the waveform, the timeline, the
 //! meters, the spectrum and the metadata.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use eframe::egui::{
-    self, Align, Align2, Color32, FontId, Label, Layout, Painter, Pos2, Rect, RichText, Sense,
-    Shape, Stroke, StrokeKind, TextureId, Ui, Vec2,
+    self, Align, Align2, Button, Color32, ColorImage, FontId, Label, Layout, Painter, Pos2, Rect,
+    Response, RichText, Sense, Shape, Stroke, StrokeKind, TextEdit, TextureHandle, TextureId,
+    TextureOptions, Ui, Vec2,
 };
 
+use crate::edit::{BEXT_FIELDS, Edits};
 use crate::levels::{FLOOR_DB, Level};
-use crate::meta::Details;
+use crate::meta::{self, Details};
+use crate::wav::Marker;
 
 pub const CURSOR: Color32 = Color32::from_rgb(235, 70, 60);
 pub const AXIS: Color32 = Color32::from_gray(150);
@@ -20,8 +24,12 @@ const SELECTION: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 5
 const SELECTION_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 178);
 const VIEWPORT: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 64);
 const VIEWPORT_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 153);
-const TIMELINE_BACK: Color32 = Color32::from_gray(17);
+const TIMELINE_BACK: Color32 = Color32::from_gray(22);
 const TIMELINE_WAVE: Color32 = Color32::from_gray(85);
+const TIMELINE_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(236, 224, 160, 170);
+pub const MARK: Color32 = Color32::from_rgb(255, 196, 70);
+const MARK_SPAN: Color32 = Color32::from_rgba_unmultiplied_const(255, 196, 70, 30);
+const LISTENER: Color32 = Color32::from_gray(150);
 const METER_BACK: Color32 = Color32::from_gray(28);
 const METER_LOW: Color32 = Color32::from_rgb(70, 190, 110);
 const METER_MID: Color32 = Color32::from_rgb(235, 160, 50);
@@ -247,7 +255,8 @@ pub fn centre_line(painter: &Painter, lane: Rect) {
 }
 
 /// The whole file, as in the original's minimap: the loudest channel
-/// mirrored about the middle, the part in view, and the playhead.
+/// mirrored about the middle, the markers, the part in view with a grip at
+/// each end, and the playhead.
 pub fn timeline(
     painter: &Painter,
     rect: Rect,
@@ -255,8 +264,15 @@ pub fn timeline(
     frames: usize,
     view: &Range<f64>,
     playhead: Option<usize>,
+    markers: &[Marker],
 ) {
-    painter.rect_filled(rect, 0.0, TIMELINE_BACK);
+    painter.rect_filled(rect, 2.0, TIMELINE_BACK);
+    painter.rect_stroke(
+        rect,
+        2.0,
+        Stroke::new(1.0, TIMELINE_EDGE),
+        StrokeKind::Outside,
+    );
     let columns = overview.first().map_or(0, Vec::len);
     if columns == 0 || frames == 0 {
         return;
@@ -283,6 +299,9 @@ pub fn timeline(
     }
     painter.extend(shapes);
     let x_of = |frame: f64| rect.left() + (frame / frames as f64) as f32 * rect.width();
+    for m in markers {
+        painter.vline(x_of(m.frame as f64), rect.y_range(), Stroke::new(1.0, MARK));
+    }
     let shown = Rect::from_x_y_ranges(x_of(view.start)..=x_of(view.end), rect.y_range());
     painter.rect_filled(shown, 0.0, VIEWPORT);
     painter.rect_stroke(
@@ -291,8 +310,207 @@ pub fn timeline(
         Stroke::new(1.0, VIEWPORT_EDGE),
         StrokeKind::Inside,
     );
+    let grip = rect.center().y - 7.0..=rect.center().y + 7.0;
+    for x in [shown.left() + 1.5, shown.right() - 1.5] {
+        painter.vline(x, grip.clone(), Stroke::new(3.0, VIEWPORT_EDGE));
+    }
     if let Some(frame) = playhead {
         painter.vline(x_of(frame as f64), rect.y_range(), Stroke::new(1.0, CURSOR));
+    }
+}
+
+/// Markers across `plot`: a line at each and each region's span shaded,
+/// and with `tabs` a tab along the top edge naming each. Returns the tabs,
+/// for dragging.
+pub fn markers_on(
+    painter: &Painter,
+    plot: Rect,
+    span: Span,
+    markers: &[Marker],
+    tabs: bool,
+) -> Vec<(u32, Rect)> {
+    let mut found = Vec::new();
+    for (i, m) in markers.iter().enumerate() {
+        let x = span.x(m.frame as f64);
+        if m.length > 0 {
+            let end = span.x((m.frame + m.length) as f64);
+            let (left, right) = (x.max(plot.left()), end.min(plot.right()));
+            if right > left {
+                painter.rect_filled(
+                    Rect::from_x_y_ranges(left..=right, plot.y_range()),
+                    0.0,
+                    MARK_SPAN,
+                );
+            }
+        }
+        if !(plot.left()..=plot.right()).contains(&x) {
+            continue;
+        }
+        painter.vline(x, plot.y_range(), Stroke::new(1.0, MARK));
+        if tabs {
+            let name = match m.label.chars().count() {
+                0 => (i + 1).to_string(),
+                1..=24 => m.label.clone(),
+                _ => format!("{}…", m.label.chars().take(23).collect::<String>()),
+            };
+            let galley = painter.layout_no_wrap(name, FontId::proportional(11.0), Color32::BLACK);
+            let tab = Rect::from_min_size(
+                Pos2::new(x, plot.top()),
+                galley.size() + Vec2::new(8.0, 2.0),
+            );
+            painter.rect_filled(tab, 2.0, MARK);
+            painter.galley(tab.min + Vec2::new(4.0, 1.0), galley, Color32::BLACK);
+            found.push((m.id, tab));
+        }
+    }
+    found
+}
+
+/// How far a figure has turned from a person into a bat at `hz`: not at
+/// all up to 20 kHz, where human hearing ends, and wholly by 100 kHz.
+pub fn batness(hz: f32) -> f32 {
+    ((hz / 20_000.0).ln() / 5f32.ln()).clamp(0.0, 1.0)
+}
+
+/// A part of the figure, in a square from -1 to 1 with y down.
+enum Part {
+    Disc(Vec2, f32),
+    /// From one point to another, this thick, with round ends.
+    Limb(Vec2, Vec2, f32),
+    Area(Vec<Vec2>),
+}
+
+impl Part {
+    fn covers(&self, p: Vec2) -> bool {
+        match self {
+            Self::Disc(centre, radius) => (p - *centre).length() <= *radius,
+            Self::Limb(a, b, width) => {
+                let ab = *b - *a;
+                let along = ((p - *a).dot(ab) / ab.length_sq().max(1e-9)).clamp(0.0, 1.0);
+                (p - (*a + ab * along)).length() <= width / 2.0
+            }
+            // Counting the edges a ray from `p` crosses, so an outline that
+            // folds in on itself still fills as drawn.
+            Self::Area(corners) => {
+                let mut inside = false;
+                for (i, a) in corners.iter().enumerate() {
+                    let b = corners[(i + 1) % corners.len()];
+                    if (a.y > p.y) != (b.y > p.y)
+                        && p.x < a.x + (b.x - a.x) * (p.y - a.y) / (b.y - a.y)
+                    {
+                        inside = !inside;
+                    }
+                }
+                inside
+            }
+        }
+    }
+}
+
+/// The figure `t` of the way from a person with arms raised to a bat with
+/// wings spread, every point moving straight from the one to the other.
+fn figure(t: f32) -> Vec<Part> {
+    let at = |(ax, ay): (f32, f32), (bx, by): (f32, f32)| {
+        Vec2::new(ax + (bx - ax) * t, ay + (by - ay) * t)
+    };
+    let size = |a: f32, b: f32| a + (b - a) * t;
+    let head = (0.0, -0.66);
+    let mut parts = vec![
+        Part::Disc(at(head, (0.0, -0.3)), size(0.19, 0.17)),
+        Part::Limb(
+            at((0.0, -0.28), (0.0, -0.18)),
+            at((0.0, 0.12), (0.0, 0.24)),
+            size(0.32, 0.36),
+        ),
+    ];
+    for side in [-1.0, 1.0] {
+        let s = |(x, y): (f32, f32)| (x * side, y);
+        // Ears grow out of the head, and the legs shrink to feet.
+        let ear = [(0.05, -0.4), (0.17, -0.34), (0.16, -0.62)];
+        parts.push(Part::Area(ear.map(|p| at(head, s(p))).to_vec()));
+        parts.push(Part::Limb(
+            at(s((0.08, 0.12)), s((0.06, 0.22))),
+            at(s((0.28, 0.92)), s((0.1, 0.42))),
+            size(0.16, 0.1),
+        ));
+        let (shoulder, hand) = ((0.12, -0.34), (0.62, -0.84));
+        parts.push(Part::Limb(
+            at(s(shoulder), s((0.1, -0.14))),
+            at(s(hand), s((0.5, -0.44))),
+            size(0.14, 0.1),
+        ));
+        // The wing unfolds from the arm: each corner starts that far along
+        // it, from the shoulder to the hand.
+        let wing = [
+            (0.0, (0.1, -0.14)),
+            (1.0, (0.5, -0.44)),
+            (1.0, (1.0, -0.2)),
+            (0.9, (0.78, -0.02)),
+            (0.8, (0.84, 0.2)),
+            (0.65, (0.6, 0.12)),
+            (0.5, (0.52, 0.34)),
+            (0.3, (0.32, 0.18)),
+            (0.0, (0.12, 0.26)),
+        ];
+        let on_arm = |along: f32| {
+            (
+                shoulder.0 + (hand.0 - shoulder.0) * along,
+                shoulder.1 + (hand.1 - shoulder.1) * along,
+            )
+        };
+        let corners = wing.map(|(along, spread)| at(s(on_arm(along)), s(spread)));
+        parts.push(Part::Area(corners.to_vec()));
+    }
+    parts
+}
+
+/// `figure(t)` in white on clear, `size` pixels square, each pixel sampled
+/// four by four so the edges come out smooth.
+fn figure_image(t: f32, size: usize) -> ColorImage {
+    const SAMPLES: usize = 4;
+    let parts = figure(t);
+    let pixels = (0..size * size)
+        .map(|i| {
+            let corner = Vec2::new((i % size) as f32, (i / size) as f32);
+            let hits = (0..SAMPLES * SAMPLES)
+                .filter(|k| {
+                    let within =
+                        Vec2::new((k % SAMPLES) as f32, (k / SAMPLES) as f32) + Vec2::splat(0.5);
+                    let p =
+                        (corner + within / SAMPLES as f32) / size as f32 * 2.0 - Vec2::splat(1.0);
+                    parts.iter().any(|part| part.covers(p))
+                })
+                .count();
+            Color32::from_white_alpha((hits * 255 / (SAMPLES * SAMPLES)) as u8)
+        })
+        .collect();
+    ColorImage::new([size, size], pixels)
+}
+
+/// The small grey figure beside each frequency slider, for who could hear
+/// that frequency: a person, turning bit by bit into a bat the further past
+/// human hearing it goes. Each step of the way is drawn once and kept.
+#[derive(Default)]
+pub struct Listeners(HashMap<(u16, usize), TextureHandle>);
+
+impl Listeners {
+    const STEPS: f32 = 64.0;
+
+    pub fn show(&mut self, ui: &mut Ui, hz: f32) -> Response {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+        let step = (batness(hz) * Self::STEPS).round() as u16;
+        let size = (rect.width() * ui.ctx().pixels_per_point()).ceil() as usize;
+        let texture = self.0.entry((step, size)).or_insert_with(|| {
+            let image = figure_image(f32::from(step) / Self::STEPS, size);
+            ui.ctx().load_texture(
+                format!("listener-{step}-{size}"),
+                image,
+                TextureOptions::LINEAR,
+            )
+        });
+        let whole = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+        ui.painter().image(texture.id(), rect, whole, LISTENER);
+        response
     }
 }
 
@@ -511,36 +729,153 @@ pub fn spectrum(
     }
 }
 
-/// Every section the file carries, as label and value rows whose values
-/// can be selected and copied.
-pub fn metadata(ui: &mut Ui, details: &Details) {
+/// A section of the Metadata view that folds away, starting `open` or not,
+/// and then as it was last left.
+fn section(ui: &mut Ui, title: &str, open: bool, rows: impl FnOnce(&mut Ui)) {
+    egui::CollapsingHeader::new(RichText::new(title).strong().size(14.0))
+        .default_open(open)
+        .show(ui, rows);
+}
+
+/// A label, and beside it whatever `value` adds, wrapping at the edge.
+fn row(ui: &mut Ui, label: &str, value: impl FnOnce(&mut Ui)) {
+    let width = (ui.available_width() * 0.38).clamp(80.0, 180.0);
+    ui.horizontal_top(|ui| {
+        ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::Min), |ui| {
+            ui.set_width(width);
+            ui.add(Label::new(RichText::new(label).color(AXIS)).wrap());
+        });
+        value(ui);
+    });
+}
+
+fn filled<'a>(mut values: impl Iterator<Item = &'a String>) -> bool {
+    values.any(|v| !v.trim().is_empty())
+}
+
+fn field(ui: &mut Ui, value: &mut String, limit: Option<usize>, multiline: bool, locked: bool) {
+    let mut edit = if multiline {
+        TextEdit::multiline(value).desired_rows(2)
+    } else {
+        TextEdit::singleline(value)
+    }
+    .desired_width(f32::INFINITY);
+    if let Some(limit) = limit {
+        edit = edit.char_limit(limit);
+    }
+    ui.add_enabled(!locked, edit);
+}
+
+/// The Metadata view. The File rows are as read; for a WAV every field it
+/// can hold is editable, and locked while a save runs.
+pub fn metadata(ui: &mut Ui, details: &Details, edits: Option<&mut Edits>, locked: bool) {
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
-            for (title, rows) in &details.sections {
-                ui.add_space(6.0);
-                ui.label(RichText::new(title).strong().size(14.0));
-                ui.add_space(2.0);
-                for (label, value) in rows {
-                    let width = (ui.available_width() * 0.38).clamp(80.0, 180.0);
-                    ui.horizontal_top(|ui| {
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(width, 0.0),
-                            Layout::top_down(Align::Min),
-                            |ui| {
-                                ui.set_width(width);
-                                ui.add(
-                                    Label::new(RichText::new(label.as_str()).color(AXIS)).wrap(),
-                                );
-                            },
-                        );
-                        ui.add(Label::new(value.as_str()).selectable(true).wrap());
+            // Without edits, everything is shown as read; with them, only
+            // the file's own facts, the rest being the fields below. The
+            // facts start folded, as the header already has most of them,
+            // and so does a section with nothing in it yet.
+            let shown = if edits.is_some() {
+                &details.sections[..details.sections.len().min(1)]
+            } else {
+                &details.sections[..]
+            };
+            for (title, rows) in shown {
+                section(ui, title, title != "File", |ui| {
+                    for (label, value) in rows {
+                        row(ui, label, |ui| {
+                            ui.add(Label::new(value.as_str()).selectable(true).wrap());
+                        });
+                    }
+                });
+            }
+            let Some(edits) = edits else { return };
+            let bext = filled(edits.bext.iter().chain([&edits.start, &edits.coding_history]));
+            section(ui, "Broadcast WAV", bext, |ui| {
+                for (i, (label, bytes)) in BEXT_FIELDS.iter().enumerate() {
+                    row(ui, label, |ui| {
+                        field(ui, &mut edits.bext[i], Some(bytes.len()), i == 0, locked)
                     });
                 }
-                ui.add_space(4.0);
-                ui.separator();
+                row(ui, "Start", |ui| {
+                    let edit = TextEdit::singleline(&mut edits.start)
+                        .hint_text("hh:mm:ss.sss")
+                        .desired_width(f32::INFINITY);
+                    ui.add_enabled(!locked, edit).on_hover_text(
+                        "Time of day at the first sample, which the timeline shows under elapsed time",
+                    );
+                });
+                row(ui, "Coding history", |ui| {
+                    field(ui, &mut edits.coding_history, None, true, locked)
+                });
+            });
+            let info = filled(edits.info.iter().map(|(_, v)| v));
+            section(ui, "RIFF INFO", info, |ui| {
+                for (id, value) in &mut edits.info {
+                    row(ui, &meta::info_name(id), |ui| {
+                        field(ui, value, None, false, locked)
+                    });
+                }
+            });
+            if !edits.ixml.is_empty() {
+                section(ui, "iXML", true, |ui| {
+                    for (label, value) in &mut edits.ixml {
+                        row(ui, label, |ui| field(ui, value, None, false, locked));
+                    }
+                });
             }
         });
+}
+
+pub enum MarkerAction {
+    Seek(usize),
+    Remove(u32),
+}
+
+/// The Markers view: each marker's time, which goes there, its name, and a
+/// button that removes it.
+pub fn marker_list(
+    ui: &mut Ui,
+    markers: &mut [Marker],
+    rate: f64,
+    locked: bool,
+) -> Option<MarkerAction> {
+    let mut action = None;
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            for (i, m) in markers.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new((i + 1).to_string()).monospace().color(MARK));
+                    let at = m.frame as f64 / rate;
+                    let when = if m.length > 0 {
+                        let end = (m.frame + m.length) as f64 / rate;
+                        format!("{} to {}", clock_fine(at), clock_fine(end))
+                    } else {
+                        clock_fine(at)
+                    };
+                    if ui
+                        .link(RichText::new(when).monospace())
+                        .on_hover_text("Go there")
+                        .clicked()
+                    {
+                        action = Some(MarkerAction::Seek(m.frame));
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let remove = ui.add_enabled(!locked, Button::new("✖").small());
+                        if remove.on_hover_text("Remove").clicked() {
+                            action = Some(MarkerAction::Remove(m.id));
+                        }
+                        let name = TextEdit::singleline(&mut m.label)
+                            .hint_text("name")
+                            .desired_width(ui.available_width());
+                        ui.add_enabled(!locked, name);
+                    });
+                });
+            }
+        });
+    action
 }
 
 pub fn hz(f: f32) -> String {
@@ -729,6 +1064,29 @@ mod tests {
         let mut out = ctx.run_ui(input, |ui| meters.ui(ui, None, &labels));
         out.textures_delta.clear();
         assert_eq!(meters.held[0].0, FLOOR_DB, "stopping empties the meters");
+    }
+
+    #[test]
+    fn the_figure_is_a_person_in_human_hearing_and_a_bat_well_above_it() {
+        assert_eq!(batness(440.0), 0.0);
+        assert_eq!(batness(20_000.0), 0.0);
+        assert!((batness(44_721.0) - 0.5).abs() < 0.01);
+        assert_eq!(batness(192_000.0), 1.0);
+        // Standing, the figure is taller than it is wide; flying, wider.
+        let extent = |t| {
+            let image = figure_image(t, 36);
+            let solid: Vec<usize> = (0..image.pixels.len())
+                .filter(|&i| image.pixels[i].a() > 127)
+                .collect();
+            let span = |of: fn(usize) -> usize| {
+                let values = solid.iter().map(|&i| of(i));
+                values.clone().max().unwrap() - values.min().unwrap()
+            };
+            (span(|i| i % 36), span(|i| i / 36))
+        };
+        let (person, bat) = (extent(0.0), extent(1.0));
+        assert!(person.1 > person.0, "{person:?}");
+        assert!(bat.0 > bat.1, "{bat:?}");
     }
 
     #[test]

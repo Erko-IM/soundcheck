@@ -8,31 +8,41 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, FontId, Key, KeyboardShortcut, Modifiers, Painter,
-    PointerButton, Rect, Response, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
+    self, Align2, Color32, CursorIcon, FontId, Key, KeyboardShortcut, Label, Modifiers, Painter,
+    PointerButton, Rect, Response, RichText, Sense, Stroke, StrokeKind, TextEdit, TextureHandle,
+    TextureOptions, Vec2, ViewportCommand,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::audio::{self, Loaded};
+use crate::edit::Edits;
 use crate::explorer::Explorer;
 use crate::finder::Inbox;
 use crate::levels::{FLOOR_DB, Level};
 use crate::playback::{self, Player};
 use crate::probe::{self, Probe};
+use crate::save;
 use crate::spectrogram::{self, Analysis, Channels, Spec, Target, View};
-use crate::views::{self, Meters, Span};
+use crate::views::{self, MarkerAction, Meters, Span};
+use crate::wav::Marker;
 
 const BRIGHTNESS: RangeInclusive<f32> = -20.0..=80.0;
 const CONTRAST: RangeInclusive<f32> = 20.0..=160.0;
 const GAIN: RangeInclusive<f32> = -60.0..=60.0;
+/// The lowest a frequency slider or arrow key goes above zero.
+const LOWEST_HZ: f32 = 10.0;
 /// Room around a plot for its labels, which also keeps the plot's own
 /// dragging clear of the handles that resize the panels around it.
 const PLOT_LEFT: f32 = 54.0;
 const PLOT_RIGHT: f32 = 10.0;
 const PLOT_EDGE: f32 = 6.0;
 const TIME_AXIS: f32 = 44.0;
+/// How close to an end of the part in view a timeline drag takes that end.
+const GRIP: f32 = 6.0;
 /// How long the view must rest before the part in view is analysed again.
 const SETTLE: Duration = Duration::from_millis(150);
+const PICKED: Color32 = Color32::from_rgb(110, 170, 255);
+const HEARING: &str = "People hear up to about 20 kHz; bats call and listen far above that";
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Colormap {
@@ -148,6 +158,7 @@ struct Views {
     spectrogram: bool,
     waveform: bool,
     spectrum: bool,
+    markers: bool,
     metadata: bool,
     timeline: bool,
     meters: bool,
@@ -159,6 +170,7 @@ impl Default for Views {
             spectrogram: true,
             waveform: true,
             spectrum: true,
+            markers: true,
             metadata: false,
             timeline: true,
             meters: true,
@@ -175,6 +187,10 @@ enum Job {
         generation: u64,
         id: u64,
         result: Result<Analysis, String>,
+    },
+    Saved {
+        generation: u64,
+        result: Result<(), String>,
     },
 }
 
@@ -204,6 +220,17 @@ struct Running {
 }
 
 impl Running {
+    fn new(id: u64) -> (Self, Arc<AtomicBool>, Arc<AtomicU32>) {
+        let (cancel, flag) = Cancel::new();
+        let progress = Arc::new(AtomicU32::new(0));
+        let running = Self {
+            id,
+            progress: Arc::clone(&progress),
+            _cancel: cancel,
+        };
+        (running, flag, progress)
+    }
+
     fn percent(&self) -> u32 {
         self.progress.load(Ordering::Relaxed) / 10
     }
@@ -261,6 +288,41 @@ impl Shown {
     }
 }
 
+/// What a click picks for the keys: a slider for the arrow keys, or the
+/// file explorer for Backspace.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Control {
+    Gain,
+    Brightness,
+    Contrast,
+    Low,
+    High,
+    Explorer,
+}
+
+/// What a drag along the timeline moves: one end of the part in view, or a
+/// new span from where the drag began.
+#[derive(Clone, Copy)]
+enum Grab {
+    Start,
+    End,
+    Span(f64),
+}
+
+/// What waits until unsaved changes are saved or let go.
+#[derive(Clone)]
+enum Then {
+    Open(PathBuf),
+    Quit,
+}
+
+/// Playback and analyses as they were when the file was let go of.
+struct Released {
+    player: Option<(usize, bool)>,
+    whole: bool,
+    detail: bool,
+}
+
 pub struct App {
     settings: Settings,
     explorer: Explorer,
@@ -296,12 +358,38 @@ pub struct App {
     /// Created on first play, dropped when another file opens.
     player: Option<Player>,
     meters: Meters,
+    listeners: views::Listeners,
+    /// Metadata and markers as edited, and as the file holds them.
+    edits: Option<Edits>,
+    saved: Option<Edits>,
+    saving: Option<Running>,
+    released: Option<Released>,
+    /// The new name being typed, without its extension.
+    renaming: Option<String>,
+    /// Why the name typed was not taken, shown under it.
+    rename_error: Option<String>,
+    /// Why the last save did not happen, shown until the next one.
+    save_error: Option<String>,
+    focus_rename: bool,
+    /// Asking whether to save before this goes ahead.
+    asking: Option<Then>,
+    /// Going ahead once the save under way is done.
+    then: Option<Then>,
+    quitting: bool,
+    picked: Option<Control>,
+    /// Where each control was drawn last frame, for the press that picks it.
+    controls: Vec<(Control, Rect)>,
+    /// The press landed on the control already picked: a click lets it go.
+    unpick_on_click: bool,
+    grab: Option<Grab>,
+    /// A marker being dragged by its tab, and where on it it was taken.
+    marker_grab: Option<(u32, f64)>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>, inbox: Inbox) -> Self {
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
-        inbox.wake(&cc.egui_ctx);
+        inbox.connect(&cc.egui_ctx);
         let settings = cc
             .storage
             .and_then(|s| eframe::get_value::<Settings>(s, eframe::APP_KEY))
@@ -334,6 +422,23 @@ impl App {
             spectrum: None,
             player: None,
             meters: Meters::default(),
+            listeners: views::Listeners::default(),
+            edits: None,
+            saved: None,
+            saving: None,
+            released: None,
+            renaming: None,
+            rename_error: None,
+            save_error: None,
+            focus_rename: false,
+            asking: None,
+            then: None,
+            quitting: false,
+            picked: None,
+            controls: Vec::new(),
+            unpick_on_click: false,
+            grab: None,
+            marker_grab: None,
         };
         if let Some(path) = initial.or_else(|| app.inbox.latest()) {
             app.open_external(&cc.egui_ctx, path);
@@ -361,9 +466,25 @@ impl App {
             self.settings.explorer = true;
         } else if path.exists() {
             self.explorer.reveal(&path);
-            self.open(ctx, path);
+            self.request_open(ctx, path);
         } else {
             self.error = Some(format!("{} does not exist", path.display()));
+        }
+    }
+
+    fn dirty(&self) -> bool {
+        self.edits != self.saved
+    }
+
+    /// Opens `path`, once unsaved changes to the file open now are saved or
+    /// let go.
+    fn request_open(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if self.saving.is_some() {
+            self.then = Some(Then::Open(path));
+        } else if self.dirty() {
+            self.asking = Some(Then::Open(path));
+        } else {
+            self.open(ctx, path);
         }
     }
 
@@ -386,13 +507,15 @@ impl App {
         self.asked = None;
         self.spectrum = None;
         self.player = None;
-        let (job, cancel) = Cancel::new();
-        let progress = Arc::new(AtomicU32::new(0));
-        self.loading = Some(Running {
-            id: 0,
-            progress: Arc::clone(&progress),
-            _cancel: job,
-        });
+        self.edits = None;
+        self.saved = None;
+        self.renaming = None;
+        self.rename_error = None;
+        self.save_error = None;
+        self.grab = None;
+        self.marker_grab = None;
+        let (running, cancel, progress) = Running::new(0);
+        self.loading = Some(running);
         let (tx, ctx, generation, spec) =
             (self.tx.clone(), ctx.clone(), self.generation, self.spec());
         std::thread::spawn(move || {
@@ -435,6 +558,10 @@ impl App {
 
     fn targets(&self) -> Vec<Target> {
         self.settings.channels.targets(self.channel_count())
+    }
+
+    fn markers(&self) -> &[Marker] {
+        self.edits.as_ref().map_or(&[], |e| &e.markers)
     }
 
     fn channel_name(&self, channel: usize) -> String {
@@ -484,13 +611,7 @@ impl App {
         let (source, info) = (current.source.clone(), current.info.clone());
         self.jobs += 1;
         let (id, generation, spec) = (self.jobs, self.generation, self.spec());
-        let (job, cancel) = Cancel::new();
-        let progress = Arc::new(AtomicU32::new(0));
-        let running = Running {
-            id,
-            progress: Arc::clone(&progress),
-            _cancel: job,
-        };
+        let (running, cancel, progress) = Running::new(id);
         if whole {
             self.whole_job = Some(running);
         } else {
@@ -521,7 +642,7 @@ impl App {
                     self.loading = None;
                     match result {
                         Ok(done) => {
-                            let (loaded, analysis) = *done;
+                            let (mut loaded, analysis) = *done;
                             let stale = analysis.spec != self.spec();
                             self.view = 0.0..loaded.info.frames as f64;
                             self.probe = Some(Probe::new(
@@ -531,6 +652,8 @@ impl App {
                                 ctx.clone(),
                             ));
                             self.meters = Meters::default();
+                            self.saved = loaded.edits.take();
+                            self.edits = self.saved.clone();
                             self.current = Some(loaded);
                             self.whole = Some(Shown::new(analysis));
                             // The settings changed while the file loaded.
@@ -560,6 +683,18 @@ impl App {
                         Err(e) => self.error = Some(e),
                     }
                 }
+                Job::Saved { generation, result } if generation == self.generation => {
+                    self.saving = None;
+                    match result {
+                        Ok(()) => self.reread(),
+                        Err(e) => {
+                            self.save_error = Some(format!("Not saved: {e}"));
+                            self.then = None;
+                        }
+                    }
+                    self.reacquire(ctx);
+                    self.go_ahead(ctx);
+                }
                 // Superseded by a newer file or a newer analysis.
                 _ => {}
             }
@@ -577,6 +712,177 @@ impl App {
             self.detail = None;
             self.detail_job = None;
         }
+    }
+
+    /// Writes the edited metadata and markers into the file.
+    fn save(&mut self, ctx: &egui::Context) {
+        if self.saving.is_some() {
+            return;
+        }
+        self.save_error = None;
+        let (Some(path), Some(edits), Some(saved)) = (self.file.clone(), &self.edits, &self.saved)
+        else {
+            return;
+        };
+        let changes = match edits.changes(saved) {
+            Ok(changes) => changes,
+            Err(e) => {
+                self.save_error = Some(format!("Not saved: {e}"));
+                self.then = None;
+                return;
+            }
+        };
+        self.release();
+        let (running, _, progress) = Running::new(0);
+        self.saving = Some(running);
+        let (tx, ctx, generation) = (self.tx.clone(), ctx.clone(), self.generation);
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| save::save(&path, &changes, &progress))
+                .unwrap_or_else(|_| Err("saving crashed; the file is as it was".into()));
+            let _ = tx.send(Job::Saved { generation, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// The header and metadata again, from the file just saved: the audio
+    /// is the same, only where it sits in the file may have moved.
+    fn reread(&mut self) {
+        let (Some(path), Some(current)) = (&self.file, &mut self.current) else {
+            return;
+        };
+        match audio::open(path) {
+            Ok(opened) => {
+                current.info.bytes = opened.info.bytes;
+                current.meta = opened.meta;
+                current.details = opened.details;
+                current
+                    .details
+                    .sections
+                    .insert(0, ("File".into(), audio::file_rows(path, &current.info)));
+                current.source = opened.source;
+                self.saved = opened.edits;
+                self.edits = self.saved.clone();
+            }
+            Err(e) => self.error = Some(format!("Saved, but it will not open again: {e}")),
+        }
+    }
+
+    /// Lets go of the file, for a save or a rename to replace or move it:
+    /// playback stops where it is and analyses under way are dropped, for
+    /// `reacquire` to pick up again.
+    fn release(&mut self) {
+        self.released = Some(Released {
+            player: self.player.take().map(|p| (p.position(), p.is_playing())),
+            whole: self.whole_job.take().is_some(),
+            detail: self.detail_job.take().is_some() || self.detail_due.take().is_some(),
+        });
+        self.probe = None;
+        self.asked = None;
+    }
+
+    fn reacquire(&mut self, ctx: &egui::Context) {
+        let Some(released) = self.released.take() else {
+            return;
+        };
+        if let Some(current) = &self.current {
+            self.probe = Some(Probe::new(
+                current.source.clone(),
+                usize::from(current.info.channels),
+                current.info.frames,
+                ctx.clone(),
+            ));
+        }
+        if released.whole {
+            self.analyse(ctx, true);
+        }
+        if released.detail && self.zoomed() {
+            self.analyse(ctx, false);
+        }
+        if let Some((at, playing)) = released.player
+            && self.ensure_player(at)
+            && let Some(player) = &self.player
+        {
+            player.seek(at);
+            if playing {
+                player.play();
+            }
+        }
+    }
+
+    /// Closes the window, once unsaved changes are saved or let go.
+    fn quit(&mut self, ctx: &egui::Context) {
+        if self.saving.is_some() {
+            self.then = Some(Then::Quit);
+        } else if self.dirty() {
+            self.asking = Some(Then::Quit);
+        } else {
+            self.quitting = true;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+    }
+
+    /// Whatever was waiting on the save, if it left nothing unsaved.
+    fn go_ahead(&mut self, ctx: &egui::Context) {
+        match self.then.take() {
+            Some(Then::Open(path)) if !self.dirty() => self.open(ctx, path),
+            Some(Then::Quit) if !self.dirty() => self.quit(ctx),
+            _ => {}
+        }
+    }
+
+    fn rename_to(&mut self, ctx: &egui::Context, stem: &str) {
+        let Some(path) = self.file.clone() else {
+            return;
+        };
+        let name = match path.extension() {
+            Some(ext) => format!("{}.{}", stem.trim(), ext.to_string_lossy()),
+            None => stem.trim().to_owned(),
+        };
+        if path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy() == name)
+        {
+            self.renaming = None;
+            self.rename_error = None;
+            return;
+        }
+        self.release();
+        match save::rename(&path, &name) {
+            Ok(new) => {
+                self.renaming = None;
+                self.rename_error = None;
+                if let Some(current) = &mut self.current {
+                    current.source = current.source.with_path(&new);
+                    if let Some(file) = current.details.sections.first_mut() {
+                        file.1 = audio::file_rows(&new, &current.info);
+                    }
+                }
+                if let Some(dir) = new.parent() {
+                    self.explorer.forget(dir);
+                }
+                self.explorer.selected = Some(new.clone());
+                self.file = Some(new);
+            }
+            Err(e) => self.rename_error = Some(e),
+        }
+        self.reacquire(ctx);
+    }
+
+    fn add_marker(&mut self) {
+        let (at, selection) = (self.cursor.unwrap_or(0), self.selection.clone());
+        let Some(edits) = self.edits.as_mut().filter(|_| self.saving.is_none()) else {
+            return;
+        };
+        let (frame, length) = selection.map_or((at, 0), |s| (s.start, s.len()));
+        let id = edits.next_marker_id();
+        edits.markers.push(Marker {
+            id,
+            frame,
+            length,
+            label: String::new(),
+            note: String::new(),
+        });
+        edits.markers.sort_by_key(|m| (m.frame, m.id));
     }
 
     fn update_probe(&mut self) {
@@ -618,14 +924,17 @@ impl App {
         self.view.start > 0.5 || self.view.end < self.frames() as f64 - 0.5
     }
 
+    fn shortest_view(&self) -> f64 {
+        (self.rate() / 1000.0).max(64.0).min(self.frames() as f64)
+    }
+
     /// Shows `len` frames from `start`, kept within the file.
     fn set_view(&mut self, start: f64, len: f64) {
         let frames = self.frames() as f64;
         if frames <= 0.0 {
             return;
         }
-        let shortest = (self.rate() / 1000.0).max(64.0).min(frames);
-        let len = len.clamp(shortest, frames);
+        let len = len.clamp(self.shortest_view(), frames);
         let start = start.clamp(0.0, frames - len);
         let view = start..start + len;
         if view == self.view {
@@ -639,6 +948,10 @@ impl App {
             self.detail_job = None;
             self.detail_due = None;
         }
+    }
+
+    fn set_view_range(&mut self, start: f64, end: f64) {
+        self.set_view(start, end - start);
     }
 
     fn view_len(&self) -> f64 {
@@ -740,7 +1053,7 @@ impl App {
         if self.player.is_some() {
             return true;
         }
-        let Some(current) = &self.current else {
+        let Some(current) = self.current.as_ref().filter(|_| self.saving.is_none()) else {
             return false;
         };
         match Player::new(&current.source, &current.info, start, self.settings.speed) {
@@ -820,49 +1133,162 @@ impl App {
         }
     }
 
+    /// Moves the picked slider one step: a dB for the levels, a semitone
+    /// for the frequencies, or with Shift five dB and an octave.
+    fn nudge(&mut self, control: Control, up: bool, coarse: bool) {
+        let db = if coarse { 5.0 } else { 1.0 } * if up { 1.0 } else { -1.0 };
+        let bump = |value: &mut f32, range: RangeInclusive<f32>| {
+            *value = (*value + db).clamp(*range.start(), *range.end());
+        };
+        match control {
+            Control::Gain => {
+                bump(&mut self.settings.gain, GAIN);
+                if let Some(player) = &self.player {
+                    player.set_gain(self.settings.gain);
+                }
+            }
+            Control::Brightness => bump(&mut self.settings.brightness, BRIGHTNESS),
+            Control::Contrast => bump(&mut self.settings.contrast, CONTRAST),
+            Control::Low | Control::High => {
+                let view = self.look().view;
+                let nyquist = self
+                    .current
+                    .as_ref()
+                    .map_or(view.f_max, |c| c.info.nyquist());
+                let factor = if coarse { 2.0 } else { 2f32.powf(1.0 / 12.0) };
+                let step = |f: f32| match (up, f < LOWEST_HZ) {
+                    (true, true) => LOWEST_HZ,
+                    (true, false) => f * factor,
+                    (false, _) if f / factor < LOWEST_HZ => 0.0,
+                    (false, _) => f / factor,
+                };
+                if control == Control::Low {
+                    self.settings.band_low = step(view.f_min).min(view.f_max / 1.06);
+                } else {
+                    let high = step(view.f_max).clamp((view.f_min * 1.06).max(LOWEST_HZ), nyquist);
+                    self.settings.band_high = (high < nyquist - 0.5).then_some(high);
+                }
+            }
+            Control::Explorer => {}
+        }
+    }
+
+    /// Where a press picks a control for the keys, or lets it go.
+    fn pick(&mut self, ctx: &egui::Context) {
+        let (pressed, clicked, dragging, at) = ctx.input(|i| {
+            let p = &i.pointer;
+            (
+                p.primary_pressed(),
+                p.primary_clicked(),
+                p.is_decidedly_dragging(),
+                p.interact_pos(),
+            )
+        });
+        if pressed {
+            let hit = at.and_then(|p| {
+                self.controls
+                    .iter()
+                    .find(|(_, r)| r.contains(p))
+                    .map(|(c, _)| *c)
+            });
+            // The explorer stays picked while it is clicked in; a slider
+            // is let go by a second click on it.
+            self.unpick_on_click =
+                hit.is_some() && hit == self.picked && hit != Some(Control::Explorer);
+            self.picked = hit;
+        }
+        if dragging {
+            self.unpick_on_click = false;
+        }
+        if clicked && std::mem::take(&mut self.unpick_on_click) {
+            self.picked = None;
+        }
+    }
+
     fn input(&mut self, ctx: &egui::Context) {
+        // While unsaved changes are asked about, keys and clicks are the
+        // question's.
+        if self.asking.is_some() {
+            return;
+        }
         let toggle_explorer = KeyboardShortcut::new(Modifiers::COMMAND, Key::B);
         if ctx.input_mut(|i| i.consume_shortcut(&toggle_explorer)) {
             self.settings.explorer = !self.settings.explorer;
+        }
+        let save_shortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
+        if ctx.input_mut(|i| i.consume_shortcut(&save_shortcut)) && self.dirty() {
+            self.save(ctx);
         }
         if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_owned()))
         {
             self.open_external(ctx, path);
         }
+        self.pick(ctx);
+        // egui takes the keyboard from the name box on Esc before the box
+        // is drawn, so the box never sees the key itself.
+        if self.renaming.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.renaming = None;
+            self.rename_error = None;
+        }
         // Taken before any widget draws, so a focused button cannot also
         // act on these keys, and never while text is being typed.
-        if ctx.egui_wants_keyboard_input() || self.current.is_none() {
+        if ctx.egui_wants_keyboard_input() {
             return;
         }
         let pressed = |modifiers, key| ctx.input_mut(|i| i.consume_key(modifiers, key));
         let plain = |key| pressed(Modifiers::NONE, key);
+        if self.picked == Some(Control::Explorer) && plain(Key::Backspace) {
+            self.explorer.go_up();
+        }
+        if self.current.is_none() {
+            return;
+        }
         if plain(Key::Space) {
             self.toggle_play();
         }
-        // Shift first: a plain arrow would take the shifted one too.
-        if pressed(Modifiers::SHIFT, Key::ArrowLeft) {
-            self.seek_by(-10.0);
-        }
-        if pressed(Modifiers::SHIFT, Key::ArrowRight) {
-            self.seek_by(10.0);
-        }
-        if plain(Key::ArrowLeft) {
-            self.seek_by(-1.0);
-        }
-        if plain(Key::ArrowRight) {
-            self.seek_by(1.0);
+        match self.picked.filter(|c| *c != Control::Explorer) {
+            Some(control) => {
+                for (key, up) in [
+                    (Key::ArrowLeft, false),
+                    (Key::ArrowDown, false),
+                    (Key::ArrowRight, true),
+                    (Key::ArrowUp, true),
+                ] {
+                    if pressed(Modifiers::SHIFT, key) {
+                        self.nudge(control, up, true);
+                    } else if plain(key) {
+                        self.nudge(control, up, false);
+                    }
+                }
+            }
+            None => {
+                // Shift first: a plain arrow would take the shifted one too.
+                if pressed(Modifiers::SHIFT, Key::ArrowLeft) {
+                    self.seek_by(-10.0);
+                }
+                if pressed(Modifiers::SHIFT, Key::ArrowRight) {
+                    self.seek_by(10.0);
+                }
+                if plain(Key::ArrowLeft) {
+                    self.seek_by(-1.0);
+                }
+                if plain(Key::ArrowRight) {
+                    self.seek_by(1.0);
+                }
+                for (key, step) in [(Key::ArrowUp, 5.0), (Key::ArrowDown, -5.0)] {
+                    if plain(key) {
+                        self.settings.brightness = (self.settings.brightness + step)
+                            .clamp(*BRIGHTNESS.start(), *BRIGHTNESS.end());
+                    }
+                }
+            }
         }
         if plain(Key::Home) {
             self.seek(0);
         }
         if plain(Key::End) {
             self.seek(self.frames());
-        }
-        for (key, step) in [(Key::ArrowUp, 5.0), (Key::ArrowDown, -5.0)] {
-            if plain(key) {
-                self.settings.brightness =
-                    (self.settings.brightness + step).clamp(*BRIGHTNESS.start(), *BRIGHTNESS.end());
-            }
         }
         if plain(Key::Plus) || plain(Key::Equals) {
             self.zoom(0.5);
@@ -876,9 +1302,22 @@ impl App {
         if plain(Key::S) {
             self.zoom_to_selection();
         }
-        if plain(Key::Escape) {
-            self.select(None);
+        if plain(Key::M) {
+            self.add_marker();
         }
+        if plain(Key::Escape) {
+            if self.picked.is_some() {
+                self.picked = None;
+            } else {
+                self.select(None);
+            }
+        }
+    }
+
+    /// Notes where `control` was drawn, for the press that picks it and
+    /// the outline that shows it picked.
+    fn mark_control(&mut self, control: Control, rect: Rect) {
+        self.controls.push((control, rect));
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
@@ -891,30 +1330,102 @@ impl App {
             ui.checkbox(&mut views.spectrogram, "Spectrogram");
             ui.checkbox(&mut views.waveform, "Waveform");
             ui.checkbox(&mut views.spectrum, "Spectrum");
+            ui.checkbox(&mut views.markers, "Markers");
             ui.checkbox(&mut views.metadata, "Metadata");
             ui.checkbox(&mut views.timeline, "Timeline");
             ui.checkbox(&mut views.meters, "Meters");
         });
         ui.add_space(4.0);
+        let (dirty, can_rename) = (
+            self.dirty(),
+            self.current.is_some() && self.saving.is_none(),
+        );
+        let (mut start_rename, mut rename, mut keep_name, mut save, mut revert) =
+            (false, None, false, false, false);
         ui.horizontal(|ui| {
-            let name = self
-                .file
-                .as_deref()
-                .and_then(Path::file_name)
-                .map_or("No file open".into(), |n| n.to_string_lossy());
-            ui.label(
-                RichText::new(name)
-                    .size(26.0)
-                    .strong()
-                    .color(Color32::WHITE),
-            );
+            let path = self.file.as_deref();
+            match &mut self.renaming {
+                Some(stem) => {
+                    let width = (ui.available_width() - 120.0).clamp(120.0, 560.0);
+                    let edit = ui.add(
+                        TextEdit::singleline(stem)
+                            .font(FontId::proportional(22.0))
+                            .desired_width(width),
+                    );
+                    if std::mem::take(&mut self.focus_rename) {
+                        edit.request_focus();
+                    }
+                    if let Some(ext) = path.and_then(Path::extension) {
+                        ui.label(RichText::new(format!(".{}", ext.to_string_lossy())).size(22.0));
+                    }
+                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    if ui.button("✔").on_hover_text("Rename (Enter)").clicked() || enter {
+                        rename = Some(stem.clone());
+                    }
+                    if ui
+                        .button("✖")
+                        .on_hover_text("Keep the name (Esc)")
+                        .clicked()
+                    {
+                        keep_name = true;
+                    }
+                }
+                None => {
+                    let name = path
+                        .and_then(Path::file_name)
+                        .map_or("No file open".into(), |n| n.to_string_lossy());
+                    let title = RichText::new(name)
+                        .size(26.0)
+                        .strong()
+                        .color(Color32::WHITE);
+                    let label = ui.add(Label::new(title).sense(Sense::click()));
+                    if can_rename && label.on_hover_text("Click to rename").clicked() {
+                        start_rename = true;
+                    }
+                }
+            }
             if let Some(loading) = &self.loading {
                 ui.spinner();
                 ui.label(format!("{}%", loading.percent()));
             }
+            if let Some(saving) = &self.saving {
+                ui.spinner();
+                ui.label(format!("Saving {}%", saving.percent()));
+            } else if dirty {
+                ui.label(RichText::new("Unsaved changes").color(views::MARK));
+                save = ui.button("Save").on_hover_text("⌘S").clicked();
+                revert = ui
+                    .button("Revert")
+                    .on_hover_text("Back to what the file holds")
+                    .clicked();
+            }
         });
-        if let Some(error) = &self.error {
-            ui.label(RichText::new(error).color(views::CURSOR));
+        if start_rename {
+            self.renaming = self
+                .file
+                .as_deref()
+                .and_then(Path::file_stem)
+                .map(|s| s.to_string_lossy().into_owned());
+            self.focus_rename = true;
+            self.rename_error = None;
+        }
+        if keep_name {
+            self.renaming = None;
+            self.rename_error = None;
+        }
+        if let Some(stem) = rename {
+            self.rename_to(ui.ctx(), &stem);
+        }
+        if save {
+            self.save(ui.ctx());
+        }
+        if revert {
+            self.edits = self.saved.clone();
+            self.save_error = None;
+        }
+        let problems = [&self.rename_error, &self.save_error, &self.error];
+        for problem in problems.into_iter().flatten() {
+            ui.label(RichText::new(problem).color(views::CURSOR));
         }
         if let Some(current) = &self.current {
             match &current.meta.description {
@@ -950,6 +1461,7 @@ impl App {
     fn transport(&mut self, ui: &mut egui::Ui) {
         let playing = self.player.as_ref().is_some_and(Player::is_playing);
         let has_file = self.current.is_some();
+        let can_mark = self.edits.is_some() && self.saving.is_none();
         ui.horizontal_wrapped(|ui| {
             let label = if playing { "Pause" } else { "Play" };
             let play = egui::Button::new(label).min_size(Vec2::new(64.0, 0.0));
@@ -966,6 +1478,14 @@ impl App {
             {
                 self.stop();
             }
+            if ui
+                .add_enabled(can_mark, egui::Button::new("Mark"))
+                .on_hover_text("M: a marker at the playhead, or the selection as a region")
+                .on_disabled_hover_text("Markers are kept inside WAV files, and this is not one")
+                .clicked()
+            {
+                self.add_marker();
+            }
             ui.separator();
             ui.label("Speed");
             for speed in playback::SPEEDS {
@@ -977,11 +1497,17 @@ impl App {
                 }
             }
             ui.separator();
-            ui.label("Gain").on_hover_text(
-                "Playback volume: raise it for quiet recordings, lower it for 32-bit float files that go past full scale",
-            );
             let mut gain = self.settings.gain;
-            ui.add(egui::Slider::new(&mut gain, GAIN).step_by(1.0).suffix(" dB"));
+            let group = ui
+                .scope(|ui| {
+                    ui.label("Gain").on_hover_text(
+                        "Playback volume: raise it for quiet recordings, lower it for 32-bit float files that go past full scale",
+                    );
+                    ui.add(egui::Slider::new(&mut gain, GAIN).step_by(1.0).suffix(" dB"));
+                })
+                .response
+                .rect;
+            self.mark_control(Control::Gain, group);
             if gain != self.settings.gain {
                 self.settings.gain = gain;
                 if let Some(player) = &self.player {
@@ -1051,6 +1577,7 @@ impl App {
 
     fn display(&mut self, ui: &mut egui::Ui) {
         let nyquist = self.current.as_ref().map_or(96_000.0, |c| c.info.nyquist());
+        let rate = self.current.as_ref().map_or(0, |c| c.info.sample_rate);
         let channels = self.channel_count();
         let names: Vec<String> = (0..channels).map(|c| self.channel_name(c)).collect();
         let look = self.look().view;
@@ -1090,34 +1617,65 @@ impl App {
                     });
             }
             ui.separator();
-            ui.label("Brightness").on_hover_text(
-                "Added to every level before colouring: right is brighter. ↑ and ↓ step it by 5 dB",
-            );
-            ui.add(
-                egui::Slider::new(&mut self.settings.brightness, BRIGHTNESS)
-                    .step_by(1.0)
-                    .suffix(" dB"),
-            );
-            ui.label("Contrast").on_hover_text(
-                "How far below full brightness a level still gets colour: lower is more contrast",
-            );
-            ui.add(
-                egui::Slider::new(&mut self.settings.contrast, CONTRAST)
-                    .step_by(1.0)
-                    .suffix(" dB"),
-            );
+            let group = ui
+                .scope(|ui| {
+                    ui.label("Brightness").on_hover_text(
+                        "Added to every level before colouring: right is brighter. ↑ and ↓ step it by 5 dB",
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.settings.brightness, BRIGHTNESS)
+                            .step_by(1.0)
+                            .suffix(" dB"),
+                    );
+                })
+                .response
+                .rect;
+            self.mark_control(Control::Brightness, group);
+            let group = ui
+                .scope(|ui| {
+                    ui.label("Contrast").on_hover_text(
+                        "How far below full brightness a level still gets colour: lower is more contrast",
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.settings.contrast, CONTRAST)
+                            .step_by(1.0)
+                            .suffix(" dB"),
+                    );
+                })
+                .response
+                .rect;
+            self.mark_control(Control::Contrast, group);
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Frequency");
             let (mut lo, mut hi) = (f64::from(look.f_min), f64::from(look.f_max));
-            ui.label("Min")
-                .on_hover_text("Drag, or click the number and type: 200, 1.5k, 12 kHz");
-            let min_changed = ui.add(frequency_slider(&mut lo, 0.0..=hi)).changed();
-            ui.label("Max")
-                .on_hover_text("Drag, or click the number and type: 200, 1.5k, 12 kHz");
-            let max_changed = ui
-                .add(frequency_slider(&mut hi, lo.max(10.0)..=f64::from(nyquist)))
-                .changed();
+            let typed = "Drag, or click the number and type: 200, 1.5k, 12 kHz";
+            let (mut min_changed, mut max_changed) = (false, false);
+            let group = ui
+                .scope(|ui| {
+                    ui.label("Min").on_hover_text(typed);
+                    min_changed = ui.add(frequency_slider(&mut lo, 0.0..=hi)).changed();
+                    self.listeners.show(ui, lo as f32).on_hover_text(HEARING);
+                })
+                .response
+                .rect;
+            self.mark_control(Control::Low, group);
+            let group = ui
+                .scope(|ui| {
+                    ui.label("Max").on_hover_text(typed);
+                    let top = format!(
+                        "Up to {}: half the {rate} Hz sample rate, the highest frequency the file can hold",
+                        views::hz_field(f64::from(nyquist))
+                    );
+                    max_changed = ui
+                        .add(frequency_slider(&mut hi, lo.max(10.0)..=f64::from(nyquist)))
+                        .on_hover_text(top)
+                        .changed();
+                    self.listeners.show(ui, hi as f32).on_hover_text(HEARING);
+                })
+                .response
+                .rect;
+            self.mark_control(Control::High, group);
             if min_changed || max_changed {
                 self.settings.band_low = lo as f32;
                 self.settings.band_high = ((hi as f32) < nyquist - 0.5).then_some(hi as f32);
@@ -1165,24 +1723,49 @@ impl App {
         }
     }
 
+    /// The views beside: the spectrum over the markers over the metadata,
+    /// each split resizable.
     fn side(&mut self, ui: &mut egui::Ui) {
-        Self::claim(ui);
+        let height = Self::claim(ui).height();
         let views = self.settings.views;
-        if views.spectrum && views.metadata {
+        let top: fn(&mut Self, &mut egui::Ui) = if views.spectrum {
+            Self::spectrum_view
+        } else if views.markers {
+            Self::markers_view
+        } else {
+            Self::metadata_view
+        };
+        // Split only once a file is open: until then the column is taller
+        // than it will be with the meters and timeline beneath it, and a
+        // split keeps the size it is first given.
+        if self.current.is_none() {
+            top(self, ui);
+            return;
+        }
+        let shown = [views.spectrum, views.markers, views.metadata]
+            .iter()
+            .filter(|v| **v)
+            .count()
+            .max(1) as f32;
+        if views.metadata && (views.spectrum || views.markers) {
             egui::Panel::bottom("metadata")
                 .frame(egui::Frame::NONE)
                 .resizable(true)
-                .default_size(ui.available_height() / 2.0)
+                .default_size(height / shown)
                 .min_size(80.0)
                 .show(ui, |ui| self.metadata_view(ui));
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ui, |ui| self.spectrum_view(ui));
-        } else if views.spectrum {
-            self.spectrum_view(ui);
-        } else {
-            self.metadata_view(ui);
         }
+        if views.markers && views.spectrum {
+            egui::Panel::bottom("markers")
+                .frame(egui::Frame::NONE)
+                .resizable(true)
+                .default_size(height / shown)
+                .min_size(80.0)
+                .show(ui, |ui| self.markers_view(ui));
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| top(self, ui));
     }
 
     /// Claims the whole of `ui`, whatever the view then shows: a panel keeps
@@ -1243,6 +1826,7 @@ impl App {
             );
         }
         self.overlays(&painter, plot, span);
+        let tabs = views::markers_on(&painter, plot, span, self.markers(), true);
         if let Some(pos) = response.hover_pos()
             && let Some(lane) = lanes.iter().find(|l| l.contains(pos))
         {
@@ -1268,6 +1852,7 @@ impl App {
             );
         }
         self.busy(&painter, plot);
+        self.marker_tabs(ui, tabs, span);
         self.plot_input(ui, &response, span);
     }
 
@@ -1320,9 +1905,13 @@ impl App {
             );
         }
         self.overlays(&painter, plot, span);
-        if !self.settings.views.spectrogram {
+        // The tabs go on whichever of the two is on top.
+        let on_top = !self.settings.views.spectrogram;
+        let tabs = views::markers_on(&painter, plot, span, self.markers(), on_top);
+        if on_top {
             self.busy(&painter, plot);
         }
+        self.marker_tabs(ui, tabs, span);
         self.plot_input(ui, &response, span);
     }
 
@@ -1351,6 +1940,53 @@ impl App {
                 FontId::proportional(12.0),
                 Color32::WHITE,
             );
+        }
+    }
+
+    /// A marker's tab: a click goes to the marker, a drag moves it.
+    fn marker_tabs(&mut self, ui: &egui::Ui, tabs: Vec<(u32, Rect)>, span: Span) {
+        let frames = self.frames();
+        let mut go = None;
+        for (id, tab) in tabs {
+            let response = ui.interact(tab, ui.id().with(("marker", id)), Sense::click_and_drag());
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::Grab);
+            }
+            let locked = self.saving.is_some();
+            let Some(m) = self
+                .edits
+                .as_mut()
+                .and_then(|e| e.markers.iter_mut().find(|m| m.id == id))
+            else {
+                continue;
+            };
+            if response.drag_started() && !locked {
+                let taken = ui
+                    .input(|i| i.pointer.press_origin())
+                    .map_or(m.frame as f64, |p| span.frame(p.x));
+                self.marker_grab = Some((id, taken - m.frame as f64));
+            }
+            if response.dragged()
+                && let (Some((grabbed, offset)), Some(pos)) =
+                    (self.marker_grab, response.interact_pointer_pos())
+                && grabbed == id
+            {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                let last = frames.saturating_sub(m.length) as f64;
+                m.frame = (span.frame(pos.x) - offset).clamp(0.0, last) as usize;
+            }
+            if response.clicked() {
+                go = Some(m.frame);
+            }
+            if response.drag_stopped() {
+                self.marker_grab = None;
+                if let Some(edits) = &mut self.edits {
+                    edits.markers.sort_by_key(|m| (m.frame, m.id));
+                }
+            }
+        }
+        if let Some(frame) = go {
+            self.seek(frame);
         }
     }
 
@@ -1407,35 +2043,87 @@ impl App {
         }
     }
 
+    /// The whole file. Dragging an end of the part in view moves that end;
+    /// dragging anywhere else shows the span dragged over; a click centres
+    /// the view there; a right-drag moves it along.
     fn timeline_view(&mut self, ui: &mut egui::Ui) {
-        let Some(current) = &self.current else { return };
         let area = Self::claim(ui);
-        let rect = Rect::from_min_max(area.min + Vec2::new(0.0, 4.0), area.max);
-        if rect.height() < 4.0 {
+        // Room for the outline, and clear of the handle resizing the panel.
+        let rect = Rect::from_min_max(
+            area.min + Vec2::new(2.0, 6.0),
+            area.max - Vec2::new(2.0, 2.0),
+        );
+        let Some(current) = self.current.as_ref().filter(|_| rect.height() > 4.0) else {
             return;
-        }
+        };
         let response = ui.interact(rect, ui.id().with("timeline"), Sense::click_and_drag());
         let painter = ui.painter_at(area);
-        let frames = current.info.frames;
+        let frames = current.info.frames as f64;
         views::timeline(
             &painter,
             rect,
             &current.timeline,
-            frames,
+            current.info.frames,
             &self.view,
             self.cursor,
+            self.markers(),
         );
-        if response.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        let x_of = |frame: f64| rect.left() + (frame / frames) as f32 * rect.width();
+        let frame_at =
+            |x: f32| f64::from(((x - rect.left()) / rect.width()).clamp(0.0, 1.0)) * frames;
+        let (x0, x1) = (x_of(self.view.start), x_of(self.view.end));
+        let end_at = |x: f32| {
+            let (to_start, to_end) = ((x - x0).abs(), (x - x1).abs());
+            if to_start.min(to_end) > GRIP {
+                None
+            } else if to_start < to_end {
+                Some(Grab::Start)
+            } else {
+                Some(Grab::End)
+            }
+        };
+        if let Some(pos) = response.hover_pos() {
+            let resizing =
+                end_at(pos.x).is_some() || matches!(self.grab, Some(Grab::Start | Grab::End));
+            ui.ctx().set_cursor_icon(if resizing {
+                CursorIcon::ResizeHorizontal
+            } else {
+                CursorIcon::Crosshair
+            });
         }
-        // Click or drag moves the view to be centred there.
-        if (response.clicked() || response.dragged())
+        if response.drag_started_by(PointerButton::Primary) {
+            let from = ui
+                .input(|i| i.pointer.press_origin())
+                .map_or(rect.left(), |p| p.x);
+            self.grab = Some(end_at(from).unwrap_or(Grab::Span(frame_at(from))));
+        }
+        if response.dragged_by(PointerButton::Primary)
+            && let (Some(grab), Some(pos)) = (self.grab, response.interact_pointer_pos())
+        {
+            let at = frame_at(pos.x);
+            let shortest = self.shortest_view();
+            let (start, end) = (self.view.start, self.view.end);
+            match grab {
+                Grab::Start => self.set_view_range(at.min(end - shortest), end),
+                Grab::End => self.set_view_range(start, at.max(start + shortest)),
+                // Past a few points, so a click that wobbles stays a click.
+                Grab::Span(from) if (x_of(from) - pos.x).abs() > 3.0 => {
+                    self.set_view_range(from.min(at), from.max(at));
+                }
+                Grab::Span(_) => {}
+            }
+        }
+        if response.drag_stopped() {
+            self.grab = None;
+        }
+        if response.dragged_by(PointerButton::Secondary) {
+            self.pan(f64::from(response.drag_delta().x / rect.width()) * frames);
+        }
+        if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
-            let centre =
-                f64::from(((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0)) * frames as f64;
             let len = self.view_len();
-            self.set_view(centre - len / 2.0, len);
+            self.set_view(frame_at(pos.x) - len / 2.0, len);
         }
     }
 
@@ -1512,15 +2200,110 @@ impl App {
         views::spectrum(&painter, plot, &curves, nyquist, (lo, hi), (top, bottom));
     }
 
-    fn metadata_view(&self, ui: &mut egui::Ui) {
+    fn markers_view(&mut self, ui: &mut egui::Ui) {
+        Self::claim(ui);
+        ui.add_space(4.0);
+        let count = self.markers().len();
+        let can_add = self.edits.is_some() && self.saving.is_none();
+        let mut add = false;
+        ui.horizontal(|ui| {
+            ui.strong(format!("Markers ({count})"));
+            add = ui
+                .add_enabled(can_add, egui::Button::new("Add").small())
+                .on_hover_text("M: a marker at the playhead, or the selection as a region")
+                .clicked();
+        });
+        if add {
+            self.add_marker();
+        }
+        let (rate, locked) = (self.rate(), self.saving.is_some());
+        let action = match (&self.current, &mut self.edits) {
+            (Some(_), Some(edits)) if edits.markers.is_empty() => {
+                ui.weak("M marks the playhead, or a selected stretch as a region. Saving keeps them in the file as standard WAV cue points, as recorders and Reaper write them.");
+                None
+            }
+            (Some(_), Some(edits)) => views::marker_list(ui, &mut edits.markers, rate, locked),
+            (Some(_), None) => {
+                ui.weak("Markers are kept inside WAV files, and this is not one.");
+                None
+            }
+            (None, _) => {
+                ui.weak("Open a file to see its markers");
+                None
+            }
+        };
+        match action {
+            Some(MarkerAction::Seek(frame)) => self.seek(frame),
+            Some(MarkerAction::Remove(id)) => {
+                if let Some(edits) = &mut self.edits {
+                    edits.markers.retain(|m| m.id != id);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn metadata_view(&mut self, ui: &mut egui::Ui) {
         Self::claim(ui);
         ui.add_space(4.0);
         ui.strong("Metadata");
+        let locked = self.saving.is_some();
         match &self.current {
-            Some(current) => views::metadata(ui, &current.details),
+            Some(current) => views::metadata(ui, &current.details, self.edits.as_mut(), locked),
             None => {
                 ui.weak("Open a file to see what it says about itself");
             }
+        }
+    }
+
+    /// Asks what to do with unsaved changes before opening another file or
+    /// quitting.
+    fn ask(&mut self, ctx: &egui::Context) {
+        let Some(then) = self.asking.clone() else {
+            return;
+        };
+        let name = self
+            .file
+            .as_deref()
+            .and_then(Path::file_name)
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let mut answer = None;
+        let modal = egui::Modal::new(egui::Id::new("unsaved")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.heading("Unsaved changes");
+            ui.add_space(4.0);
+            ui.label(format!(
+                "{name} has changes to its metadata or markers that are not saved."
+            ));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("Don't save").clicked() {
+                    answer = Some(false);
+                }
+                if ui.button("Cancel").clicked() {
+                    self.asking = None;
+                }
+            });
+        });
+        if modal.should_close() && answer.is_none() {
+            self.asking = None;
+        }
+        match answer {
+            Some(true) => {
+                self.asking = None;
+                self.then = Some(then);
+                self.save(ctx);
+            }
+            Some(false) => {
+                self.asking = None;
+                self.edits = self.saved.clone();
+                self.then = Some(then);
+                self.go_ahead(ctx);
+            }
+            None => {}
         }
     }
 }
@@ -1533,16 +2316,33 @@ impl eframe::App for App {
         }
         self.poll(&ctx);
         self.input(&ctx);
+        self.controls.clear();
         self.follow_playback(&ctx);
         self.start_due_analysis(&ctx);
         self.update_probe();
-        if self.loading.is_some() || self.whole_job.is_some() || self.detail_job.is_some() {
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.quitting
+            && (self.dirty() || self.saving.is_some())
+        {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.quit(&ctx);
+        }
+        if self.inbox.quit_asked() {
+            self.quit(&ctx);
+        }
+        let busy = [
+            &self.loading,
+            &self.whole_job,
+            &self.detail_job,
+            &self.saving,
+        ];
+        if busy.iter().any(|job| job.is_some()) {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         let widest = (ui.available_width() / 6.0).max(140.0);
         let mut clicked = None;
-        egui::Panel::left("explorer")
+        let explorer = egui::Panel::left("explorer")
             .resizable(true)
             .default_size(widest.min(240.0))
             .min_size(140.0)
@@ -1550,8 +2350,11 @@ impl eframe::App for App {
             .show_collapsible(ui, &mut self.settings.explorer, |ui| {
                 clicked = self.explorer.ui(ui)
             });
+        if let Some(explorer) = explorer {
+            self.mark_control(Control::Explorer, explorer.response.rect.shrink(5.0));
+        }
         if let Some(path) = clicked {
-            self.open(&ctx, path);
+            self.request_open(&ctx, path);
         }
 
         egui::Panel::top("header").show(ui, |ui| self.header(ui));
@@ -1569,7 +2372,7 @@ impl eframe::App for App {
         }
         self.refresh_textures(&ctx);
         let central = views.spectrogram || views.waveform;
-        let side = views.spectrum || views.metadata;
+        let side = views.spectrum || views.markers || views.metadata;
         if central && side {
             egui::Panel::right("side")
                 .resizable(true)
@@ -1590,6 +2393,16 @@ impl eframe::App for App {
                 });
             }
         });
+        // Last, so that no panel paints over it.
+        if let Some((_, rect)) = self.controls.iter().find(|(c, _)| Some(*c) == self.picked) {
+            ui.painter().rect_stroke(
+                rect.expand(3.0),
+                4.0,
+                Stroke::new(1.5, PICKED),
+                StrokeKind::Outside,
+            );
+        }
+        self.ask(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1602,7 +2415,7 @@ impl eframe::App for App {
 fn frequency_slider(value: &mut f64, range: RangeInclusive<f64>) -> egui::Slider<'_> {
     egui::Slider::new(value, range)
         .logarithmic(true)
-        .smallest_positive(10.0)
+        .smallest_positive(f64::from(LOWEST_HZ))
         .custom_formatter(|v, _| views::hz_field(v))
         .custom_parser(views::parse_hz)
 }
@@ -1690,7 +2503,7 @@ mod tests {
         );
         let back: Settings = eframe::get_value(&storage, eframe::APP_KEY).unwrap();
         assert_eq!((back.fft, back.contrast), (4096, 90.0));
-        assert!(!back.views.meters && back.views.spectrogram);
+        assert!(!back.views.meters && back.views.spectrogram && back.views.markers);
     }
 
     #[test]

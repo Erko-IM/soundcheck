@@ -19,6 +19,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, RawValue, StandardTag};
 use symphonia::core::units::Timestamp;
 
+use crate::edit::Edits;
 use crate::levels::Levels;
 use crate::meta::{self, Details, Meta};
 use crate::spectrogram::{Analysis, Analyzer, Spec};
@@ -68,6 +69,20 @@ pub enum Source {
     Coded(PathBuf),
 }
 
+impl Source {
+    /// The same source after its file was renamed.
+    pub fn with_path(&self, path: &Path) -> Self {
+        match self {
+            Self::Pcm { data, kind, .. } => Self::Pcm {
+                path: path.to_owned(),
+                data: data.clone(),
+                kind: *kind,
+            },
+            Self::Coded(_) => Self::Coded(path.to_owned()),
+        }
+    }
+}
+
 pub struct Loaded {
     pub info: Info,
     pub meta: Meta,
@@ -76,16 +91,20 @@ pub struct Loaded {
     pub levels: Levels,
     /// Per channel, the extremes of each column across the whole file.
     pub timeline: Vec<Vec<[f32; 2]>>,
+    /// What can be edited; only WAV files can be saved into.
+    pub edits: Option<Edits>,
 }
 
-struct Opened {
-    info: Info,
-    meta: Meta,
-    details: Details,
-    source: Source,
+/// A file's header and metadata, without its audio.
+pub struct Opened {
+    pub info: Info,
+    pub meta: Meta,
+    pub details: Details,
+    pub source: Source,
+    pub edits: Option<Edits>,
 }
 
-fn open(path: &Path) -> Result<Opened, String> {
+pub fn open(path: &Path) -> Result<Opened, String> {
     let mut file = File::open(path).map_err(|e| format!("cannot open: {e}"))?;
     let bytes = file.metadata().map_or(0, |m| m.len());
     match wav::parse(&mut file) {
@@ -105,6 +124,7 @@ fn open(path: &Path) -> Result<Opened, String> {
                 data: w.data.clone(),
                 kind: w.kind,
             },
+            edits: Some(Edits::from_wav(&w)),
         }),
         Err(wav::Error::NotWav) => {
             let mut coded = Coded::open(path)?;
@@ -149,6 +169,7 @@ fn open(path: &Path) -> Result<Opened, String> {
                 meta,
                 details,
                 source: Source::Coded(path.to_owned()),
+                edits: None,
             })
         }
         Err(e) => Err(e.to_string()),
@@ -168,6 +189,7 @@ pub fn load(
         meta,
         mut details,
         source,
+        edits,
     } = open(path)?;
     let channels = usize::from(info.channels);
     let mut reader = Reader::open(&source, channels)?;
@@ -222,6 +244,7 @@ pub fn load(
             source,
             levels,
             timeline,
+            edits,
         },
         analysis,
     ))
@@ -262,7 +285,7 @@ fn report(progress: &AtomicU32, done: usize, total: usize) {
     progress.store(permille as u32, Ordering::Relaxed);
 }
 
-fn file_rows(path: &Path, info: &Info) -> Vec<(String, String)> {
+pub fn file_rows(path: &Path, info: &Info) -> Vec<(String, String)> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
     let folder = path.parent().map(|p| p.display().to_string());
     let bits = info.bits.map(|b| format!(", {b}-bit")).unwrap_or_default();

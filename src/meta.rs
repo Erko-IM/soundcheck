@@ -153,24 +153,32 @@ fn flatten(element: &Element, prefix: &str, rows: &mut Vec<(String, String)>) {
     }
 }
 
-fn info_name(id: &[u8; 4]) -> String {
-    let name = match id {
-        b"IART" => "Artist",
-        b"ICMT" => "Comment",
-        b"ICOP" => "Copyright",
-        b"ICRD" => "Date",
-        b"IENG" => "Engineer",
-        b"IGNR" => "Genre",
-        b"IKEY" => "Keywords",
-        b"INAM" => "Title",
-        b"IPRD" => "Product",
-        b"ISBJ" => "Subject",
-        b"ISFT" => "Software",
-        b"ISRC" => "Source",
-        b"ITCH" => "Technician",
-        _ => return String::from_utf8_lossy(id).into_owned(),
-    };
-    name.to_owned()
+/// The RIFF INFO fields editors know, in the order the Metadata view lists
+/// them.
+pub const INFO_FIELDS: [(&[u8; 4], &str); 13] = [
+    (b"INAM", "Title"),
+    (b"IART", "Artist"),
+    (b"ICMT", "Comment"),
+    (b"ISBJ", "Subject"),
+    (b"IKEY", "Keywords"),
+    (b"ICRD", "Date"),
+    (b"IGNR", "Genre"),
+    (b"ICOP", "Copyright"),
+    (b"IENG", "Engineer"),
+    (b"ITCH", "Technician"),
+    (b"ISRC", "Source"),
+    (b"IPRD", "Product"),
+    (b"ISFT", "Software"),
+];
+
+pub fn info_name(id: &[u8; 4]) -> String {
+    INFO_FIELDS
+        .iter()
+        .find(|(known, _)| *known == id)
+        .map_or_else(
+            || String::from_utf8_lossy(id).into_owned(),
+            |(_, name)| (*name).to_owned(),
+        )
 }
 
 /// Channel names from iXML TRACK_LIST, by 1-based CHANNEL_INDEX.
@@ -227,6 +235,16 @@ pub struct Element {
     pub name: String,
     pub text: String,
     pub children: Vec<Element>,
+    /// Where the element's content sits in the source, between its start
+    /// and end tags; for `<NAME/>`, the whole tag. `None` for an element
+    /// that was never closed.
+    pub span: Option<Span>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Span {
+    Content(std::ops::Range<usize>),
+    Empty(std::ops::Range<usize>),
 }
 
 impl Element {
@@ -239,17 +257,19 @@ impl Element {
 /// iXML by hand-rolled code, so this is lenient: an unclosed element closes
 /// with its parent, and a stray end tag is ignored.
 pub fn parse_xml(xml: &str) -> Option<Element> {
-    let mut stack: Vec<Element> = vec![Element::default()];
+    // The element being read, and where its content began.
+    let mut stack: Vec<(Element, usize)> = vec![(Element::default(), 0)];
     let mut rest = xml;
+    let at = |rest: &str| xml.len() - rest.len();
     while let Some(open) = rest.find('<') {
         let text = &rest[..open];
-        if let Some(top) = stack.last_mut() {
+        if let Some((top, _)) = stack.last_mut() {
             top.text.push_str(&unescape(text));
         }
         rest = &rest[open..];
         if let Some(cdata) = rest.strip_prefix("<![CDATA[") {
             let end = cdata.find("]]>").unwrap_or(cdata.len());
-            if let Some(top) = stack.last_mut() {
+            if let Some((top, _)) = stack.last_mut() {
                 top.text.push_str(&cdata[..end]);
             }
             rest = cdata.get(end + 3..).unwrap_or_default();
@@ -263,6 +283,7 @@ pub fn parse_xml(xml: &str) -> Option<Element> {
         let Some(close) = rest.find(skip_to) else {
             break;
         };
+        let tag_start = at(rest);
         let tag = &rest[1..close];
         rest = &rest[close + skip_to.len()..];
         if closer || tag.starts_with('?') || tag.starts_with('!') {
@@ -270,12 +291,18 @@ pub fn parse_xml(xml: &str) -> Option<Element> {
         }
         if let Some(name) = tag.strip_prefix('/') {
             let name = name.trim();
-            if let Some(depth) = stack.iter().rposition(|e| e.name == name)
+            if let Some(depth) = stack.iter().rposition(|(e, _)| e.name == name)
                 && depth > 0
             {
+                // Only the element this tag closes gets a span: any left
+                // open inside it were never closed.
                 while stack.len() > depth {
-                    let done = stack.pop().unwrap_or_default();
-                    if let Some(parent) = stack.last_mut() {
+                    let closed = stack.len() == depth + 1;
+                    let (mut done, from) = stack.pop().unwrap_or_default();
+                    if closed {
+                        done.span = Some(Span::Content(from..tag_start));
+                    }
+                    if let Some((parent, _)) = stack.last_mut() {
                         parent.children.push(done);
                     }
                 }
@@ -289,25 +316,33 @@ pub fn parse_xml(xml: &str) -> Option<Element> {
             .next()
             .unwrap_or_default()
             .to_owned();
-        let element = Element {
+        let mut element = Element {
             name,
             ..Element::default()
         };
         if empty {
-            if let Some(top) = stack.last_mut() {
+            element.span = Some(Span::Empty(tag_start..at(rest)));
+            if let Some((top, _)) = stack.last_mut() {
                 top.children.push(element);
             }
         } else {
-            stack.push(element);
+            stack.push((element, at(rest)));
         }
     }
     while stack.len() > 1 {
-        let done = stack.pop().unwrap_or_default();
-        if let Some(parent) = stack.last_mut() {
+        let (done, _) = stack.pop().unwrap_or_default();
+        if let Some((parent, _)) = stack.last_mut() {
             parent.children.push(done);
         }
     }
-    stack.pop()?.children.into_iter().next()
+    stack.pop()?.0.children.into_iter().next()
+}
+
+/// `text` as XML character data.
+pub fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// XML character data as text, entity and character references resolved.
@@ -428,6 +463,23 @@ mod tests {
             Some("48000")
         );
         assert!(root.child("EMPTY").is_some());
+    }
+
+    #[test]
+    fn xml_spans_point_at_each_element_s_own_content() {
+        let x = "<BWFXML><NOTE>a &amp; b</NOTE><EMPTY/><SPEED><RATE>48</RATE></SPEED></BWFXML>";
+        let root = parse_xml(x).unwrap();
+        let content = |e: &Element| match &e.span {
+            Some(Span::Content(r)) => &x[r.clone()],
+            Some(Span::Empty(r)) => &x[r.clone()],
+            None => "",
+        };
+        assert_eq!(content(root.child("NOTE").unwrap()), "a &amp; b");
+        assert_eq!(content(root.child("EMPTY").unwrap()), "<EMPTY/>");
+        let rate = root.child("SPEED").and_then(|s| s.child("RATE")).unwrap();
+        assert_eq!(content(rate), "48");
+        let unclosed = parse_xml("<A><B>1</A>").unwrap();
+        assert_eq!(unclosed.child("B").unwrap().span, None);
     }
 
     #[test]

@@ -166,6 +166,11 @@ impl Explorer {
         }
     }
 
+    /// Reads `dir` again, to show a file renamed in it.
+    pub fn forget(&mut self, dir: &Path) {
+        self.listings.remove(dir);
+    }
+
     /// Roots the tree at `file`'s folder with `file` selected and in view.
     pub fn reveal(&mut self, file: &Path) {
         if let Some(dir) = file.parent() {
@@ -181,6 +186,15 @@ impl Explorer {
             Some(parent) => Some(Some(parent.to_owned())),
             None if cfg!(windows) => Some(None),
             None => None,
+        }
+    }
+
+    /// Roots the tree one folder further up, as the ⬆ button does.
+    pub fn go_up(&mut self) {
+        match self.up() {
+            Some(Some(parent)) => self.set_root(&parent),
+            Some(None) => self.root = None,
+            None => {}
         }
     }
 
@@ -297,7 +311,11 @@ impl Explorer {
                 let toggle = entry.is_dir.then_some(open);
                 let chosen = selected == Some(entry.path.as_path());
                 let response = draw_row(ui, depth, height, &entry.name, toggle, chosen);
-                if response.clicked() {
+                // egui counts a click anywhere just before as the first of
+                // the run, and then the second click here as a third.
+                if entry.is_dir && (response.double_clicked() || response.triple_clicked()) {
+                    action = Some(Action::Root(Some(entry.path.clone())));
+                } else if response.clicked() {
                     action = Some(if entry.is_dir {
                         Action::Toggle(entry.path.clone())
                     } else {
