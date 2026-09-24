@@ -1,7 +1,8 @@
 # `make install` rebuilds soundcheck and replaces the copy in /Applications,
-# so updating after a change is one command. `make dmg` builds an image to
-# hand to someone else. Windows and Linux packages come from the Release
-# workflow, which builds on those platforms' own runners.
+# so updating after a change is one command. `make dmg` builds soundcheck.dmg
+# in the repo root to hand to someone else, replacing the one before.
+# Windows and Linux packages come from the Release workflow, which builds on
+# those platforms' own runners.
 PACKAGER_VERSION := 0.11.8
 APPS ?= /Applications
 # A code-signing identity from your keychain. Without one, every build is a
@@ -18,9 +19,14 @@ install: packager
 	$(if $(SIGN),codesign --force --sign "$(SIGN)" "$(APPS)/soundcheck.app")
 	@echo "installed $(APPS)/soundcheck.app"
 
+# CI=true skips the step where Finder opens the half-built image to arrange
+# its window, which looks like an install. The image still holds the app and
+# a link to Applications, shown in Finder's default layout.
 dmg: packager
-	cargo packager --release --formats dmg
-	@ls -1 target/packages/*.dmg
+	rm -f target/packages/*.dmg
+	CI=true cargo packager --release --formats dmg
+	mv target/packages/*.dmg soundcheck.dmg
+	@echo "built $(CURDIR)/soundcheck.dmg"
 
 check:
 	cargo fmt --check
