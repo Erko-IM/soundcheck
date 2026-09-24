@@ -41,8 +41,9 @@ const TIME_AXIS: f32 = 44.0;
 const GRIP: f32 = 6.0;
 /// How long the view must rest before the part in view is analysed again.
 const SETTLE: Duration = Duration::from_millis(150);
-const PICKED: Color32 = Color32::from_rgb(110, 170, 255);
-const HEARING: &str = "People hear up to about 20 kHz; bats call and listen far above that";
+const PICKED: Color32 = Color32::from_rgba_unmultiplied_const(255, 140, 50, 200);
+const HEARING: &str = "People hear from about 20 Hz to 20 kHz. Whales call and listen below that, and bats far above it";
+const PICKING: &str = "Click here to pick it for the keys: the arrows step it, with Shift further, R resets it and Shift+R resets every slider";
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Colormap {
@@ -300,6 +301,16 @@ enum Control {
     Explorer,
 }
 
+impl Control {
+    const SLIDERS: [Self; 5] = [
+        Self::Gain,
+        Self::Brightness,
+        Self::Contrast,
+        Self::Low,
+        Self::High,
+    ];
+}
+
 /// What a drag along the timeline moves: one end of the part in view, or a
 /// new span from where the drag began.
 #[derive(Clone, Copy)]
@@ -384,6 +395,8 @@ pub struct App {
     grab: Option<Grab>,
     /// A marker being dragged by its tab, and where on it it was taken.
     marker_grab: Option<(u32, f64)>,
+    /// A marker just made, whose name box takes the keyboard once drawn.
+    name_next: Option<u32>,
 }
 
 impl App {
@@ -439,6 +452,7 @@ impl App {
             unpick_on_click: false,
             grab: None,
             marker_grab: None,
+            name_next: None,
         };
         if let Some(path) = initial.or_else(|| app.inbox.latest()) {
             app.open_external(&cc.egui_ctx, path);
@@ -875,6 +889,7 @@ impl App {
         };
         let (frame, length) = selection.map_or((at, 0), |s| (s.start, s.len()));
         let id = edits.next_marker_id();
+        self.name_next = Some(id);
         edits.markers.push(Marker {
             id,
             frame,
@@ -1173,6 +1188,25 @@ impl App {
         }
     }
 
+    /// Puts `control` back where it starts.
+    fn reset(&mut self, control: Control) {
+        let start = Settings::default();
+        let settings = &mut self.settings;
+        match control {
+            Control::Gain => {
+                settings.gain = start.gain;
+                if let Some(player) = &self.player {
+                    player.set_gain(start.gain);
+                }
+            }
+            Control::Brightness => settings.brightness = start.brightness,
+            Control::Contrast => settings.contrast = start.contrast,
+            Control::Low => settings.band_low = start.band_low,
+            Control::High => settings.band_high = start.band_high,
+            Control::Explorer => {}
+        }
+    }
+
     /// Where a press picks a control for the keys, or lets it go.
     fn pick(&mut self, ctx: &egui::Context) {
         let (pressed, clicked, dragging, at) = ctx.input(|i| {
@@ -1240,6 +1274,16 @@ impl App {
         let plain = |key| pressed(Modifiers::NONE, key);
         if self.picked == Some(Control::Explorer) && plain(Key::Backspace) {
             self.explorer.go_up();
+        }
+        // Shift first: a plain R would take the shifted one too.
+        if pressed(Modifiers::SHIFT, Key::R) {
+            for control in Control::SLIDERS {
+                self.reset(control);
+            }
+        } else if let Some(control) = self.picked
+            && plain(Key::R)
+        {
+            self.reset(control);
         }
         if self.current.is_none() {
             return;
@@ -1500,9 +1544,9 @@ impl App {
             let mut gain = self.settings.gain;
             let group = ui
                 .scope(|ui| {
-                    ui.label("Gain").on_hover_text(
-                        "Playback volume: raise it for quiet recordings, lower it for 32-bit float files that go past full scale",
-                    );
+                    ui.label("Gain").on_hover_text(format!(
+                        "Playback volume: raise it for quiet recordings, lower it for 32-bit float files that go past full scale.\n\n{PICKING}"
+                    ));
                     ui.add(egui::Slider::new(&mut gain, GAIN).step_by(1.0).suffix(" dB"));
                 })
                 .response
@@ -1619,9 +1663,9 @@ impl App {
             ui.separator();
             let group = ui
                 .scope(|ui| {
-                    ui.label("Brightness").on_hover_text(
-                        "Added to every level before colouring: right is brighter. ↑ and ↓ step it by 5 dB",
-                    );
+                    ui.label("Brightness").on_hover_text(format!(
+                        "Added to every level before colouring: right is brighter. With nothing picked, ↑ and ↓ step it by 5 dB.\n\n{PICKING}"
+                    ));
                     ui.add(
                         egui::Slider::new(&mut self.settings.brightness, BRIGHTNESS)
                             .step_by(1.0)
@@ -1633,9 +1677,9 @@ impl App {
             self.mark_control(Control::Brightness, group);
             let group = ui
                 .scope(|ui| {
-                    ui.label("Contrast").on_hover_text(
-                        "How far below full brightness a level still gets colour: lower is more contrast",
-                    );
+                    ui.label("Contrast").on_hover_text(format!(
+                        "How far below full brightness a level still gets colour: lower is more contrast.\n\n{PICKING}"
+                    ));
                     ui.add(
                         egui::Slider::new(&mut self.settings.contrast, CONTRAST)
                             .step_by(1.0)
@@ -1649,20 +1693,22 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label("Frequency");
             let (mut lo, mut hi) = (f64::from(look.f_min), f64::from(look.f_max));
-            let typed = "Drag, or click the number and type: 200, 1.5k, 12 kHz";
+            let typed = format!("Drag, or click the number and type: 200, 1.5k, 12 kHz.\n\n{PICKING}");
             let (mut min_changed, mut max_changed) = (false, false);
             let group = ui
                 .scope(|ui| {
-                    ui.label("Min").on_hover_text(typed);
+                    ui.label("Min").on_hover_text(&typed);
                     min_changed = ui.add(frequency_slider(&mut lo, 0.0..=hi)).changed();
-                    self.listeners.show(ui, lo as f32).on_hover_text(HEARING);
+                    self.listeners
+                        .show(ui, lo as f32, views::Animal::Whale)
+                        .on_hover_text(HEARING);
                 })
                 .response
                 .rect;
             self.mark_control(Control::Low, group);
             let group = ui
                 .scope(|ui| {
-                    ui.label("Max").on_hover_text(typed);
+                    ui.label("Max").on_hover_text(&typed);
                     let top = format!(
                         "Up to {}: half the {rate} Hz sample rate, the highest frequency the file can hold",
                         views::hz_field(f64::from(nyquist))
@@ -1671,7 +1717,9 @@ impl App {
                         .add(frequency_slider(&mut hi, lo.max(10.0)..=f64::from(nyquist)))
                         .on_hover_text(top)
                         .changed();
-                    self.listeners.show(ui, hi as f32).on_hover_text(HEARING);
+                    self.listeners
+                        .show(ui, hi as f32, views::Animal::Bat)
+                        .on_hover_text(HEARING);
                 })
                 .response
                 .rect;
@@ -1868,7 +1916,7 @@ impl App {
         let channels = usize::from(current.info.channels);
         let detail = self.detail.as_ref().map(|d| &d.analysis);
         for (c, lane) in views::lanes(plot, channels).into_iter().enumerate() {
-            painter.rect_filled(lane, 0.0, Color32::from_gray(12));
+            views::strip(&painter, lane);
             views::centre_line(&painter, lane);
             let color = views::PALETTE[c % views::PALETTE.len()];
             if let Some(whole) = &self.whole {
@@ -2222,7 +2270,9 @@ impl App {
                 ui.weak("M marks the playhead, or a selected stretch as a region. Saving keeps them in the file as standard WAV cue points, as recorders and Reaper write them.");
                 None
             }
-            (Some(_), Some(edits)) => views::marker_list(ui, &mut edits.markers, rate, locked),
+            (Some(_), Some(edits)) => {
+                views::marker_list(ui, &mut edits.markers, rate, locked, self.name_next.take())
+            }
             (Some(_), None) => {
                 ui.weak("Markers are kept inside WAV files, and this is not one.");
                 None
@@ -2393,6 +2443,9 @@ impl eframe::App for App {
                 });
             }
         });
+        // A new marker's name box that was not drawn this frame waits for
+        // no later one.
+        self.name_next = None;
         // Last, so that no panel paints over it.
         if let Some((_, rect)) = self.controls.iter().find(|(c, _)| Some(*c) == self.picked) {
             ui.painter().rect_stroke(

@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use eframe::egui::{
-    self, Align, Align2, Button, Color32, ColorImage, FontId, Label, Layout, Painter, Pos2, Rect,
-    Response, RichText, Sense, Shape, Stroke, StrokeKind, TextEdit, TextureHandle, TextureId,
-    TextureOptions, Ui, Vec2,
+    self, Align, Align2, Button, Color32, ColorImage, CursorIcon, FontId, Label, Layout, Painter,
+    Pos2, Rect, Response, RichText, Sense, Shape, Stroke, StrokeKind, TextEdit, TextureHandle,
+    TextureId, TextureOptions, Ui, Vec2,
 };
 
 use crate::edit::{BEXT_FIELDS, Edits};
@@ -20,13 +20,14 @@ pub const AXIS: Color32 = Color32::from_gray(150);
 const GRID: Color32 = Color32::from_gray(48);
 const ELAPSED: Color32 = Color32::from_gray(220);
 const WALL_CLOCK: Color32 = Color32::from_gray(115);
-const SELECTION: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 51);
-const SELECTION_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 178);
+/// Orange, like a control picked for the keys: what is chosen.
+const SELECTION: Color32 = Color32::from_rgba_unmultiplied_const(255, 140, 50, 45);
+const SELECTION_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(255, 140, 50, 180);
 const VIEWPORT: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 64);
 const VIEWPORT_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 153);
-const TIMELINE_BACK: Color32 = Color32::from_gray(22);
+const STRIP_BACK: Color32 = Color32::from_gray(22);
+const STRIP_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(236, 224, 160, 170);
 const TIMELINE_WAVE: Color32 = Color32::from_gray(85);
-const TIMELINE_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(236, 224, 160, 170);
 pub const MARK: Color32 = Color32::from_rgb(255, 196, 70);
 const MARK_SPAN: Color32 = Color32::from_rgba_unmultiplied_const(255, 196, 70, 30);
 const LISTENER: Color32 = Color32::from_gray(150);
@@ -254,6 +255,13 @@ pub fn centre_line(painter: &Painter, lane: Rect) {
     painter.hline(lane.x_range(), lane.center().y, Stroke::new(1.0, GRID));
 }
 
+/// The dark grey ground of a waveform lane or the timeline, edged in pale
+/// yellow to stand out from the panel around it.
+pub fn strip(painter: &Painter, rect: Rect) {
+    painter.rect_filled(rect, 2.0, STRIP_BACK);
+    painter.rect_stroke(rect, 2.0, Stroke::new(1.0, STRIP_EDGE), StrokeKind::Outside);
+}
+
 /// The whole file, as in the original's minimap: the loudest channel
 /// mirrored about the middle, the markers, the part in view with a grip at
 /// each end, and the playhead.
@@ -266,13 +274,7 @@ pub fn timeline(
     playhead: Option<usize>,
     markers: &[Marker],
 ) {
-    painter.rect_filled(rect, 2.0, TIMELINE_BACK);
-    painter.rect_stroke(
-        rect,
-        2.0,
-        Stroke::new(1.0, TIMELINE_EDGE),
-        StrokeKind::Outside,
-    );
+    strip(painter, rect);
     let columns = overview.first().map_or(0, Vec::len);
     if columns == 0 || frames == 0 {
         return;
@@ -366,144 +368,262 @@ pub fn markers_on(
     found
 }
 
-/// How far a figure has turned from a person into a bat at `hz`: not at
-/// all up to 20 kHz, where human hearing ends, and wholly by 100 kHz.
-pub fn batness(hz: f32) -> f32 {
-    ((hz / 20_000.0).ln() / 5f32.ln()).clamp(0.0, 1.0)
+/// Who the figure beside a frequency slider turns into, the further past
+/// human hearing the slider goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Animal {
+    /// Calls and listens far above people.
+    Bat,
+    /// Blue and fin whales call below people's hearing, and hear it.
+    Whale,
 }
 
-/// A part of the figure, in a square from -1 to 1 with y down.
-enum Part {
-    Disc(Vec2, f32),
-    /// From one point to another, this thick, with round ends.
-    Limb(Vec2, Vec2, f32),
-    Area(Vec<Vec2>),
-}
+impl Animal {
+    /// How far a person has turned into this animal at `hz`: for a bat,
+    /// from 20 kHz, where human hearing ends, wholly by 100 kHz; for a
+    /// whale, from 20 Hz, where it starts, wholly by 10 Hz.
+    pub fn change(self, hz: f32) -> f32 {
+        let past = match self {
+            Self::Bat => (hz / 20_000.0).ln() / 5f32.ln(),
+            Self::Whale => (20.0 / hz).log2(),
+        };
+        past.clamp(0.0, 1.0)
+    }
 
-impl Part {
-    fn covers(&self, p: Vec2) -> bool {
+    fn figure(self) -> Figure {
         match self {
-            Self::Disc(centre, radius) => (p - *centre).length() <= *radius,
-            Self::Limb(a, b, width) => {
-                let ab = *b - *a;
-                let along = ((p - *a).dot(ab) / ab.length_sq().max(1e-9)).clamp(0.0, 1.0);
-                (p - (*a + ab * along)).length() <= width / 2.0
-            }
-            // Counting the edges a ray from `p` crosses, so an outline that
-            // folds in on itself still fills as drawn.
-            Self::Area(corners) => {
-                let mut inside = false;
-                for (i, a) in corners.iter().enumerate() {
-                    let b = corners[(i + 1) % corners.len()];
-                    if (a.y > p.y) != (b.y > p.y)
-                        && p.x < a.x + (b.x - a.x) * (p.y - a.y) / (b.y - a.y)
-                    {
-                        inside = !inside;
-                    }
-                }
-                inside
-            }
+            Self::Bat => Figure::bat(),
+            Self::Whale => Figure::whale(),
         }
     }
 }
 
-/// The figure `t` of the way from a person with arms raised to a bat with
-/// wings spread, every point moving straight from the one to the other.
-fn figure(t: f32) -> Vec<Part> {
-    let at = |(ax, ay): (f32, f32), (bx, by): (f32, f32)| {
-        Vec2::new(ax + (bx - ax) * t, ay + (by - ay) * t)
-    };
-    let size = |a: f32, b: f32| a + (b - a) * t;
-    let head = (0.0, -0.66);
-    let mut parts = vec![
-        Part::Disc(at(head, (0.0, -0.3)), size(0.19, 0.17)),
-        Part::Limb(
-            at((0.0, -0.28), (0.0, -0.18)),
-            at((0.0, 0.12), (0.0, 0.24)),
-            size(0.32, 0.36),
-        ),
-    ];
-    for side in [-1.0, 1.0] {
-        let s = |(x, y): (f32, f32)| (x * side, y);
-        // Ears grow out of the head, and the legs shrink to feet.
-        let ear = [(0.05, -0.4), (0.17, -0.34), (0.16, -0.62)];
-        parts.push(Part::Area(ear.map(|p| at(head, s(p))).to_vec()));
-        parts.push(Part::Limb(
-            at(s((0.08, 0.12)), s((0.06, 0.22))),
-            at(s((0.28, 0.92)), s((0.1, 0.42))),
-            size(0.16, 0.1),
-        ));
-        let (shoulder, hand) = ((0.12, -0.34), (0.62, -0.84));
-        parts.push(Part::Limb(
-            at(s(shoulder), s((0.1, -0.14))),
-            at(s(hand), s((0.5, -0.44))),
-            size(0.14, 0.1),
-        ));
-        // The wing unfolds from the arm: each corner starts that far along
-        // it, from the shoulder to the hand.
-        let wing = [
-            (0.0, (0.1, -0.14)),
-            (1.0, (0.5, -0.44)),
-            (1.0, (1.0, -0.2)),
-            (0.9, (0.78, -0.02)),
-            (0.8, (0.84, 0.2)),
-            (0.65, (0.6, 0.12)),
-            (0.5, (0.52, 0.34)),
-            (0.3, (0.32, 0.18)),
-            (0.0, (0.12, 0.26)),
-        ];
-        let on_arm = |along: f32| {
-            (
-                shoulder.0 + (hand.0 - shoulder.0) * along,
-                shoulder.1 + (hand.1 - shoulder.1) * along,
-            )
-        };
-        let corners = wing.map(|(along, spread)| at(s(on_arm(along)), s(spread)));
-        parts.push(Part::Area(corners.to_vec()));
-    }
-    parts
+/// From one point to another, this thick, with round ends.
+#[derive(Clone, Copy)]
+struct Limb {
+    from: Vec2,
+    to: Vec2,
+    width: f32,
 }
 
-/// `figure(t)` in white on clear, `size` pixels square, each pixel sampled
-/// four by four so the edges come out smooth.
-fn figure_image(t: f32, size: usize) -> ColorImage {
-    const SAMPLES: usize = 4;
-    let parts = figure(t);
-    let pixels = (0..size * size)
-        .map(|i| {
-            let corner = Vec2::new((i % size) as f32, (i / size) as f32);
-            let hits = (0..SAMPLES * SAMPLES)
-                .filter(|k| {
-                    let within =
-                        Vec2::new((k % SAMPLES) as f32, (k / SAMPLES) as f32) + Vec2::splat(0.5);
-                    let p =
-                        (corner + within / SAMPLES as f32) / size as f32 * 2.0 - Vec2::splat(1.0);
-                    parts.iter().any(|part| part.covers(p))
-                })
-                .count();
-            Color32::from_white_alpha((hits * 255 / (SAMPLES * SAMPLES)) as u8)
-        })
-        .collect();
-    ColorImage::new([size, size], pixels)
+impl Limb {
+    fn new((ax, ay): (f32, f32), (bx, by): (f32, f32), width: f32) -> Self {
+        Self {
+            from: Vec2::new(ax, ay),
+            to: Vec2::new(bx, by),
+            width,
+        }
+    }
+
+    fn mirrored(self) -> Self {
+        Self {
+            from: Vec2::new(-self.from.x, self.from.y),
+            to: Vec2::new(-self.to.x, self.to.y),
+            ..self
+        }
+    }
+
+    fn covers(self, p: Vec2) -> bool {
+        let along = self.to - self.from;
+        let t = ((p - self.from).dot(along) / along.length_sq().max(1e-9)).clamp(0.0, 1.0);
+        (p - (self.from + along * t)).length() <= self.width / 2.0
+    }
+}
+
+fn points<const N: usize>(corners: [(f32, f32); N]) -> [Vec2; N] {
+    corners.map(|(x, y)| Vec2::new(x, y))
+}
+
+fn mirrored<const N: usize>(corners: [Vec2; N]) -> [Vec2; N] {
+    corners.map(|p| Vec2::new(-p.x, p.y))
+}
+
+/// Counting the edges a ray from `p` crosses, so an outline that folds in
+/// on itself still fills as drawn.
+fn inside(corners: &[Vec2], p: Vec2) -> bool {
+    let mut inside = false;
+    for (i, a) in corners.iter().enumerate() {
+        let b = corners[(i + 1) % corners.len()];
+        if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (b.x - a.x) * (p.y - a.y) / (b.y - a.y) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// A figure, in a square from -1 to 1 with y down. A person, a bat and a
+/// whale all have these parts, so one turns into another part by part.
+#[derive(Clone, Copy)]
+struct Figure {
+    head: Vec2,
+    head_radius: f32,
+    body: Limb,
+    /// Legs, then arms.
+    limbs: [Limb; 4],
+    /// Ears, or drops of spray.
+    small: [[Vec2; 3]; 2],
+    /// Wings, or a tail.
+    large: [[Vec2; 9]; 2],
+}
+
+impl Figure {
+    /// Arms raised, with the ears still inside the head, to grow out of it,
+    /// and the wings folded along the arms, to unfold from them.
+    fn person() -> Self {
+        let head = Vec2::new(0.0, -0.66);
+        let arm = Limb::new((0.12, -0.34), (0.62, -0.84), 0.14);
+        let leg = Limb::new((0.08, 0.12), (0.28, 0.92), 0.16);
+        // How far along the arm each corner of the wing starts.
+        let along = [0.0, 1.0, 1.0, 0.9, 0.8, 0.65, 0.5, 0.3, 0.0];
+        let wing = along.map(|a| arm.from + (arm.to - arm.from) * a);
+        Self {
+            head,
+            head_radius: 0.19,
+            body: Limb::new((0.0, -0.28), (0.0, 0.12), 0.32),
+            limbs: [leg.mirrored(), leg, arm.mirrored(), arm],
+            small: [[head; 3]; 2],
+            large: [mirrored(wing), wing],
+        }
+    }
+
+    fn bat() -> Self {
+        let ear = points([(0.05, -0.4), (0.17, -0.34), (0.16, -0.62)]);
+        let wing = points([
+            (0.1, -0.14),
+            (0.5, -0.44),
+            (1.0, -0.2),
+            (0.78, -0.02),
+            (0.84, 0.2),
+            (0.6, 0.12),
+            (0.52, 0.34),
+            (0.32, 0.18),
+            (0.12, 0.26),
+        ]);
+        let arm = Limb::new((0.1, -0.14), (0.5, -0.44), 0.1);
+        let leg = Limb::new((0.06, 0.22), (0.1, 0.42), 0.1);
+        Self {
+            head: Vec2::new(0.0, -0.3),
+            head_radius: 0.17,
+            body: Limb::new((0.0, -0.18), (0.0, 0.24), 0.36),
+            limbs: [leg.mirrored(), leg, arm.mirrored(), arm],
+            small: [mirrored(ear), ear],
+            large: [mirrored(wing), wing],
+        }
+    }
+
+    /// Side on, facing left, blowing: the raised arms become the spout and
+    /// the ears its spray, one leg the flipper and one wing the tail, and
+    /// the other leg and wing go into the body.
+    fn whale() -> Self {
+        let hidden = std::array::from_fn(|i| {
+            let angle = i as f32 * std::f32::consts::TAU / 9.0;
+            Vec2::new(-0.1 + 0.05 * angle.cos(), 0.06 + 0.05 * angle.sin())
+        });
+        Self {
+            head: Vec2::new(-0.42, 0.04),
+            head_radius: 0.36,
+            body: Limb::new((-0.3, 0.08), (0.26, 0.06), 0.6),
+            limbs: [
+                Limb::new((-0.2, 0.28), (0.04, 0.46), 0.13),
+                Limb::new((0.2, 0.05), (0.3, 0.05), 0.1),
+                Limb::new((-0.42, -0.3), (-0.5, -0.66), 0.07),
+                Limb::new((-0.4, -0.3), (-0.32, -0.66), 0.07),
+            ],
+            small: [
+                points([(-0.5, -0.7), (-0.7, -0.66), (-0.68, -0.5)]),
+                points([(-0.32, -0.7), (-0.12, -0.66), (-0.14, -0.5)]),
+            ],
+            large: [
+                hidden,
+                points([
+                    (0.2, -0.24),
+                    (0.6, -0.12),
+                    (0.8, -0.34),
+                    (0.84, -0.22),
+                    (0.76, 0.0),
+                    (0.84, 0.22),
+                    (0.8, 0.34),
+                    (0.6, 0.14),
+                    (0.2, 0.34),
+                ]),
+            ],
+        }
+    }
+
+    /// `t` of the way from this figure to `to`, every point moving straight
+    /// from the one to the other.
+    fn toward(&self, to: &Self, t: f32) -> Self {
+        let at = |a: Vec2, b: Vec2| a + (b - a) * t;
+        let size = |a: f32, b: f32| a + (b - a) * t;
+        let limb = |a: Limb, b: Limb| Limb {
+            from: at(a.from, b.from),
+            to: at(a.to, b.to),
+            width: size(a.width, b.width),
+        };
+        Self {
+            head: at(self.head, to.head),
+            head_radius: size(self.head_radius, to.head_radius),
+            body: limb(self.body, to.body),
+            limbs: std::array::from_fn(|i| limb(self.limbs[i], to.limbs[i])),
+            small: std::array::from_fn(|i| {
+                std::array::from_fn(|k| at(self.small[i][k], to.small[i][k]))
+            }),
+            large: std::array::from_fn(|i| {
+                std::array::from_fn(|k| at(self.large[i][k], to.large[i][k]))
+            }),
+        }
+    }
+
+    fn covers(&self, p: Vec2) -> bool {
+        (p - self.head).length() <= self.head_radius
+            || self.body.covers(p)
+            || self.limbs.iter().any(|limb| limb.covers(p))
+            || self.small.iter().any(|corners| inside(corners, p))
+            || self.large.iter().any(|corners| inside(corners, p))
+    }
+
+    /// In white on clear, `size` pixels square, each pixel sampled four by
+    /// four so the edges come out smooth.
+    fn image(&self, size: usize) -> ColorImage {
+        const SAMPLES: usize = 4;
+        let pixels = (0..size * size)
+            .map(|i| {
+                let corner = Vec2::new((i % size) as f32, (i / size) as f32);
+                let hits = (0..SAMPLES * SAMPLES)
+                    .filter(|k| {
+                        let within = Vec2::new((k % SAMPLES) as f32, (k / SAMPLES) as f32)
+                            + Vec2::splat(0.5);
+                        let p = (corner + within / SAMPLES as f32) / size as f32 * 2.0
+                            - Vec2::splat(1.0);
+                        self.covers(p)
+                    })
+                    .count();
+                Color32::from_white_alpha((hits * 255 / (SAMPLES * SAMPLES)) as u8)
+            })
+            .collect();
+        ColorImage::new([size, size], pixels)
+    }
 }
 
 /// The small grey figure beside each frequency slider, for who could hear
-/// that frequency: a person, turning bit by bit into a bat the further past
-/// human hearing it goes. Each step of the way is drawn once and kept.
+/// that frequency: a person, turning bit by bit into an animal that hears
+/// what people cannot, the further past human hearing the slider goes.
+/// Each step of the way is drawn once and kept.
 #[derive(Default)]
-pub struct Listeners(HashMap<(u16, usize), TextureHandle>);
+pub struct Listeners(HashMap<(Animal, u16, usize), TextureHandle>);
 
 impl Listeners {
     const STEPS: f32 = 64.0;
 
-    pub fn show(&mut self, ui: &mut Ui, hz: f32) -> Response {
+    pub fn show(&mut self, ui: &mut Ui, hz: f32, animal: Animal) -> Response {
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
-        let step = (batness(hz) * Self::STEPS).round() as u16;
+        let step = (animal.change(hz) * Self::STEPS).round() as u16;
         let size = (rect.width() * ui.ctx().pixels_per_point()).ceil() as usize;
-        let texture = self.0.entry((step, size)).or_insert_with(|| {
-            let image = figure_image(f32::from(step) / Self::STEPS, size);
+        let texture = self.0.entry((animal, step, size)).or_insert_with(|| {
+            let t = f32::from(step) / Self::STEPS;
+            let image = Figure::person().toward(&animal.figure(), t).image(size);
             ui.ctx().load_texture(
-                format!("listener-{step}-{size}"),
+                format!("listener-{animal:?}-{step}-{size}"),
                 image,
                 TextureOptions::LINEAR,
             )
@@ -834,12 +954,14 @@ pub enum MarkerAction {
 }
 
 /// The Markers view: each marker's time, which goes there, its name, and a
-/// button that removes it.
+/// button that removes it. The name box of `name`, a marker just made,
+/// takes the keyboard.
 pub fn marker_list(
     ui: &mut Ui,
     markers: &mut [Marker],
     rate: f64,
     locked: bool,
+    name: Option<u32>,
 ) -> Option<MarkerAction> {
     let mut action = None;
     egui::ScrollArea::vertical()
@@ -855,22 +977,32 @@ pub fn marker_list(
                     } else {
                         clock_fine(at)
                     };
-                    if ui
-                        .link(RichText::new(when).monospace())
-                        .on_hover_text("Go there")
-                        .clicked()
-                    {
+                    // Only the name boxes take the keyboard, so Tab goes from
+                    // name to name and nothing but a click removes a marker.
+                    let link = RichText::new(when)
+                        .monospace()
+                        .color(ui.visuals().hyperlink_color);
+                    let go = ui.add(Label::new(link).selectable(false).sense(Sense::CLICK));
+                    if go.hovered() {
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+                    if go.on_hover_text("Go there").clicked() {
                         action = Some(MarkerAction::Seek(m.frame));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let remove = ui.add_enabled(!locked, Button::new("✖").small());
+                        let remove =
+                            ui.add_enabled(!locked, Button::new("✖").small().sense(Sense::CLICK));
                         if remove.on_hover_text("Remove").clicked() {
                             action = Some(MarkerAction::Remove(m.id));
                         }
-                        let name = TextEdit::singleline(&mut m.label)
+                        let edit = TextEdit::singleline(&mut m.label)
                             .hint_text("name")
                             .desired_width(ui.available_width());
-                        ui.add_enabled(!locked, name);
+                        let edit = ui.add_enabled(!locked, edit);
+                        if name == Some(m.id) {
+                            edit.request_focus();
+                            edit.scroll_to_me(Some(Align::Center));
+                        }
                     });
                 });
             }
@@ -1067,14 +1199,18 @@ mod tests {
     }
 
     #[test]
-    fn the_figure_is_a_person_in_human_hearing_and_a_bat_well_above_it() {
-        assert_eq!(batness(440.0), 0.0);
-        assert_eq!(batness(20_000.0), 0.0);
-        assert!((batness(44_721.0) - 0.5).abs() < 0.01);
-        assert_eq!(batness(192_000.0), 1.0);
-        // Standing, the figure is taller than it is wide; flying, wider.
-        let extent = |t| {
-            let image = figure_image(t, 36);
+    fn the_figure_is_a_person_in_human_hearing_and_an_animal_past_it() {
+        use Animal::{Bat, Whale};
+        assert_eq!((Bat.change(440.0), Bat.change(20_000.0)), (0.0, 0.0));
+        assert!((Bat.change(44_721.0) - 0.5).abs() < 0.01);
+        assert_eq!(Bat.change(192_000.0), 1.0);
+        assert_eq!((Whale.change(20.0), Whale.change(24_000.0)), (0.0, 0.0));
+        assert!((Whale.change(14.142) - 0.5).abs() < 0.01);
+        assert_eq!((Whale.change(10.0), Whale.change(0.0)), (1.0, 1.0));
+        // Standing, the figure is taller than it is wide; turned into
+        // either animal, wider.
+        let extent = |figure: Figure| {
+            let image = figure.image(36);
             let solid: Vec<usize> = (0..image.pixels.len())
                 .filter(|&i| image.pixels[i].a() > 127)
                 .collect();
@@ -1084,9 +1220,12 @@ mod tests {
             };
             (span(|i| i % 36), span(|i| i / 36))
         };
-        let (person, bat) = (extent(0.0), extent(1.0));
+        let person = extent(Figure::person());
         assert!(person.1 > person.0, "{person:?}");
-        assert!(bat.0 > bat.1, "{bat:?}");
+        for animal in [Bat, Whale] {
+            let (wide, tall) = extent(Figure::person().toward(&animal.figure(), 1.0));
+            assert!(wide > tall, "{animal:?} {wide} by {tall}");
+        }
     }
 
     #[test]
