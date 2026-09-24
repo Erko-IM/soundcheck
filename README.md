@@ -5,3 +5,5 @@ It was inspired by https://github.com/mrkva/sound-explorer/tree/main - but rewri
 Makefile contains commands to generate your own installer for macos - only ARM based. But repo root also contains install file itself. 
 
 Will add the same for Linux and Windows later on.
+
+This project is open-source - no catch, nothing proprietary, just seems like a useful tool to have, and thus... if you find it useful, feel free to use, fork, do whatever you want, but you cannot fork it to make it proprietary.
