@@ -22,13 +22,22 @@ jobs:
       matrix:
         include:
           - runner: macos-15
-            formats: dmg
+            output: soundcheck.dmg
           - runner: windows-2025
             formats: nsis
+            output: target/packages/*.exe
           # The oldest supported Ubuntu, so the AppImage runs on older distros.
           - runner: ubuntu-22.04
             formats: deb,appimage
+            output: |
+              target/packages/*.deb
+              target/packages/*.AppImage
     runs-on: ${{ matrix.runner }}
+    # Windows runs steps in PowerShell by default, which reads $FORMATS as
+    # one of its own variables rather than from the environment.
+    defaults:
+      run:
+        shell: bash
     env:
       FORMATS: ${{ matrix.formats }}
     steps:
@@ -48,12 +57,20 @@ jobs:
         run: cargo install cargo-packager --locked --version 0.11.8
 
       - name: Package
+        if: runner.os != 'macOS'
         run: cargo packager --release --formats "$FORMATS"
+
+      # make builds the image around the signed app itself; its dmg target
+      # says why.
+      - name: Package
+        if: runner.os == 'macOS'
+        run: make dmg
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: soundcheck-${{ runner.os }}
-          path: target/packages/*
+          # Only the packages: gh release create can't upload a folder.
+          path: ${{ matrix.output }}
           if-no-files-found: error
 
   release:

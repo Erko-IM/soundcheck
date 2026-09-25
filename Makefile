@@ -27,13 +27,17 @@ install: packager
 	$(if $(SIGN),codesign --force --sign "$(SIGN)" "$(APPS)/soundcheck.app")
 	@echo "installed $(APPS)/soundcheck.app"
 
-# CI=true skips the step where Finder opens the half-built image to arrange
-# its window, which looks like an install. The image still holds the app and
-# a link to Applications, shown in Finder's default layout.
+# A plain image around the signed app. cargo-packager's dmg format signs the
+# image as well, and macOS blocks a downloaded image with an ad-hoc signature
+# outright; unsigned, it opens and macOS checks only the app. hdiutil, not
+# diskutil image, because that only exists from macOS 26.
 dmg: packager
-	rm -f target/packages/*.dmg
-	CI=true $(CARGO_BIN)/cargo packager --release --formats dmg
-	mv target/packages/*.dmg soundcheck.dmg
+	$(CARGO_BIN)/cargo packager --release --formats app
+	rm -rf target/dmg
+	mkdir target/dmg
+	ditto target/packages/soundcheck.app target/dmg/soundcheck.app
+	ln -s /Applications target/dmg/Applications
+	hdiutil create -volname soundcheck -srcfolder target/dmg -fs HFS+ -format UDZO -ov soundcheck.dmg
 	@echo "built $(CURDIR)/soundcheck.dmg"
 
 check: rust
