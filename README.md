@@ -10,6 +10,10 @@ Will add the same for Linux and Windows later on.
 
 This project is open-source - no catch, nothing proprietary, just seems like a useful tool to have, and thus... if you find it useful, feel free to use, fork, do whatever you want, but you cannot fork it to make it proprietary.
 
+Press "m" to mark a place on the soundfile, it will also immediately put you on the name place.
+Press "r" to reset the selected configuration box, or "shift+r" to reset all the configs.
+The rest should be pretty self-explanatory.
+
 ## License
 
 This project is licensed under the GNU General Public License v3.0 (GPL-3.0) - see the [LICENSE](LICENSE) file for details.
