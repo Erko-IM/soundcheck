@@ -36,7 +36,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      # rust-toolchain.toml names the version, so this matches what make builds with.
+      - name: Install Rust
+        run: rustup toolchain install --no-self-update
 
       - name: Linux build dependencies
         if: runner.os == 'Linux'

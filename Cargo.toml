@@ -55,6 +55,9 @@ out-dir = "target/packages"
 
 [package.metadata.packager.macos]
 info-plist-path = "packaging/Info.plist"
+# "-" signs ad hoc, which seals the whole app: without it a downloaded copy
+# is "damaged".
+signing-identity = "-"
 
 [package.metadata.packager.deb]
 desktop-template = "packaging/soundcheck.desktop"

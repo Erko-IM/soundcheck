@@ -1,0 +1,5 @@
+# Pinned so `make` and the Release workflow build with the same Rust.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
