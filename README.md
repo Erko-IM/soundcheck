@@ -7,7 +7,10 @@ It was inspired by https://github.com/mrkva/sound-explorer/tree/main - but rewri
 Makefile contains commands to generate your own installer for macos - only ARM based. But repo root also contains install file itself. 
 
 The first time you open the dmg file after downloading, macos says it cannot verify soundcheck, this is because the app is not signed with a paid Apple developer account. It most likely never will be. Click Done, then open System Settings, go to Privacy & Security, scroll down to the message about soundcheck and click Open Anyway. After that it opens like any other app. 
-From a terminal, this does the same: `xattr -dr com.apple.quarantine /Applications/soundcheck.app` if you don't want to bother with UI.
+
+From a terminal, this does the same if you don't want to bother with UI:
+`xattr -dr com.apple.quarantine /Applications/soundcheck.app`
+
 Other option is to clone repo to your machine, and run "make dmg" from repo root from terminal. It will install all the necessary dependencies on your mac as well. Check Makefile contents to see what it is actually doing, in case you are worried.
 
 Will add the same for Linux and Windows later on.
