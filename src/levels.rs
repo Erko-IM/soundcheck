@@ -39,23 +39,23 @@ impl Levels {
     /// boundary.
     pub fn push(&mut self, samples: &[f32]) {
         let ch = self.channels;
-        let blocks: Vec<Vec<[f32; 2]>> = samples
-            .par_chunks(self.block * ch)
-            .map(|block| {
+        let start = self.stats.len();
+        let blocks = samples.len().div_ceil(self.block * ch);
+        self.stats.resize(start + blocks * ch, [0.0; 2]);
+        self.stats[start..]
+            .par_chunks_mut(ch)
+            .zip(samples.par_chunks(self.block * ch))
+            .for_each(|(stats, block)| {
+                for frame in block.chunks_exact(ch) {
+                    for (s, &x) in stats.iter_mut().zip(frame) {
+                        *s = [s[0].max(x.abs()), s[1] + x * x];
+                    }
+                }
                 let frames = (block.len() / ch).max(1) as f32;
-                (0..ch)
-                    .map(|c| {
-                        let (peak, energy) = block
-                            .iter()
-                            .skip(c)
-                            .step_by(ch)
-                            .fold((0.0f32, 0.0f32), |(p, e), &s| (p.max(s.abs()), e + s * s));
-                        [peak, energy / frames]
-                    })
-                    .collect()
-            })
-            .collect();
-        self.stats.extend(blocks.into_iter().flatten());
+                for s in stats {
+                    s[1] /= frames;
+                }
+            });
     }
 
     /// Each channel's level over `span` frames ending at `frame`.

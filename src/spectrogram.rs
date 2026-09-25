@@ -17,6 +17,9 @@ pub const FFT_SIZES: [usize; 5] = [512, 1024, 2048, 4096, 8192];
 /// ever scaled down.
 pub const MAX_COLUMNS: usize = 2048;
 pub const SILENCE_DB: f32 = -200.0;
+/// Frames a thread takes at a time when a target's signal is drawn out of
+/// the interleaved samples.
+const MIX_FRAMES: usize = 1 << 14;
 
 /// Which signals are analysed: the channels averaged, each channel on its
 /// own, or one channel.
@@ -50,6 +53,25 @@ impl Target {
         match self {
             Self::Mix => frame.iter().sum::<f32>() / frame.len() as f32,
             Self::Channel(c) => frame[c],
+        }
+    }
+
+    /// One value per frame of the interleaved `frames` of `ch` channels.
+    /// Mono and a stereo mix are written out, so the compiler takes many
+    /// frames at a time.
+    fn fill(self, out: &mut [f32], frames: &[f32], ch: usize) {
+        match (self, ch) {
+            (_, 1) => out.copy_from_slice(frames),
+            (Self::Mix, 2) => {
+                for (o, f) in out.iter_mut().zip(frames.as_chunks::<2>().0) {
+                    *o = (f[0] + f[1]) / 2.0;
+                }
+            }
+            _ => {
+                for (o, f) in out.iter_mut().zip(frames.chunks_exact(ch)) {
+                    *o = self.sample(f);
+                }
+            }
         }
     }
 }
@@ -133,12 +155,26 @@ impl Kernel {
         acc: &mut [f32],
         fold: fn(&mut f32, f32),
     ) {
-        let half = self.window.len() / 2;
-        for (i, (slot, w)) in s.input.iter_mut().zip(self.window.iter()).enumerate() {
-            *slot = (centre + i)
-                .checked_sub(half)
-                .and_then(|at| signal.get(at))
-                .map_or(0.0, |x| x * w);
+        let (size, half) = (self.window.len(), self.window.len() / 2);
+        match centre
+            .checked_sub(half)
+            .filter(|from| from + size <= signal.len())
+        {
+            // Inside the signal all the way, as nearly every window is.
+            Some(from) => {
+                let inside = s.input.iter_mut().zip(&signal[from..from + size]);
+                for ((slot, x), w) in inside.zip(self.window.iter()) {
+                    *slot = x * w;
+                }
+            }
+            None => {
+                for (i, (slot, w)) in s.input.iter_mut().zip(self.window.iter()).enumerate() {
+                    *slot = (centre + i)
+                        .checked_sub(half)
+                        .and_then(|at| signal.get(at))
+                        .map_or(0.0, |x| x * w);
+                }
+            }
         }
         self.plan
             .process_with_scratch(&mut s.input, &mut s.output, &mut s.fft)
@@ -269,7 +305,12 @@ impl Analyzer {
     pub fn push(&mut self, first: usize, samples: &[f32]) {
         let ch = self.channels;
         for (target, buffer) in self.targets.iter().zip(&mut self.buffers) {
-            buffer.par_extend(samples.par_chunks_exact(ch).map(|f| target.sample(f)));
+            let start = buffer.len();
+            buffer.resize(start + samples.len() / ch, 0.0);
+            buffer[start..]
+                .par_chunks_mut(MIX_FRAMES)
+                .zip(samples.par_chunks(MIX_FRAMES * ch))
+                .for_each(|(out, frames)| target.fill(out, frames, ch));
         }
         self.add_envelope(first, samples);
 
@@ -387,14 +428,8 @@ impl Analyzer {
         let found: Vec<(usize, Vec<[f32; 2]>)> = stretches
             .into_par_iter()
             .map(|(column, frames)| {
-                let mut extremes = vec![[f32::INFINITY, f32::NEG_INFINITY]; ch];
                 let part = &samples[(frames.start - first) * ch..(frames.end - first) * ch];
-                for frame in part.chunks_exact(ch) {
-                    for (e, &s) in extremes.iter_mut().zip(frame) {
-                        *e = [e[0].min(s), e[1].max(s)];
-                    }
-                }
-                (column, extremes)
+                (column, extremes(part, ch))
             })
             .collect();
         for (column, extremes) in found {
@@ -404,6 +439,36 @@ impl Analyzer {
             }
         }
     }
+}
+
+/// Each channel's lowest and highest sample in the interleaved frames of
+/// `part`. They are compared a row of whole frames at a time, a row wide
+/// enough that the compiler compares many samples at once.
+fn extremes(part: &[f32], ch: usize) -> Vec<[f32; 2]> {
+    let width = ch * 64usize.div_ceil(ch);
+    let mut lo = vec![f32::INFINITY; width];
+    let mut hi = vec![f32::NEG_INFINITY; width];
+    let rows = part.chunks_exact(width);
+    let rest = rows.remainder();
+    for row in rows {
+        for ((l, h), &s) in lo.iter_mut().zip(&mut hi).zip(row) {
+            *l = l.min(s);
+            *h = h.max(s);
+        }
+    }
+    for ((l, h), &s) in lo.iter_mut().zip(&mut hi).zip(rest) {
+        *l = l.min(s);
+        *h = h.max(s);
+    }
+    (0..ch)
+        .map(|c| {
+            let lanes = (c..width).step_by(ch);
+            [
+                lanes.clone().map(|i| lo[i]).fold(f32::INFINITY, f32::min),
+                lanes.map(|i| hi[i]).fold(f32::NEG_INFINITY, f32::max),
+            ]
+        })
+        .collect()
 }
 
 /// Frames either side of a centre that [`spectrum_around`] reads.

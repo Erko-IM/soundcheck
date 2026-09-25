@@ -27,8 +27,10 @@ use crate::wav::{self, SampleKind};
 
 /// A timestamp further ahead than this is a damaged one, not a gap.
 const MAX_GAP_SECONDS: usize = 10;
-/// Frames read at a time by a pass over a file or a range of it.
-const PIECE: usize = 1 << 18;
+/// Samples, all channels counted, read at a time by a pass over a file or
+/// a range of it: enough that the work on each read far outweighs sharing
+/// it out between threads, in the same memory whatever the channel count.
+const PIECE_SAMPLES: usize = 1 << 21;
 /// PCM reads of more frames than this are split across threads.
 const PARALLEL_FRAMES: usize = 1 << 15;
 /// A compressed file is decoded forward over a jump this short, and seeks
@@ -200,7 +202,7 @@ pub fn load(
     let planned = info.frames;
     let mut analyzer = (planned > 0).then(|| Analyzer::new(spec, 0..planned, planned, channels));
     // Whole blocks of levels per read, so no block straddles two.
-    let piece = (PIECE / levels.block).max(1) * levels.block;
+    let piece = (piece_frames(channels) / levels.block).max(1) * levels.block;
     let mut buffer = vec![0.0; piece * channels];
     let mut at = 0;
     loop {
@@ -264,13 +266,14 @@ pub fn analyse(
     let mut reader = Reader::open(source, channels)?;
     let mut analyzer = Analyzer::new(spec, range, info.frames, channels);
     let wanted = analyzer.wanted();
-    let mut buffer = vec![0.0; PIECE * channels];
+    let piece = piece_frames(channels).min(wanted.len().max(1));
+    let mut buffer = vec![0.0; piece * channels];
     let mut at = wanted.start;
     while at < wanted.end {
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        let n = PIECE.min(wanted.end - at);
+        let n = piece.min(wanted.end - at);
         let part = &mut buffer[..n * channels];
         reader.read(at, part)?;
         analyzer.push(at, part);
@@ -278,6 +281,11 @@ pub fn analyse(
         report(progress, at - wanted.start, wanted.len());
     }
     Ok(Some(analyzer.finish()))
+}
+
+/// Frames of `channels` channels in one piece.
+fn piece_frames(channels: usize) -> usize {
+    (PIECE_SAMPLES / channels.max(1)).max(1)
 }
 
 fn report(progress: &AtomicU32, done: usize, total: usize) {
@@ -322,7 +330,6 @@ impl Reader {
     pub fn open(source: &Source, channels: usize) -> Result<Self, String> {
         let origin = match source {
             Source::Pcm { path, data, kind } => Origin::Pcm(Pcm {
-                path: path.clone(),
                 file: File::open(path).map_err(|e| format!("cannot open: {e}"))?,
                 data: data.clone(),
                 kind: *kind,
@@ -356,7 +363,6 @@ impl Reader {
 }
 
 struct Pcm {
-    path: PathBuf,
     file: File,
     data: Range<u64>,
     kind: SampleKind,
@@ -383,31 +389,48 @@ impl Pcm {
             self.kind.decode_all(&self.bytes, wanted);
             return Ok(available);
         }
-        // Each worker reads through a handle of its own, so the reads
-        // overlap as a memory map's would, but a card pulled out mid-read
-        // ends in an error instead of a crash.
-        let (path, kind) = (&self.path, self.kind);
+        // The workers share the handle, each reading its own part at its
+        // own offset, so the reads overlap as a memory map's would, but a
+        // card pulled out mid-read ends in an error instead of a crash.
+        let (file, kind) = (&self.file, self.kind);
         wanted
             .par_chunks_mut(PARALLEL_FRAMES * ch)
             .enumerate()
-            .try_for_each_init(
-                || (None, Vec::new()),
-                |(file, bytes): &mut (Option<File>, Vec<u8>), (i, part)| {
-                    let file = match file {
-                        Some(file) => file,
-                        None => file.insert(File::open(path)?),
-                    };
-                    bytes.resize(part.len() * width, 0);
-                    file.seek(SeekFrom::Start(
-                        start + (i * PARALLEL_FRAMES * frame) as u64,
-                    ))?;
-                    file.read_exact(bytes)?;
-                    kind.decode_all(bytes, part);
-                    Ok(())
-                },
-            )
+            .try_for_each_init(Vec::new, |bytes: &mut Vec<u8>, (i, part)| {
+                bytes.resize(part.len() * width, 0);
+                read_at(file, bytes, start + (i * PARALLEL_FRAMES * frame) as u64)?;
+                kind.decode_all(bytes, part);
+                Ok(())
+            })
             .map_err(failed)?;
         Ok(available)
+    }
+}
+
+/// Fills `buf` from `offset` on without using the handle's position, so
+/// threads can read through one handle at once.
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let (mut buf, mut offset) = (buf, offset);
+        while !buf.is_empty() {
+            match file.seek_read(buf, offset) {
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => {
+                    buf = &mut buf[n..];
+                    offset += n as u64;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 }
 

@@ -91,22 +91,26 @@ fn digits(s: &str) -> (&str, &str) {
 }
 
 /// On Windows each drive is a tree of its own, so above a drive's root is
-/// the list of drives.
-#[cfg(windows)]
+/// the list of drives. Elsewhere nothing is above the root folder.
 fn drives() -> Vec<Entry> {
-    // SAFETY: takes no arguments and only returns a bit mask.
-    let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
-    (b'A'..=b'Z')
-        .filter(|letter| mask & (1 << (letter - b'A')) != 0)
-        .map(|letter| {
-            let name = format!("{}:", char::from(letter));
-            Entry {
-                path: PathBuf::from(format!("{name}\\")),
-                name,
-                is_dir: true,
-            }
-        })
-        .collect()
+    #[cfg(windows)]
+    {
+        // SAFETY: takes no arguments and only returns a bit mask.
+        let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+        (b'A'..=b'Z')
+            .filter(|letter| mask & (1 << (letter - b'A')) != 0)
+            .map(|letter| {
+                let name = format!("{}:", char::from(letter));
+                Entry {
+                    path: PathBuf::from(format!("{name}\\")),
+                    name,
+                    is_dir: true,
+                }
+            })
+            .collect()
+    }
+    #[cfg(not(windows))]
+    Vec::new()
 }
 
 enum Row<'a> {
@@ -132,9 +136,15 @@ pub struct Explorer {
     /// Folders read so far; `None` while a read is under way.
     listings: HashMap<PathBuf, Option<Vec<Entry>>>,
     open: HashSet<PathBuf>,
+    /// The file open, or the folder the arrow keys last moved to.
     pub selected: Option<PathBuf>,
     /// Scroll the selected file into view once its folder has been read.
     reveal: bool,
+    /// Scroll only as far as it takes to show the selected row.
+    follow: bool,
+    /// How far down the rows were scrolled last frame, and how much of
+    /// them showed.
+    scrolled: (f32, f32),
     tx: mpsc::Sender<(PathBuf, Vec<Entry>)>,
     rx: mpsc::Receiver<(PathBuf, Vec<Entry>)>,
 }
@@ -148,6 +158,8 @@ impl Default for Explorer {
             open: HashSet::new(),
             selected: None,
             reveal: false,
+            follow: false,
+            scrolled: (0.0, 0.0),
             tx,
             rx,
         }
@@ -196,6 +208,54 @@ impl Explorer {
             Some(None) => self.root = None,
             None => {}
         }
+    }
+
+    /// The rows as the tree shows them, and the folders among them not read
+    /// yet. With no root, `drives` are the rows.
+    fn listed<'a>(&'a self, drives: &'a [Entry]) -> (Vec<Row<'a>>, Vec<PathBuf>) {
+        let (mut rows, mut unread) = (Vec::new(), Vec::new());
+        match &self.root {
+            Some(root) => self.rows(root, 0, &mut rows, &mut unread),
+            None => rows.extend(drives.iter().map(|entry| Row::Entry {
+                depth: 0,
+                open: self.open.contains(&entry.path),
+                entry,
+            })),
+        }
+        (rows, unread)
+    }
+
+    /// Moves the selection a row down or up, as the arrow keys do. A folder
+    /// it lands on is selected; a file is returned instead, for the caller
+    /// to open, which selects it.
+    pub fn step(&mut self, down: bool) -> Option<PathBuf> {
+        let drives = drives();
+        let (rows, _) = self.listed(&drives);
+        let entries: Vec<&Entry> = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Entry { entry, .. } => Some(*entry),
+                Row::Loading { .. } => None,
+            })
+            .collect();
+        let at = self
+            .selected
+            .as_deref()
+            .and_then(|s| entries.iter().position(|e| e.path == s));
+        let next = match (at, down) {
+            (Some(i), true) => i + 1,
+            (Some(i), false) => i.checked_sub(1)?,
+            (None, true) => 0,
+            (None, false) => entries.len().checked_sub(1)?,
+        };
+        let entry = entries.get(next)?;
+        let (path, is_dir) = (entry.path.clone(), entry.is_dir);
+        self.follow = true;
+        if is_dir {
+            self.selected = Some(path);
+            return None;
+        }
+        Some(path)
     }
 
     fn rows<'a>(
@@ -265,41 +325,38 @@ impl Explorer {
         });
         ui.separator();
 
-        let mut rows = Vec::new();
-        let mut unread = Vec::new();
-        #[cfg(windows)]
-        let drive_list = drives();
-        match &self.root {
-            Some(root) => self.rows(root, 0, &mut rows, &mut unread),
-            #[cfg(windows)]
-            None => rows.extend(drive_list.iter().map(|entry| Row::Entry {
-                depth: 0,
-                open: self.open.contains(&entry.path),
-                entry,
-            })),
-            #[cfg(not(windows))]
-            None => {
-                ui.weak("Drop a folder or a file here");
-            }
+        if self.root.is_none() && cfg!(not(windows)) {
+            ui.weak("Drop a folder or a file here");
         }
+        let drive_list = drives();
+        let (rows, unread) = self.listed(&drive_list);
 
         let height = ui.spacing().interact_size.y;
         let spacing = ui.spacing().item_spacing.y;
         let selected = self.selected.as_deref();
         let mut scroll = egui::ScrollArea::vertical().auto_shrink(false);
-        let revealed = if self.reveal {
+        let position = || {
             rows.iter().position(|row| {
                 matches!(row, Row::Entry { entry, .. } if Some(entry.path.as_path()) == selected)
             })
-        } else {
-            None
         };
+        let revealed = if self.reveal { position() } else { None };
         if let Some(index) = revealed {
             let above = ui.available_height() / 3.0;
             scroll =
                 scroll.vertical_scroll_offset((index as f32 * (height + spacing) - above).max(0.0));
+        } else if self.follow
+            && let Some(index) = position()
+        {
+            let (offset, shown) = self.scrolled;
+            let top = index as f32 * (height + spacing);
+            if top < offset {
+                scroll = scroll.vertical_scroll_offset(top);
+            } else if top + height > offset + shown {
+                scroll = scroll.vertical_scroll_offset(top + height - shown);
+            }
         }
-        scroll.show_rows(ui, height, rows.len(), |ui, range| {
+        let output = scroll.show_rows(ui, height, rows.len(), |ui, range| {
             for row in &rows[range] {
                 let (depth, entry, open) = match row {
                     Row::Entry { depth, entry, open } => (*depth, *entry, *open),
@@ -332,6 +389,8 @@ impl Explorer {
                 }
             }
         });
+        self.scrolled = (output.state.offset.y, output.inner_rect.height());
+        self.follow = false;
 
         // The file sits in the root folder, so once that is read it has
         // either been scrolled to or is not listed at all.
@@ -440,6 +499,34 @@ mod tests {
             names,
             ["9", "010", "a2", "a10", "b", "take 1", "take 9", "take 10"]
         );
+    }
+
+    #[test]
+    fn the_arrows_walk_the_rows_and_hand_back_the_files() {
+        let dir = std::env::temp_dir().join(format!("soundcheck-step-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Day 1")).unwrap();
+        for name in ["a.wav", "b.wav"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let mut explorer = Explorer::default();
+        explorer.set_root(&dir);
+        explorer.listings.insert(dir.clone(), Some(list(&dir)));
+        // From nothing selected, down is the top row: a folder, selected at once.
+        assert_eq!(explorer.step(true), None);
+        assert_eq!(explorer.selected, Some(dir.join("Day 1")));
+        // A file comes back to be opened, and is selected once it is.
+        assert_eq!(explorer.step(true), Some(dir.join("a.wav")));
+        explorer.selected = Some(dir.join("a.wav"));
+        assert_eq!(explorer.step(true), Some(dir.join("b.wav")));
+        explorer.selected = Some(dir.join("b.wav"));
+        // Neither end goes any further.
+        assert_eq!(explorer.step(true), None);
+        assert_eq!(explorer.selected, Some(dir.join("b.wav")));
+        assert_eq!(explorer.step(false), Some(dir.join("a.wav")));
+        explorer.selected = Some(dir.join("Day 1"));
+        assert_eq!(explorer.step(false), None);
+        assert_eq!(explorer.selected, Some(dir.join("Day 1")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

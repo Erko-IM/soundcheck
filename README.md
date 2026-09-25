@@ -20,6 +20,7 @@ This project is open-source - no catch, nothing proprietary, just seems like a u
 
 Press "m" to mark a place on the soundfile, it will also immediately put you on the name place.
 Press "r" to reset the selected configuration box, or "shift+r" to reset all the configs.
+Click in the file list, then the up and down arrows move through it, opening each file as you land on it. If the current one is playing, the next one starts playing too.
 The rest should be pretty self-explanatory.
 
 ## License

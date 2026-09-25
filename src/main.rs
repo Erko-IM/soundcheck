@@ -25,7 +25,10 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("soundcheck")
             .with_inner_size([1440.0, 880.0])
-            .with_min_inner_size([900.0, 520.0]),
+            .with_min_inner_size([900.0, 520.0])
+            // Empty, so eframe keeps its own logo out of the Dock: putting it
+            // there holds up the first frame by about 16 ms.
+            .with_icon(egui::IconData::default()),
         ..Default::default()
     };
     eframe::run_native(

@@ -399,6 +399,9 @@ pub struct App {
     spectrum: Option<probe::Spectrum>,
     /// Created on first play, dropped when another file opens.
     player: Option<Player>,
+    /// Play the file loading once it has loaded, as the one before was
+    /// playing when it was left.
+    play_when_loaded: bool,
     meters: Meters,
     listeners: views::Listeners,
     /// Metadata and markers as edited, and as the file holds them.
@@ -465,6 +468,7 @@ impl App {
             asked: None,
             spectrum: None,
             player: None,
+            play_when_loaded: false,
             meters: Meters::default(),
             listeners: views::Listeners::default(),
             edits: None,
@@ -534,6 +538,7 @@ impl App {
     }
 
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.play_when_loaded |= self.player.as_ref().is_some_and(Player::is_playing);
         self.generation += 1;
         self.explorer.selected = Some(path.clone());
         self.file = Some(path.clone());
@@ -740,8 +745,14 @@ impl App {
                             if stale {
                                 self.analyse(ctx, true);
                             }
+                            if std::mem::take(&mut self.play_when_loaded) {
+                                self.toggle_play();
+                            }
                         }
-                        Err(e) => self.error = Some(e),
+                        Err(e) => {
+                            self.error = Some(e);
+                            self.play_when_loaded = false;
+                        }
                     }
                 }
                 Job::Analysed {
@@ -1160,6 +1171,13 @@ impl App {
     }
 
     fn toggle_play(&mut self) {
+        // While a file loads, whether it plays once it has.
+        if self.current.is_none() {
+            if self.loading.is_some() {
+                self.play_when_loaded = !self.play_when_loaded;
+            }
+            return;
+        }
         let frames = self.frames();
         if frames == 0 {
             return;
@@ -1369,8 +1387,22 @@ impl App {
         }
         let pressed = |modifiers, key| ctx.input_mut(|i| i.consume_key(modifiers, key));
         let plain = |key| pressed(Modifiers::NONE, key);
-        if self.picked == Some(Control::Explorer) && plain(Key::Backspace) {
-            self.explorer.go_up();
+        if self.picked == Some(Control::Explorer) {
+            if plain(Key::Backspace) {
+                self.explorer.go_up();
+            }
+            for (key, down) in [(Key::ArrowUp, false), (Key::ArrowDown, true)] {
+                if plain(key)
+                    && let Some(file) = self.explorer.step(down)
+                {
+                    // Back from a folder onto the file open, which stays as it is.
+                    if self.file.as_ref() == Some(&file) {
+                        self.explorer.selected = Some(file);
+                    } else {
+                        self.request_open(ctx, file);
+                    }
+                }
+            }
         }
         // Shift first: a plain R would take the shifted one too.
         if pressed(Modifiers::SHIFT, Key::R) {
@@ -1382,11 +1414,11 @@ impl App {
         {
             self.reset(control);
         }
+        if (self.current.is_some() || self.loading.is_some()) && plain(Key::Space) {
+            self.toggle_play();
+        }
         if self.current.is_none() {
             return;
-        }
-        if plain(Key::Space) {
-            self.toggle_play();
         }
         match self.picked.filter(|c| *c != Control::Explorer) {
             Some(control) => {
@@ -1417,10 +1449,13 @@ impl App {
                 if plain(Key::ArrowRight) {
                     self.seek_by(1.0);
                 }
-                for (key, step) in [(Key::ArrowUp, 5.0), (Key::ArrowDown, -5.0)] {
-                    if plain(key) {
-                        self.settings.brightness = (self.settings.brightness + step)
-                            .clamp(*BRIGHTNESS.start(), *BRIGHTNESS.end());
+                // Up and down move through the explorer while it is picked.
+                if self.picked.is_none() {
+                    for (key, step) in [(Key::ArrowUp, 5.0), (Key::ArrowDown, -5.0)] {
+                        if plain(key) {
+                            self.settings.brightness = (self.settings.brightness + step)
+                                .clamp(*BRIGHTNESS.start(), *BRIGHTNESS.end());
+                        }
                     }
                 }
             }
@@ -1614,14 +1649,16 @@ impl App {
     }
 
     fn transport(&mut self, ui: &mut egui::Ui) {
-        let playing = self.player.as_ref().is_some_and(Player::is_playing);
+        let loading = self.loading.is_some();
+        let playing = self.player.as_ref().is_some_and(Player::is_playing)
+            || (loading && self.play_when_loaded);
         let has_file = self.current.is_some();
         let can_mark = self.edits.is_some() && self.saving.is_none();
         ui.horizontal_wrapped(|ui| {
             let label = if playing { "Pause" } else { "Play" };
             let play = egui::Button::new(label).min_size(Vec2::new(64.0, 0.0));
             if ui
-                .add_enabled(has_file, play)
+                .add_enabled(has_file || loading, play)
                 .on_hover_text("Space")
                 .clicked()
             {
