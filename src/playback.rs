@@ -1,11 +1,12 @@
-//! Playback. A feeder thread reads the file, resamples it to the output
-//! device's rate at the chosen speed, and keeps a lock-free ring buffer
-//! topped up; the audio callback only drains that buffer, so it never waits
-//! on the disk or allocates. While paused the device is stopped and the
-//! feeder sleeps until it is told something, so a paused player costs
-//! nothing.
+//! Playback. A feeder thread reads the file, shifts its pitch if asked,
+//! resamples it to the output device's rate at the chosen speed, and keeps a
+//! lock-free ring buffer topped up; the audio callback only drains that
+//! buffer, so it never waits on the disk or allocates. While paused the
+//! device is stopped and the feeder sleeps until it is told something, so a
+//! paused player costs nothing.
 
 use std::cell::{Cell, RefCell};
+use std::f32::consts::TAU;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
@@ -14,13 +15,61 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample};
+use realfft::num_complex::Complex;
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
 
 use crate::audio::{Info, Reader, Source};
 
-/// Speed multipliers offered. Pitch moves with speed, as on tape.
-pub const SPEEDS: [u32; 4] = [1, 2, 4, 8];
+/// A playback speed, as the fraction of whole numbers the resampler works
+/// in. Pitch moves with speed, as on tape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Speed {
+    times: u32,
+    over: u32,
+}
+
+impl Speed {
+    pub const NORMAL: Self = Self::new(1, 1);
+    pub const FAST: [Self; 4] = [
+        Self::NORMAL,
+        Self::new(2, 1),
+        Self::new(4, 1),
+        Self::new(8, 1),
+    ];
+    /// At a tenth of the speed, a bat's call is ten times lower and long
+    /// enough to follow.
+    pub const SLOW: [Self; 4] = [
+        Self::new(1, 10),
+        Self::new(1, 8),
+        Self::new(1, 4),
+        Self::new(1, 2),
+    ];
+
+    const fn new(times: u32, over: u32) -> Self {
+        Self { times, over }
+    }
+
+    pub fn value(self) -> f64 {
+        f64::from(self.times) / f64::from(self.over)
+    }
+
+    /// The speed offered at `value`.
+    pub fn of(value: f64) -> Option<Self> {
+        Self::SLOW
+            .into_iter()
+            .chain(Self::FAST)
+            .find(|s| (s.value() - value).abs() < 1e-6)
+    }
+
+    pub fn label(self) -> String {
+        match self.over {
+            1 => format!("{}×", self.times),
+            over => format!("1/{over}×"),
+        }
+    }
+}
 
 const CHUNK: usize = 1024;
 /// How often the feeder tops the ring up while playing. The ring holds a
@@ -88,7 +137,9 @@ impl Playhead {
 
 struct Restart {
     frame: usize,
-    speed: u32,
+    speed: Speed,
+    /// Semitones.
+    pitch: f32,
     seek: u16,
     looping: Option<Range<usize>>,
 }
@@ -106,7 +157,8 @@ pub struct Player {
     feeder: Option<JoinHandle<()>>,
     stream: cpal::Stream,
     frames: usize,
-    speed: Cell<u32>,
+    speed: Cell<Speed>,
+    pitch: Cell<f32>,
     looping: RefCell<Option<Range<usize>>>,
     /// Seeks sent so far, and where the last one went: until the feeder has
     /// acted on it, playback is wherever it was last sent.
@@ -115,7 +167,14 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn new(source: &Source, info: &Info, start: usize, speed: u32) -> Result<Self, String> {
+    /// Plays from `start` at `speed`, `pitch` semitones up or down.
+    pub fn new(
+        source: &Source,
+        info: &Info,
+        start: usize,
+        speed: Speed,
+        pitch: f32,
+    ) -> Result<Self, String> {
         let (sample_rate, frames) = (info.sample_rate, info.frames);
         let channels = usize::from(info.channels);
         let device = cpal::default_host()
@@ -164,7 +223,7 @@ impl Player {
                         channels,
                         scratch: Vec::new(),
                     });
-                    Renderer::new(input, frames, sample_rate, device_rate, speed, start)
+                    Renderer::new(input, frames, sample_rate, device_rate, speed, pitch, start)
                 });
                 match renderer {
                     Ok(renderer) => feed(renderer, producer, &playhead, &inbox, &shared),
@@ -179,6 +238,7 @@ impl Player {
             stream,
             frames,
             speed: Cell::new(speed),
+            pitch: Cell::new(pitch),
             looping: RefCell::new(None),
             seeks: Cell::new(0),
             target: Cell::new(start),
@@ -234,12 +294,26 @@ impl Player {
     }
 
     pub fn seek(&self, frame: usize) {
-        self.restart(frame, self.speed.get());
+        self.restart(frame);
     }
 
-    pub fn set_speed(&self, speed: u32) {
+    pub fn speed(&self) -> Speed {
+        self.speed.get()
+    }
+
+    pub fn pitch(&self) -> f32 {
+        self.pitch.get()
+    }
+
+    pub fn set_speed(&self, speed: Speed) {
         self.speed.set(speed);
-        self.restart(self.position(), speed);
+        self.restart(self.position());
+    }
+
+    /// Moves the sound `pitch` semitones up or down, at the same speed.
+    pub fn set_pitch(&self, pitch: f32) {
+        self.pitch.set(pitch);
+        self.restart(self.position());
     }
 
     /// Output gain in dB, applied to what is already queued too.
@@ -259,7 +333,7 @@ impl Player {
         self.seek(from);
     }
 
-    fn restart(&self, frame: usize, speed: u32) {
+    fn restart(&self, frame: usize) {
         let seek = self.seeks.get().wrapping_add(1);
         let looping = self.looping.borrow().clone();
         let frame = match &looping {
@@ -272,7 +346,8 @@ impl Player {
         // always reaches it.
         let _ = self.commands.send(Command::Restart(Restart {
             frame,
-            speed,
+            speed: self.speed.get(),
+            pitch: self.pitch.get(),
             seek,
             looping,
         }));
@@ -288,8 +363,8 @@ impl Drop for Player {
     }
 }
 
-fn step(sample_rate: u32, speed: u32, device_rate: u32) -> f64 {
-    f64::from(sample_rate) * f64::from(speed) / f64::from(device_rate)
+fn step(sample_rate: u32, speed: Speed, device_rate: u32) -> f64 {
+    f64::from(sample_rate) * speed.value() / f64::from(device_rate)
 }
 
 fn build<T>(
@@ -382,12 +457,13 @@ fn feed(
         if let Some(Restart {
             frame,
             speed,
+            pitch,
             seek: number,
             looping,
         }) = restart
         {
             let wrap = looping.as_ref().map(|r| r.start as f64..r.end as f64);
-            if let Err(e) = renderer.restart(frame, speed, looping) {
+            if let Err(e) = renderer.restart(frame, speed, pitch, looping) {
                 shared.fail(e);
                 return;
             }
@@ -442,22 +518,25 @@ fn feed(
     }
 }
 
-/// Source frames in; stereo at the device rate and chosen speed out.
+/// Source frames in; stereo at the device rate, chosen speed and pitch out.
 struct Renderer {
     input: Box<dyn Frames>,
     frames: usize,
     resampler: Fft<f32>,
+    shifter: Option<Shifter>,
     sample_rate: u32,
     device_rate: u32,
-    speed: u32,
+    speed: Speed,
+    pitch: f32,
     /// Next source frame to read.
     next: usize,
     /// Source frame the next output frame plays. Rendering carries on past
     /// the last frame read until this reaches the end, so the resampler's
     /// tail is heard instead of cut off.
     heard: f64,
-    /// Output frames still to drop after a (re)start: the resampler's delay,
-    /// which would otherwise play as a gap and put the playhead late.
+    /// Output frames still to drop after a (re)start: the resampler's and
+    /// the shifter's delay, which would otherwise play as a gap and put the
+    /// playhead late.
     skip: usize,
     /// Frames played over and over: reading wraps from the end to the start
     /// and never finishes.
@@ -466,10 +545,17 @@ struct Renderer {
     output: Vec<f32>,
 }
 
-fn resampler(sample_rate: u32, device_rate: u32, speed: u32) -> Result<Fft<f32>, String> {
-    let input_rate = sample_rate as usize * speed as usize;
-    Fft::new(input_rate, device_rate as usize, CHUNK, 2, FixedSync::Input)
-        .map_err(|e| format!("cannot play {sample_rate} Hz audio at {speed}x on this output: {e}"))
+fn resampler(sample_rate: u32, device_rate: u32, speed: Speed) -> Result<Fft<f32>, String> {
+    let input_rate = sample_rate as usize * speed.times as usize;
+    let output_rate = device_rate as usize * speed.over as usize;
+    Fft::new(input_rate, output_rate, CHUNK, 2, FixedSync::Input).map_err(|e| {
+        let speed = speed.label();
+        format!("cannot play {sample_rate} Hz audio at {speed} on this output: {e}")
+    })
+}
+
+fn shifter(pitch: f32, sample_rate: u32) -> Option<Shifter> {
+    (pitch != 0.0).then(|| Shifter::new(2f32.powf(pitch / 12.0), sample_rate))
 }
 
 impl Renderer {
@@ -478,28 +564,42 @@ impl Renderer {
         frames: usize,
         sample_rate: u32,
         device_rate: u32,
-        speed: u32,
+        speed: Speed,
+        pitch: f32,
         start: usize,
     ) -> Result<Self, String> {
         let resampler = resampler(sample_rate, device_rate, speed)?;
-        Ok(Self {
+        let mut renderer = Self {
             input,
             frames,
-            skip: resampler.output_delay(),
+            skip: 0,
             output: vec![0.0; 2 * resampler.output_frames_max()],
             resampler,
+            shifter: shifter(pitch, sample_rate),
             sample_rate,
             device_rate,
             speed,
+            pitch,
             next: start,
             heard: start as f64,
             looping: None,
             block: Vec::new(),
-        })
+        };
+        renderer.skip = renderer.delay();
+        Ok(renderer)
     }
 
     fn step(&self) -> f64 {
         step(self.sample_rate, self.speed, self.device_rate)
+    }
+
+    /// Output frames that come out ahead of the frame they start from.
+    fn delay(&self) -> usize {
+        let shifted = self
+            .shifter
+            .as_ref()
+            .map_or(0.0, |s| s.latency() as f64 / self.step());
+        self.resampler.output_delay() + shifted.round() as usize
     }
 
     /// Samples the next block can hold, so ring space is checked first.
@@ -510,7 +610,8 @@ impl Renderer {
     fn restart(
         &mut self,
         frame: usize,
-        speed: u32,
+        speed: Speed,
+        pitch: f32,
         looping: Option<Range<usize>>,
     ) -> Result<(), String> {
         if speed != self.speed {
@@ -519,8 +620,15 @@ impl Renderer {
                 .resize(2 * self.resampler.output_frames_max(), 0.0);
             self.speed = speed;
         }
+        if pitch != self.pitch {
+            self.shifter = shifter(pitch, self.sample_rate);
+            self.pitch = pitch;
+        }
         self.resampler.reset();
-        self.skip = self.resampler.output_delay();
+        if let Some(shifter) = &mut self.shifter {
+            shifter.reset();
+        }
+        self.skip = self.delay();
         self.next = frame;
         self.heard = frame as f64;
         self.looping = looping;
@@ -558,6 +666,9 @@ impl Renderer {
                 }
             }
         }
+        if let Some(shifter) = &mut self.shifter {
+            shifter.process(&mut self.block);
+        }
         let input = InterleavedSlice::new(self.block.as_flattened(), 2, count)
             .map_err(|e| e.to_string())?;
         let capacity = self.output.len() / 2;
@@ -579,6 +690,197 @@ impl Renderer {
         };
         self.heard += kept as f64 * self.step();
         Ok(Some(&self.output[2 * dropped..2 * (dropped + kept)]))
+    }
+}
+
+/// Frames overlap this many times over in the shifter.
+const OVERLAP: usize = 8;
+
+/// Moves every frequency by `ratio` and leaves the timing as it is: a phase
+/// vocoder that moves each spectral peak with the bins around it, keeping
+/// their phases locked to the peak's (Laroche and Dolson, "New
+/// phase-vocoder techniques for pitch-shifting", 1999), so a partial keeps
+/// its strength at any ratio. It works at the file's own rate, before the
+/// resampler, so that calls far above hearing are brought down into it
+/// before the resampler would have filtered them out.
+struct Shifter {
+    ratio: f32,
+    size: usize,
+    hop: usize,
+    window: Vec<f32>,
+    forward: Arc<dyn RealToComplex<f32>>,
+    inverse: Arc<dyn ComplexToReal<f32>>,
+    voices: [Voice; 2],
+    /// Where the next frame goes in each voice's input.
+    rover: usize,
+    frame: Vec<f32>,
+    spectrum: Vec<Complex<f32>>,
+    /// Each bin's magnitude, and the frequency in bins of what it hears.
+    heard: Vec<(f32, f32)>,
+    peaks: Vec<usize>,
+    /// The moved peaks' phases for the next frame to go on from.
+    next_phase: Vec<f32>,
+}
+
+/// One channel of the shifter.
+#[derive(Clone)]
+struct Voice {
+    input: Vec<f32>,
+    output: Vec<f32>,
+    /// Frames added together as they overlap.
+    sum: Vec<f32>,
+    heard_phase: Vec<f32>,
+    moved_phase: Vec<f32>,
+}
+
+/// `angle` brought within half a turn either way.
+fn wrap(angle: f32) -> f32 {
+    angle - TAU * (angle / TAU).round()
+}
+
+impl Shifter {
+    fn new(ratio: f32, sample_rate: u32) -> Self {
+        // About 20 ms: shorter smears a call less in time, longer its pitch.
+        let size = (sample_rate as usize / 50).next_power_of_two().max(256);
+        let bins = size / 2 + 1;
+        let mut planner = RealFftPlanner::<f32>::new();
+        let voice = Voice {
+            input: vec![0.0; size],
+            output: vec![0.0; size],
+            sum: vec![0.0; size],
+            heard_phase: vec![0.0; bins],
+            moved_phase: vec![0.0; bins],
+        };
+        let hop = size / OVERLAP;
+        Self {
+            ratio,
+            size,
+            hop,
+            window: (0..size)
+                .map(|k| 0.5 - 0.5 * (TAU * k as f32 / size as f32).cos())
+                .collect(),
+            forward: planner.plan_fft_forward(size),
+            inverse: planner.plan_fft_inverse(size),
+            voices: [voice.clone(), voice],
+            rover: size - hop,
+            frame: vec![0.0; size],
+            spectrum: vec![Complex::default(); bins],
+            heard: vec![(0.0, 0.0); bins],
+            peaks: Vec::with_capacity(bins),
+            next_phase: vec![0.0; bins],
+        }
+    }
+
+    /// Frames between one going in and coming out.
+    fn latency(&self) -> usize {
+        self.size - self.hop
+    }
+
+    fn reset(&mut self) {
+        for voice in &mut self.voices {
+            for part in [
+                &mut voice.input,
+                &mut voice.output,
+                &mut voice.sum,
+                &mut voice.heard_phase,
+                &mut voice.moved_phase,
+            ] {
+                part.fill(0.0);
+            }
+        }
+        self.rover = self.latency();
+    }
+
+    /// Replaces each frame of `block` with the shifted sound of the frame
+    /// `latency()` earlier.
+    fn process(&mut self, block: &mut [[f32; 2]]) {
+        let latency = self.latency();
+        for frame in block {
+            for (voice, sample) in self.voices.iter_mut().zip(frame.iter_mut()) {
+                voice.input[self.rover] = *sample;
+                *sample = voice.output[self.rover - latency];
+            }
+            self.rover += 1;
+            if self.rover == self.size {
+                self.rover = latency;
+                for channel in 0..2 {
+                    self.shift(channel);
+                }
+            }
+        }
+    }
+
+    /// One frame of `channel`: each partial found, moved, and added back.
+    fn shift(&mut self, channel: usize) {
+        let (size, hop, bins) = (self.size, self.hop, self.size / 2 + 1);
+        // How far a bin's phase turns in a hop, were it exactly on the bin.
+        let expected = TAU * hop as f32 / size as f32;
+        let voice = &mut self.voices[channel];
+        for ((f, &x), &w) in self.frame.iter_mut().zip(&voice.input).zip(&self.window) {
+            *f = x * w;
+        }
+        // The buffers are the sizes the plans were made for, so neither
+        // transform can fail.
+        let _ = self.forward.process(&mut self.frame, &mut self.spectrum);
+        for k in 0..bins {
+            let (magnitude, phase) = self.spectrum[k].to_polar();
+            let turned = wrap(phase - voice.heard_phase[k] - k as f32 * expected);
+            voice.heard_phase[k] = phase;
+            self.heard[k] = (magnitude, k as f32 + turned * OVERLAP as f32 / TAU);
+        }
+        self.peaks.clear();
+        self.peaks.extend((1..bins - 1).filter(|&k| {
+            let m = self.heard[k].0;
+            m > self.heard[k - 1].0 && m >= self.heard[k + 1].0
+        }));
+        self.spectrum.fill(Complex::default());
+        self.next_phase.copy_from_slice(&voice.moved_phase);
+        // Each peak's region runs to the quietest bin before the next peak.
+        let mut start = 0;
+        for (i, &peak) in self.peaks.iter().enumerate() {
+            let end = match self.peaks.get(i + 1) {
+                Some(&next) => (peak..next)
+                    .min_by(|&a, &b| self.heard[a].0.total_cmp(&self.heard[b].0))
+                    .unwrap_or(peak),
+                None => bins - 1,
+            };
+            let region = start..=end;
+            start = end + 1;
+            let frequency = self.heard[peak].1 * self.ratio;
+            let to = frequency.round() as isize;
+            let Ok(to) = usize::try_from(to) else {
+                continue;
+            };
+            if to >= bins {
+                continue;
+            }
+            // The peak turns at its new frequency from where its bin was;
+            // the bins around it keep the phase they had against it.
+            let phase = wrap(voice.moved_phase[to] + frequency * expected);
+            self.next_phase[to] = phase;
+            let shift = to as isize - peak as isize;
+            for k in region {
+                let Some(m) = k.checked_add_signed(shift).filter(|&m| m < bins) else {
+                    continue;
+                };
+                let turned = phase + voice.heard_phase[k] - voice.heard_phase[peak];
+                self.spectrum[m] += Complex::from_polar(self.heard[k].0, turned);
+            }
+        }
+        voice.moved_phase.copy_from_slice(&self.next_phase);
+        // A real signal's first and last bins have no imaginary part.
+        self.spectrum[0].im = 0.0;
+        self.spectrum[bins - 1].im = 0.0;
+        let _ = self.inverse.process(&mut self.spectrum, &mut self.frame);
+        // The window twice over, OVERLAP times, averages 3/8 of the frame.
+        let scale = 1.0 / (size as f32 * OVERLAP as f32 * 0.375);
+        for ((s, &y), &w) in voice.sum.iter_mut().zip(&self.frame).zip(&self.window) {
+            *s += y * w * scale;
+        }
+        voice.output[..hop].copy_from_slice(&voice.sum[..hop]);
+        voice.sum.copy_within(hop.., 0);
+        voice.sum[size - hop..].fill(0.0);
+        voice.input.copy_within(hop.., 0);
     }
 }
 
@@ -635,8 +937,21 @@ mod tests {
     }
 
     fn renderer(samples: Vec<f32>, rate: u32, device: u32, speed: u32) -> Renderer {
+        shifted(samples, rate, device, Speed::new(speed, 1), 0.0)
+    }
+
+    fn shifted(samples: Vec<f32>, rate: u32, device: u32, speed: Speed, pitch: f32) -> Renderer {
         let frames = samples.len();
-        Renderer::new(Box::new(Memory(samples)), frames, rate, device, speed, 0).unwrap()
+        Renderer::new(
+            Box::new(Memory(samples)),
+            frames,
+            rate,
+            device,
+            speed,
+            pitch,
+            0,
+        )
+        .unwrap()
     }
 
     /// Up to `limit` frames of what the renderer produces, left channel
@@ -702,7 +1017,9 @@ mod tests {
         let mut samples = vec![0.0; 48_000];
         samples[24_000..].fill(0.5);
         let mut looped = renderer(samples, 48_000, 44_100, 1);
-        looped.restart(30_000, 1, Some(24_000..48_000)).unwrap();
+        looped
+            .restart(30_000, Speed::NORMAL, 0.0, Some(24_000..48_000))
+            .unwrap();
         let out = render_left(looped, 200_000);
         assert!(out.len() >= 200_000, "stopped after {} frames", out.len());
         let settled = &out[1_000..];
@@ -757,6 +1074,70 @@ mod tests {
         );
         let (hz, _) = peak(&out, 48_000);
         assert!((hz - 16_000.0).abs() < 12.0, "peak at {hz} Hz");
+    }
+
+    #[test]
+    fn a_pitch_shift_moves_the_tone_and_keeps_the_length() {
+        for (pitch, expected) in [(12.0, 2_000.0), (-12.0, 500.0), (7.0, 1_498.3)] {
+            let samples = tone(1_000.0, 48_000, 2.0);
+            let frames = samples.len();
+            let out = render_left(
+                shifted(samples, 48_000, 48_000, Speed::NORMAL, pitch),
+                usize::MAX,
+            );
+            let (hz, level) = peak(&out, 48_000);
+            assert!((hz - expected).abs() < 12.0, "{pitch}: peak at {hz} Hz");
+            assert!(level > -3.0, "{pitch}: {level} dBFS");
+            assert!(
+                out.len().abs_diff(frames) <= 1,
+                "{pitch}: {} frames",
+                out.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_bat_call_brought_down_three_octaves_is_heard() {
+        // 60 kHz, where nobody hears and the output cannot go, comes out
+        // at 7.5 kHz.
+        let out = render_left(
+            shifted(
+                tone(60_000.0, 384_000, 1.0),
+                384_000,
+                48_000,
+                Speed::NORMAL,
+                -36.0,
+            ),
+            usize::MAX,
+        );
+        let (hz, level) = peak(&out, 48_000);
+        assert!((hz - 7_500.0).abs() < 12.0, "peak at {hz} Hz");
+        assert!(level > -3.0, "{level} dBFS");
+    }
+
+    #[test]
+    fn slow_speeds_lower_the_pitch_and_lengthen_the_file() {
+        for (speed, expected) in [(Speed::new(1, 2), 500.0), (Speed::new(1, 10), 100.0)] {
+            let samples = tone(1_000.0, 48_000, 0.5);
+            let frames = samples.len();
+            let out = render_left(shifted(samples, 48_000, 44_100, speed, 0.0), usize::MAX);
+            let (hz, _) = peak(&out, 44_100);
+            assert!((hz - expected).abs() < 12.0, "{speed:?}: peak at {hz} Hz");
+            let wanted = frames as f64 * 44_100.0 / 48_000.0 / speed.value();
+            assert!(
+                (out.len() as f64 - wanted).abs() < 2.0,
+                "{speed:?}: {} frames",
+                out.len()
+            );
+        }
+    }
+
+    #[test]
+    fn only_offered_speeds_are_found() {
+        assert_eq!(Speed::of(0.125), Some(Speed::new(1, 8)));
+        assert_eq!(Speed::of(2.0), Some(Speed::new(2, 1)));
+        assert_eq!(Speed::of(3.0), None);
+        assert_eq!(Speed::new(1, 10).label(), "1/10×");
     }
 
     fn stereo_of(file: &[u8], channels: u16) -> (Stereo, std::path::PathBuf) {

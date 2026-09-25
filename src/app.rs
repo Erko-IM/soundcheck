@@ -19,7 +19,7 @@ use crate::edit::Edits;
 use crate::explorer::Explorer;
 use crate::finder::Inbox;
 use crate::levels::{FLOOR_DB, Level};
-use crate::playback::{self, Player};
+use crate::playback::{Player, Speed};
 use crate::probe::{self, Probe};
 use crate::save;
 use crate::spectrogram::{self, Analysis, Channels, Spec, Target, View};
@@ -29,6 +29,10 @@ use crate::wav::Marker;
 const BRIGHTNESS: RangeInclusive<f32> = -20.0..=80.0;
 const CONTRAST: RangeInclusive<f32> = 20.0..=160.0;
 const GAIN: RangeInclusive<f32> = -60.0..=60.0;
+/// Semitones: four octaves either way.
+const PITCH: RangeInclusive<f32> = -48.0..=48.0;
+/// Time expansion factors bat detectors use run up to 32.
+const EXPANSION: RangeInclusive<f32> = 1.0..=32.0;
 /// The lowest a frequency slider or arrow key goes above zero.
 const LOWEST_HZ: f32 = 10.0;
 /// Room around a plot for its labels, which also keeps the plot's own
@@ -102,9 +106,26 @@ struct Settings {
     band_high: Option<f32>,
     log: bool,
     channels: Channels,
-    speed: u32,
+    /// Playback speed: 2 is twice as fast, 0.125 an eighth.
+    speed: f64,
     /// Playback gain, in dB.
     gain: f32,
+    tools: Tools,
+    /// Semitones the sound, and the frequencies shown, move with the pitch
+    /// shift on.
+    pitch: f32,
+    /// How many times slower than it happened the recording was made, with
+    /// time expansion on.
+    expansion: f32,
+}
+
+/// The listening tools switched on, at the top of the window.
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Tools {
+    pitch: bool,
+    expansion: bool,
+    slow: bool,
 }
 
 impl Default for Settings {
@@ -121,8 +142,11 @@ impl Default for Settings {
             band_high: None,
             log: false,
             channels: Channels::Mix,
-            speed: 1,
+            speed: 1.0,
             gain: 0.0,
+            tools: Tools::default(),
+            pitch: 0.0,
+            expansion: 1.0,
         }
     }
 }
@@ -141,12 +165,15 @@ impl Settings {
         if !spectrogram::FFT_SIZES.contains(&self.fft) {
             self.fft = 2048;
         }
-        if !playback::SPEEDS.contains(&self.speed) {
-            self.speed = 1;
-        }
+        let slow = self.tools.slow;
+        self.speed = Speed::of(self.speed)
+            .filter(|s| slow || s.value() >= 1.0)
+            .map_or(1.0, Speed::value);
         self.brightness = within(self.brightness, BRIGHTNESS, 0.0);
         self.contrast = within(self.contrast, CONTRAST, 90.0);
         self.gain = within(self.gain, GAIN, 0.0);
+        self.pitch = within(self.pitch, PITCH, 0.0).round();
+        self.expansion = within(self.expansion, EXPANSION, 1.0).round();
         self.band_low = within(self.band_low, 0.0..=f32::MAX, 0.0);
         self.band_high = self.band_high.filter(|f| f.is_finite() && *f > 0.0);
         self
@@ -298,16 +325,20 @@ enum Control {
     Contrast,
     Low,
     High,
+    Pitch,
+    Expansion,
     Explorer,
 }
 
 impl Control {
-    const SLIDERS: [Self; 5] = [
+    const SLIDERS: [Self; 7] = [
         Self::Gain,
         Self::Brightness,
         Self::Contrast,
         Self::Low,
         Self::High,
+        Self::Pitch,
+        Self::Expansion,
     ];
 }
 
@@ -562,6 +593,41 @@ impl App {
         self.current
             .as_ref()
             .map_or(48_000.0, |c| f64::from(c.info.sample_rate))
+    }
+
+    fn speed(&self) -> Speed {
+        Speed::of(self.settings.speed).unwrap_or(Speed::NORMAL)
+    }
+
+    /// Semitones playback moves by: none with the pitch shift off.
+    fn pitch(&self) -> f32 {
+        if self.settings.tools.pitch {
+            self.settings.pitch
+        } else {
+            0.0
+        }
+    }
+
+    /// How many times slower the recording was made: 1 with time expansion
+    /// off.
+    fn expansion(&self) -> f32 {
+        if self.settings.tools.expansion {
+            self.settings.expansion
+        } else {
+            1.0
+        }
+    }
+
+    /// Hertz shown for each hertz in the file: time expansion shows the
+    /// frequencies as they were, and a pitch shift moves them with the
+    /// sound.
+    fn hz_scale(&self) -> f32 {
+        self.expansion() * 2f32.powf(self.pitch() / 12.0)
+    }
+
+    /// Frames of the file to a second as it happened.
+    fn display_rate(&self) -> f64 {
+        self.rate() * f64::from(self.expansion())
     }
 
     fn channel_count(&self) -> usize {
@@ -1035,7 +1101,7 @@ impl App {
     }
 
     fn seek_by(&mut self, seconds: f64) {
-        let at = self.cursor.unwrap_or(0) as f64 + seconds * self.rate();
+        let at = self.cursor.unwrap_or(0) as f64 + seconds * self.display_rate();
         self.seek(at.max(0.0) as usize);
     }
 
@@ -1071,7 +1137,13 @@ impl App {
         let Some(current) = self.current.as_ref().filter(|_| self.saving.is_none()) else {
             return false;
         };
-        match Player::new(&current.source, &current.info, start, self.settings.speed) {
+        match Player::new(
+            &current.source,
+            &current.info,
+            start,
+            self.speed(),
+            self.pitch(),
+        ) {
             Ok(player) => {
                 player.set_gain(self.settings.gain);
                 if let Some(range) = &self.selection {
@@ -1119,10 +1191,15 @@ impl App {
         }
     }
 
-    fn set_speed(&mut self, speed: u32) {
-        self.settings.speed = speed;
-        if let Some(player) = &self.player {
-            player.set_speed(speed);
+    /// The player at the speed and pitch set, which a slider, a key or a
+    /// switch at the top may have just changed.
+    fn tune_player(&self) {
+        let Some(player) = &self.player else { return };
+        if player.speed() != self.speed() {
+            player.set_speed(self.speed());
+        }
+        if player.pitch() != self.pitch() {
+            player.set_pitch(self.pitch());
         }
     }
 
@@ -1165,11 +1242,13 @@ impl App {
             Control::Brightness => bump(&mut self.settings.brightness, BRIGHTNESS),
             Control::Contrast => bump(&mut self.settings.contrast, CONTRAST),
             Control::Low | Control::High => {
-                let view = self.look().view;
+                let (view, scale) = (self.look().view, self.hz_scale());
                 let nyquist = self
                     .current
                     .as_ref()
-                    .map_or(view.f_max, |c| c.info.nyquist());
+                    .map_or(view.f_max, |c| c.info.nyquist())
+                    * scale;
+                let (f_min, f_max) = (view.f_min * scale, view.f_max * scale);
                 let factor = if coarse { 2.0 } else { 2f32.powf(1.0 / 12.0) };
                 let step = |f: f32| match (up, f < LOWEST_HZ) {
                     (true, true) => LOWEST_HZ,
@@ -1178,11 +1257,27 @@ impl App {
                     (false, _) => f / factor,
                 };
                 if control == Control::Low {
-                    self.settings.band_low = step(view.f_min).min(view.f_max / 1.06);
+                    self.settings.band_low = step(f_min).min(f_max / 1.06) / scale;
                 } else {
-                    let high = step(view.f_max).clamp((view.f_min * 1.06).max(LOWEST_HZ), nyquist);
-                    self.settings.band_high = (high < nyquist - 0.5).then_some(high);
+                    let high = step(f_max).clamp((f_min * 1.06).max(LOWEST_HZ), nyquist);
+                    self.settings.band_high =
+                        (high < nyquist - 0.5 * scale).then_some(high / scale);
                 }
+            }
+            Control::Pitch => {
+                let semitones = if coarse { 12.0 } else { 1.0 } * if up { 1.0 } else { -1.0 };
+                self.settings.pitch =
+                    (self.settings.pitch + semitones).clamp(*PITCH.start(), *PITCH.end());
+            }
+            Control::Expansion => {
+                let factor = self.settings.expansion;
+                let next = match (coarse, up) {
+                    (true, true) => factor * 2.0,
+                    (true, false) => factor / 2.0,
+                    (false, true) => factor + 1.0,
+                    (false, false) => factor - 1.0,
+                };
+                self.settings.expansion = next.round().clamp(*EXPANSION.start(), *EXPANSION.end());
             }
             Control::Explorer => {}
         }
@@ -1203,6 +1298,8 @@ impl App {
             Control::Contrast => settings.contrast = start.contrast,
             Control::Low => settings.band_low = start.band_low,
             Control::High => settings.band_high = start.band_high,
+            Control::Pitch => settings.pitch = start.pitch,
+            Control::Expansion => settings.expansion = start.expansion,
             Control::Explorer => {}
         }
     }
@@ -1378,7 +1475,21 @@ impl App {
             ui.checkbox(&mut views.metadata, "Metadata");
             ui.checkbox(&mut views.timeline, "Timeline");
             ui.checkbox(&mut views.meters, "Meters");
+            ui.separator();
+            let tools = &mut self.settings.tools;
+            ui.checkbox(&mut tools.pitch, "Pitch shift").on_hover_text(
+                "A slider that moves the sound up or down without changing its speed, and the frequencies shown with it",
+            );
+            ui.checkbox(&mut tools.expansion, "Time expansion").on_hover_text(
+                "For recordings from time-expansion bat detectors: frequencies and times shown as they were",
+            );
+            ui.checkbox(&mut tools.slow, "Slow speeds").on_hover_text(
+                "Speeds down to a tenth, which bring bat calls down into hearing",
+            );
         });
+        if !self.settings.tools.slow && self.settings.speed < 1.0 {
+            self.settings.speed = 1.0;
+        }
         ui.add_space(4.0);
         let (dirty, can_rename) = (
             self.dirty(),
@@ -1481,7 +1592,7 @@ impl App {
                 ),
             };
             ui.label(
-                RichText::new(summary(current))
+                RichText::new(summary(current, self.expansion(), self.pitch()))
                     .monospace()
                     .size(12.0)
                     .color(views::AXIS),
@@ -1531,13 +1642,19 @@ impl App {
                 self.add_marker();
             }
             ui.separator();
-            ui.label("Speed");
-            for speed in playback::SPEEDS {
+            ui.label("Speed")
+                .on_hover_text("Pitch moves with speed, as on tape");
+            let slow = if self.settings.tools.slow {
+                &Speed::SLOW[..]
+            } else {
+                &[]
+            };
+            for &speed in slow.iter().chain(&Speed::FAST) {
                 if ui
-                    .selectable_label(self.settings.speed == speed, format!("{speed}×"))
+                    .selectable_label(self.speed() == speed, speed.label())
                     .clicked()
                 {
-                    self.set_speed(speed);
+                    self.settings.speed = speed.value();
                 }
             }
             ui.separator();
@@ -1559,14 +1676,14 @@ impl App {
                 }
             }
             ui.separator();
-            if let Some(current) = &self.current {
-                let rate = f64::from(current.info.sample_rate);
+            if has_file {
+                let rate = self.display_rate();
                 let at = self.cursor.unwrap_or(0) as f64 / rate;
                 ui.label(
                     RichText::new(format!(
                         "{} / {}",
                         views::clock_fine(at),
-                        views::clock(current.info.seconds())
+                        views::clock(self.frames() as f64 / rate)
                     ))
                     .monospace(),
                 );
@@ -1602,7 +1719,7 @@ impl App {
                 self.zoom_to_selection();
             }
             if let Some(s) = &self.selection {
-                let rate = self.rate();
+                let rate = self.display_rate();
                 let (from, to) = (s.start as f64 / rate, s.end as f64 / rate);
                 ui.label(
                     RichText::new(format!(
@@ -1622,6 +1739,7 @@ impl App {
     fn display(&mut self, ui: &mut egui::Ui) {
         let nyquist = self.current.as_ref().map_or(96_000.0, |c| c.info.nyquist());
         let rate = self.current.as_ref().map_or(0, |c| c.info.sample_rate);
+        let scale = self.hz_scale();
         let channels = self.channel_count();
         let names: Vec<String> = (0..channels).map(|c| self.channel_name(c)).collect();
         let look = self.look().view;
@@ -1692,7 +1810,10 @@ impl App {
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Frequency");
-            let (mut lo, mut hi) = (f64::from(look.f_min), f64::from(look.f_max));
+            let (mut lo, mut hi) = (
+                f64::from(look.f_min * scale),
+                f64::from(look.f_max * scale),
+            );
             let typed = format!("Drag, or click the number and type: 200, 1.5k, 12 kHz.\n\n{PICKING}");
             let (mut min_changed, mut max_changed) = (false, false);
             let group = ui
@@ -1709,12 +1830,19 @@ impl App {
             let group = ui
                 .scope(|ui| {
                     ui.label("Max").on_hover_text(&typed);
-                    let top = format!(
-                        "Up to {}: half the {rate} Hz sample rate, the highest frequency the file can hold",
-                        views::hz_field(f64::from(nyquist))
-                    );
+                    let limit = views::hz_field(f64::from(nyquist * scale));
+                    let top = if scale == 1.0 {
+                        format!(
+                            "Up to {limit}: half the {rate} Hz sample rate, the highest frequency the file can hold"
+                        )
+                    } else {
+                        format!(
+                            "Up to {limit}: the highest frequency the file can hold, half its {rate} Hz sample rate, moved by the pitch shift and time expansion"
+                        )
+                    };
+                    let range = lo.max(f64::from(LOWEST_HZ))..=f64::from(nyquist * scale);
                     max_changed = ui
-                        .add(frequency_slider(&mut hi, lo.max(10.0)..=f64::from(nyquist)))
+                        .add(frequency_slider(&mut hi, range))
                         .on_hover_text(top)
                         .changed();
                     self.listeners
@@ -1725,14 +1853,55 @@ impl App {
                 .rect;
             self.mark_control(Control::High, group);
             if min_changed || max_changed {
-                self.settings.band_low = lo as f32;
-                self.settings.band_high = ((hi as f32) < nyquist - 0.5).then_some(hi as f32);
+                let (lo, hi) = (lo as f32 / scale, hi as f32 / scale);
+                self.settings.band_low = lo;
+                self.settings.band_high = (hi < nyquist - 0.5).then_some(hi);
             }
             if ui.button("Full").clicked() {
                 self.settings.band_low = 0.0;
                 self.settings.band_high = None;
             }
             ui.checkbox(&mut self.settings.log, "Log");
+        });
+        let tools = self.settings.tools;
+        if !tools.pitch && !tools.expansion {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            if tools.pitch {
+                let group = ui
+                    .scope(|ui| {
+                        ui.label("Pitch").on_hover_text(format!(
+                            "Moves the sound up or down in semitones, twelve to the octave, at the same speed, and the frequencies shown with it. Three octaves down, bat calls at 40 to 90 kHz come out at 5 to 11 kHz.\n\n{PICKING}"
+                        ));
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.pitch, PITCH)
+                                .step_by(1.0)
+                                .suffix(" st"),
+                        );
+                    })
+                    .response
+                    .rect;
+                self.mark_control(Control::Pitch, group);
+            }
+            if tools.expansion {
+                let group = ui
+                    .scope(|ui| {
+                        ui.label("Time expansion").on_hover_text(format!(
+                            "For recordings from time-expansion bat detectors: how many times slower than it happened the detector recorded. Frequencies and times show as they were; playback stays as recorded.\n\n{PICKING}"
+                        ));
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.expansion, EXPANSION)
+                                .step_by(1.0)
+                                .fixed_decimals(0)
+                                .logarithmic(true)
+                                .prefix("×"),
+                        );
+                    })
+                    .response
+                    .rect;
+                self.mark_control(Control::Expansion, group);
+            }
         });
     }
 
@@ -1845,7 +2014,7 @@ impl App {
         let response = ui.interact(plot, ui.id().with("spectrogram"), Sense::click_and_drag());
         let painter = ui.painter_at(area);
         let span = Span::new(plot, &self.view);
-        let rate = f64::from(current.info.sample_rate);
+        let (rate, scale) = (self.display_rate(), self.hz_scale());
         let targets = self.targets();
         let lanes = views::lanes(plot, targets.len());
         let view = self.look().view;
@@ -1859,7 +2028,7 @@ impl App {
                     views::place(&painter, *lane, span, texture.id(), &shown.analysis.range);
                 }
             }
-            views::freq_axis(&painter, *lane, lo, hi, view.log);
+            views::freq_axis(&painter, *lane, lo, hi, view.log, scale);
             if current.info.channels > 1 {
                 views::lane_label(&painter, *lane, &self.target_name(*target));
             }
@@ -1878,7 +2047,8 @@ impl App {
         if let Some(pos) = response.hover_pos()
             && let Some(lane) = lanes.iter().find(|l| l.contains(pos))
         {
-            let f = views::freq_at((lane.bottom() - pos.y) / lane.height(), lo, hi, view.log);
+            let f =
+                views::freq_at((lane.bottom() - pos.y) / lane.height(), lo, hi, view.log) * scale;
             let t = span.frame(pos.x) / rate;
             painter.hline(
                 lane.x_range(),
@@ -1943,7 +2113,7 @@ impl App {
             }
         }
         if axis {
-            let rate = f64::from(current.info.sample_rate);
+            let rate = self.display_rate();
             views::time_axis(
                 &painter,
                 plot,
@@ -2190,8 +2360,7 @@ impl App {
             .as_ref()
             .filter(|p| p.is_playing())
             .map(|player| {
-                let span =
-                    f64::from(current.info.sample_rate) * f64::from(self.settings.speed) / 20.0;
+                let span = f64::from(current.info.sample_rate) * self.speed().value() / 20.0;
                 let gain = self.settings.gain;
                 current
                     .levels
@@ -2213,7 +2382,7 @@ impl App {
             ui.weak("Click the spectrogram to inspect a moment");
             return;
         };
-        let at = spectrum.request.frame as f64 / f64::from(current.info.sample_rate);
+        let at = spectrum.request.frame as f64 / self.display_rate();
         ui.strong(format!("Spectrum at {}", views::clock_fine(at)));
         let area = ui.available_rect_before_wrap();
         let plot = Rect::from_min_max(
@@ -2245,7 +2414,16 @@ impl App {
                 levels,
             })
             .collect();
-        views::spectrum(&painter, plot, &curves, nyquist, (lo, hi), (top, bottom));
+        let scale = self.hz_scale();
+        views::spectrum(
+            &painter,
+            plot,
+            &curves,
+            nyquist,
+            (lo, hi),
+            (top, bottom),
+            scale,
+        );
     }
 
     fn markers_view(&mut self, ui: &mut egui::Ui) {
@@ -2264,7 +2442,7 @@ impl App {
         if add {
             self.add_marker();
         }
-        let (rate, locked) = (self.rate(), self.saving.is_some());
+        let (rate, locked) = (self.display_rate(), self.saving.is_some());
         let action = match (&self.current, &mut self.edits) {
             (Some(_), Some(edits)) if edits.markers.is_empty() => {
                 ui.weak("M marks the playhead, or a selected stretch as a region. Saving keeps them in the file as standard WAV cue points, as recorders and Reaper write them.");
@@ -2446,6 +2624,7 @@ impl eframe::App for App {
         // A new marker's name box that was not drawn this frame waits for
         // no later one.
         self.name_next = None;
+        self.tune_player();
         // Last, so that no panel paints over it.
         if let Some((_, rect)) = self.controls.iter().find(|(c, _)| Some(*c) == self.picked) {
             ui.painter().rect_stroke(
@@ -2488,7 +2667,7 @@ fn lift(level: Level, gain: f32) -> Level {
     }
 }
 
-fn summary(c: &Loaded) -> String {
+fn summary(c: &Loaded, expansion: f32, pitch: f32) -> String {
     let info = &c.info;
     let mut parts = vec![
         info.container.clone(),
@@ -2496,7 +2675,13 @@ fn summary(c: &Loaded) -> String {
     ];
     parts.extend(info.bits.map(|b| format!("{b}-bit")));
     parts.push(format!("{} ch", info.channels));
-    parts.push(views::clock(info.seconds()));
+    parts.push(views::clock(info.seconds() / f64::from(expansion)));
+    if expansion > 1.0 {
+        parts.push(format!("time expanded ×{expansion}"));
+    }
+    if pitch != 0.0 {
+        parts.push(format!("pitch {pitch:+} semitones"));
+    }
     parts.extend(c.meta.recorder.clone());
     if let Some(start) = &c.meta.start {
         let time = views::wall(start.seconds);
@@ -2560,17 +2745,39 @@ mod tests {
     }
 
     #[test]
+    fn a_speed_from_an_older_file_still_reads_and_slow_ones_need_switching_on() {
+        let mut storage = Memory::default();
+        storage.set_string(eframe::APP_KEY, "(speed: 4)".to_owned());
+        let back: Settings = eframe::get_value(&storage, eframe::APP_KEY).unwrap();
+        assert_eq!(back.sanitized().speed, 4.0);
+        let slow = Settings {
+            speed: 0.125,
+            ..Settings::default()
+        };
+        assert_eq!(slow.sanitized().speed, 1.0);
+        let switched_on = Settings {
+            speed: 0.125,
+            tools: Tools {
+                slow: true,
+                ..Tools::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(switched_on.sanitized().speed, 0.125);
+    }
+
+    #[test]
     fn settings_out_of_range_are_brought_back() {
         let settings = Settings {
             fft: 1000,
-            speed: 3,
+            speed: 3.0,
             brightness: 500.0,
             contrast: f32::NAN,
             gain: -90.0,
             ..Settings::default()
         }
         .sanitized();
-        assert_eq!((settings.fft, settings.speed), (2048, 1));
+        assert_eq!((settings.fft, settings.speed), (2048, 1.0));
         assert_eq!(
             (settings.brightness, settings.contrast, settings.gain),
             (80.0, 90.0, -60.0)

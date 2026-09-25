@@ -23,10 +23,10 @@ const WALL_CLOCK: Color32 = Color32::from_gray(115);
 /// Orange, like a control picked for the keys: what is chosen.
 const SELECTION: Color32 = Color32::from_rgba_unmultiplied_const(255, 140, 50, 45);
 const SELECTION_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(255, 140, 50, 180);
-const VIEWPORT: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 64);
-const VIEWPORT_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(90, 159, 212, 153);
 const STRIP_BACK: Color32 = Color32::from_gray(22);
 const STRIP_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(236, 224, 160, 170);
+/// The part in view, on the timeline: pale yellow like its edge.
+const VIEWPORT: Color32 = Color32::from_rgba_unmultiplied_const(236, 224, 160, 40);
 const TIMELINE_WAVE: Color32 = Color32::from_gray(85);
 pub const MARK: Color32 = Color32::from_rgb(255, 196, 70);
 const MARK_SPAN: Color32 = Color32::from_rgba_unmultiplied_const(255, 196, 70, 30);
@@ -179,7 +179,10 @@ pub fn time_axis(painter: &Painter, plot: Rect, span: Span, rate: f64, wall_star
     }
 }
 
-pub fn freq_axis(painter: &Painter, lane: Rect, lo: f32, hi: f32, log: bool) {
+/// Frequencies up `lane`, from `lo` to `hi` in the file, labelled `scale`
+/// times over as a pitch shift or time expansion shows them.
+pub fn freq_axis(painter: &Painter, lane: Rect, lo: f32, hi: f32, log: bool, scale: f32) {
+    let (lo, hi) = (lo * scale, hi * scale);
     for f in freq_ticks(lo, hi, log, lane.height(), 16.0) {
         let y = lane.bottom() - freq_t(f, lo, hi, log) * lane.height();
         painter.hline(lane.left() - 5.0..=lane.left(), y, Stroke::new(1.0, AXIS));
@@ -306,15 +309,10 @@ pub fn timeline(
     }
     let shown = Rect::from_x_y_ranges(x_of(view.start)..=x_of(view.end), rect.y_range());
     painter.rect_filled(shown, 0.0, VIEWPORT);
-    painter.rect_stroke(
-        shown,
-        0.0,
-        Stroke::new(1.0, VIEWPORT_EDGE),
-        StrokeKind::Inside,
-    );
+    painter.rect_stroke(shown, 0.0, Stroke::new(1.0, STRIP_EDGE), StrokeKind::Inside);
     let grip = rect.center().y - 7.0..=rect.center().y + 7.0;
     for x in [shown.left() + 1.5, shown.right() - 1.5] {
-        painter.vline(x, grip.clone(), Stroke::new(3.0, VIEWPORT_EDGE));
+        painter.vline(x, grip.clone(), Stroke::new(3.0, STRIP_EDGE));
     }
     if let Some(frame) = playhead {
         painter.vline(x_of(frame as f64), rect.y_range(), Stroke::new(1.0, CURSOR));
@@ -785,7 +783,8 @@ pub struct Curve<'a> {
 }
 
 /// Level against log frequency, `top` to `bottom` dB, with a legend once
-/// there is more than one curve.
+/// there is more than one curve. Frequencies are the file's, labelled
+/// `scale` times over.
 pub fn spectrum(
     painter: &Painter,
     plot: Rect,
@@ -793,11 +792,12 @@ pub fn spectrum(
     nyquist: f32,
     (lo, hi): (f32, f32),
     (top, bottom): (f32, f32),
+    scale: f32,
 ) {
     let x_of = |f: f32| plot.left() + freq_t(f, lo, hi, true) * plot.width();
     let y_of = |db: f32| plot.top() + ((top - db) / (top - bottom)).clamp(0.0, 1.0) * plot.height();
-    for f in freq_ticks(lo, hi, true, plot.width(), 34.0) {
-        let x = x_of(f);
+    for f in freq_ticks(lo * scale, hi * scale, true, plot.width(), 34.0) {
+        let x = x_of(f / scale);
         painter.vline(x, plot.y_range(), Stroke::new(1.0, GRID));
         painter.text(
             Pos2::new(x, plot.bottom() + 4.0),
