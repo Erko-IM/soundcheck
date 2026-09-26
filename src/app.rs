@@ -1,6 +1,7 @@
 //! Window layout, input, and the glue between the UI thread and the
 //! workers.
 
+use std::collections::HashSet;
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -19,8 +20,10 @@ use crate::edit::Edits;
 use crate::explorer::Explorer;
 use crate::finder::Inbox;
 use crate::levels::{FLOOR_DB, Level};
-use crate::playback::{Player, Speed};
+use crate::playback::{self, Player, Speed};
 use crate::probe::{self, Probe};
+use crate::rename;
+use crate::rename_ui::{self, Renamer, Request};
 use crate::save;
 use crate::spectrogram::{self, Analysis, Channels, Spec, Target, View};
 use crate::views::{self, MarkerAction, Meters, Span};
@@ -108,6 +111,8 @@ struct Settings {
     channels: Channels,
     /// Playback speed: 2 is twice as fast, 0.125 an eighth.
     speed: f64,
+    /// Any speed on a slider, rather than the presets.
+    speed_slider: bool,
     /// Playback gain, in dB.
     gain: f32,
     tools: Tools,
@@ -143,6 +148,7 @@ impl Default for Settings {
             log: false,
             channels: Channels::Mix,
             speed: 1.0,
+            speed_slider: false,
             gain: 0.0,
             tools: Tools::default(),
             pitch: 0.0,
@@ -166,9 +172,13 @@ impl Settings {
             self.fft = 2048;
         }
         let slow = self.tools.slow;
-        self.speed = Speed::of(self.speed)
-            .filter(|s| slow || s.value() >= 1.0)
-            .map_or(1.0, Speed::value);
+        self.speed = if self.speed_slider {
+            Speed::new(self.speed).value()
+        } else {
+            Speed::preset(self.speed)
+                .filter(|s| slow || s.value() >= 1.0)
+                .map_or(1.0, Speed::value)
+        };
         self.brightness = within(self.brightness, BRIGHTNESS, 0.0);
         self.contrast = within(self.contrast, CONTRAST, 90.0);
         self.gain = within(self.gain, GAIN, 0.0);
@@ -190,6 +200,8 @@ struct Views {
     metadata: bool,
     timeline: bool,
     meters: bool,
+    /// The short form for renaming the files in the explorer's folder.
+    rename: bool,
 }
 
 impl Default for Views {
@@ -202,6 +214,7 @@ impl Default for Views {
             metadata: false,
             timeline: true,
             meters: true,
+            rename: false,
         }
     }
 }
@@ -316,8 +329,9 @@ impl Shown {
     }
 }
 
-/// What a click picks for the keys: a slider for the arrow keys, or the
-/// file explorer for Backspace.
+/// What a click picks for the keys: a slider for the arrow keys, the file
+/// explorer for them and Backspace, or the timeline for moving and sizing
+/// the part in view.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Control {
     Gain,
@@ -327,11 +341,13 @@ enum Control {
     High,
     Pitch,
     Expansion,
+    Speed,
     Explorer,
+    Timeline,
 }
 
 impl Control {
-    const SLIDERS: [Self; 7] = [
+    const SLIDERS: [Self; 8] = [
         Self::Gain,
         Self::Brightness,
         Self::Contrast,
@@ -339,15 +355,18 @@ impl Control {
         Self::High,
         Self::Pitch,
         Self::Expansion,
+        Self::Speed,
     ];
 }
 
-/// What a drag along the timeline moves: one end of the part in view, or a
-/// new span from where the drag began.
+/// What a drag along the timeline moves: one end of the part in view, the
+/// part itself, taken this many frames from its start, or a new span from
+/// where the drag began.
 #[derive(Clone, Copy)]
 enum Grab {
     Start,
     End,
+    Move(f64),
     Span(f64),
 }
 
@@ -431,6 +450,9 @@ pub struct App {
     marker_grab: Option<(u32, f64)>,
     /// A marker just made, whose name box takes the keyboard once drawn.
     name_next: Option<u32>,
+    renamer: Renamer,
+    /// The window with every rename rule is open.
+    rename_window: bool,
 }
 
 impl App {
@@ -488,6 +510,8 @@ impl App {
             grab: None,
             marker_grab: None,
             name_next: None,
+            renamer: Renamer::default(),
+            rename_window: false,
         };
         if let Some(path) = initial.or_else(|| app.inbox.latest()) {
             app.open_external(&cc.egui_ctx, path);
@@ -600,8 +624,35 @@ impl App {
             .map_or(48_000.0, |c| f64::from(c.info.sample_rate))
     }
 
+    /// The speed set, within the slowest and fastest the open file plays at.
     fn speed(&self) -> Speed {
-        Speed::of(self.settings.speed).unwrap_or(Speed::NORMAL)
+        let set = Speed::new(self.settings.speed);
+        match &self.current {
+            Some(c) => {
+                let rate = c.info.sample_rate;
+                Speed::new(
+                    set.value()
+                        .max(playback::slowest(rate))
+                        .min(playback::fastest(&c.source, rate)),
+                )
+            }
+            None => set,
+        }
+    }
+
+    /// The preset nearest the speed set, among those shown.
+    fn nearest_preset(&self) -> Speed {
+        let slow: &[Speed] = if self.settings.tools.slow {
+            &Speed::SLOW
+        } else {
+            &[]
+        };
+        let off = |s: &Speed| (s.value().ln() - self.settings.speed.ln()).abs();
+        slow.iter()
+            .chain(&Speed::FAST)
+            .copied()
+            .min_by(|a, b| off(a).total_cmp(&off(b)))
+            .unwrap_or(Speed::NORMAL)
     }
 
     /// Semitones playback moves by: none with the pitch shift off.
@@ -942,21 +993,76 @@ impl App {
             Ok(new) => {
                 self.renaming = None;
                 self.rename_error = None;
-                if let Some(current) = &mut self.current {
-                    current.source = current.source.with_path(&new);
-                    if let Some(file) = current.details.sections.first_mut() {
-                        file.1 = audio::file_rows(&new, &current.info);
-                    }
-                }
                 if let Some(dir) = new.parent() {
                     self.explorer.forget(dir);
                 }
-                self.explorer.selected = Some(new.clone());
-                self.file = Some(new);
+                self.moved(&new);
             }
             Err(e) => self.rename_error = Some(e),
         }
         self.reacquire(ctx);
+    }
+
+    /// The file open is now at `new`, after a rename.
+    fn moved(&mut self, new: &Path) {
+        if let Some(current) = &mut self.current {
+            current.source = current.source.with_path(new);
+            if let Some(file) = current.details.sections.first_mut() {
+                file.1 = audio::file_rows(new, &current.info);
+            }
+        }
+        self.explorer.selected = Some(new.to_owned());
+        self.file = Some(new.to_owned());
+    }
+
+    fn rename_request(&mut self, ctx: &egui::Context, request: Request) {
+        match request {
+            Request::AllRules => self.rename_window = true,
+            Request::Close => self.rename_window = false,
+            Request::Rename(batch) => self.bulk_rename(ctx, batch, false),
+            Request::Undo(batch) => self.bulk_rename(ctx, batch, true),
+        }
+    }
+
+    /// Renames the files of `batch` all at once, letting go of the one open
+    /// while it moves, as a single rename does.
+    fn bulk_rename(&mut self, ctx: &egui::Context, batch: rename_ui::Batch, undo: bool) {
+        let open = self
+            .file
+            .as_ref()
+            .and_then(|f| batch.iter().find(|(from, _)| from == f))
+            .map(|(_, to)| to.clone());
+        let busy = if self.saving.is_some() {
+            Some("Nothing renamed while a save is under way.")
+        } else if open.is_some() && self.loading.is_some() {
+            Some("Nothing renamed: the file open is still loading.")
+        } else {
+            None
+        };
+        if let Some(why) = busy {
+            self.renamer.finished(batch, undo, Err(why.into()), ctx);
+            return;
+        }
+        if open.is_some() {
+            self.release();
+        }
+        let result = rename::execute(&batch);
+        if result.is_ok()
+            && let Some(new) = &open
+        {
+            self.moved(new);
+        }
+        let folders: HashSet<PathBuf> = batch
+            .iter()
+            .filter_map(|(from, _)| from.parent().map(Path::to_owned))
+            .collect();
+        for folder in &folders {
+            self.explorer.forget(folder);
+        }
+        if open.is_some() {
+            self.reacquire(ctx);
+        }
+        self.renamer.finished(batch, undo, result, ctx);
     }
 
     fn add_marker(&mut self) {
@@ -1297,12 +1403,24 @@ impl App {
                 };
                 self.settings.expansion = next.round().clamp(*EXPANSION.start(), *EXPANSION.end());
             }
-            Control::Explorer => {}
+            // A semitone of pitch at a time, as on tape, or with Shift an
+            // octave.
+            Control::Speed => {
+                let factor = if coarse { 2.0 } else { 2f64.powf(1.0 / 12.0) };
+                let speed = self.settings.speed * if up { factor } else { 1.0 / factor };
+                self.settings.speed = Speed::new(speed).value();
+            }
+            Control::Explorer | Control::Timeline => {}
         }
     }
 
-    /// Puts `control` back where it starts.
+    /// Puts `control` back where it starts: the timeline back to the whole
+    /// file.
     fn reset(&mut self, control: Control) {
+        if control == Control::Timeline {
+            self.fit();
+            return;
+        }
         let start = Settings::default();
         let settings = &mut self.settings;
         match control {
@@ -1318,7 +1436,8 @@ impl App {
             Control::High => settings.band_high = start.band_high,
             Control::Pitch => settings.pitch = start.pitch,
             Control::Expansion => settings.expansion = start.expansion,
-            Control::Explorer => {}
+            Control::Speed => settings.speed = start.speed,
+            Control::Explorer | Control::Timeline => {}
         }
     }
 
@@ -1421,6 +1540,26 @@ impl App {
             return;
         }
         match self.picked.filter(|c| *c != Control::Explorer) {
+            // Along by a tenth of the part in view, or with Shift by all of
+            // it; wider and narrower by a quarter, or with Shift twice.
+            Some(Control::Timeline) => {
+                let len = self.view_len();
+                for (key, sign) in [(Key::ArrowLeft, -1.0), (Key::ArrowRight, 1.0)] {
+                    if pressed(Modifiers::SHIFT, key) {
+                        self.pan(sign * len);
+                    } else if plain(key) {
+                        self.pan(sign * len / 10.0);
+                    }
+                }
+                for (key, step, coarse) in [(Key::ArrowUp, 1.25, 2.0), (Key::ArrowDown, 0.8, 0.5)] {
+                    let centre = (self.view.start + self.view.end) / 2.0;
+                    if pressed(Modifiers::SHIFT, key) {
+                        self.zoom_at(centre, coarse);
+                    } else if plain(key) {
+                        self.zoom_at(centre, step);
+                    }
+                }
+            }
             Some(control) => {
                 for (key, up) in [
                     (Key::ArrowLeft, false),
@@ -1510,6 +1649,11 @@ impl App {
             ui.checkbox(&mut views.metadata, "Metadata");
             ui.checkbox(&mut views.timeline, "Timeline");
             ui.checkbox(&mut views.meters, "Meters");
+            ui.checkbox(&mut views.rename, "Rename").on_hover_text(
+                "Rename the files in the explorer's folder: replace, add, number and change case",
+            );
+            ui.checkbox(&mut self.rename_window, "Bulk rename")
+                .on_hover_text("Every renaming rule, in a window of its own");
             ui.separator();
             let tools = &mut self.settings.tools;
             ui.checkbox(&mut tools.pitch, "Pitch shift").on_hover_text(
@@ -1522,7 +1666,7 @@ impl App {
                 "Speeds down to a tenth, which bring bat calls down into hearing",
             );
         });
-        if !self.settings.tools.slow && self.settings.speed < 1.0 {
+        if !self.settings.speed_slider && !self.settings.tools.slow && self.settings.speed < 1.0 {
             self.settings.speed = 1.0;
         }
         ui.add_space(4.0);
@@ -1681,31 +1825,52 @@ impl App {
             ui.separator();
             ui.label("Speed")
                 .on_hover_text("Pitch moves with speed, as on tape");
-            let slow = if self.settings.tools.slow {
-                &Speed::SLOW[..]
+            if self.settings.speed_slider {
+                self.speed_slider(ui);
             } else {
-                &[]
+                let slow = if self.settings.tools.slow {
+                    &Speed::SLOW[..]
+                } else {
+                    &[]
+                };
+                for &speed in slow.iter().chain(&Speed::FAST) {
+                    if ui
+                        .selectable_label(self.speed() == speed, speed.label())
+                        .clicked()
+                    {
+                        self.settings.speed = speed.value();
+                    }
+                }
+            }
+            let free = self.settings.speed_slider;
+            let hint = if free {
+                "Back to the preset speeds"
+            } else {
+                "Any speed, on a slider or typed in"
             };
-            for &speed in slow.iter().chain(&Speed::FAST) {
-                if ui
-                    .selectable_label(self.speed() == speed, speed.label())
-                    .clicked()
-                {
-                    self.settings.speed = speed.value();
+            if ui.selectable_label(free, "Slider").on_hover_text(hint).clicked() {
+                self.settings.speed_slider = !free;
+                if free {
+                    self.settings.speed = self.nearest_preset().value();
                 }
             }
             ui.separator();
             let mut gain = self.settings.gain;
+            let mut reset = false;
             let group = ui
                 .scope(|ui| {
                     ui.label("Gain").on_hover_text(format!(
                         "Playback volume: raise it for quiet recordings, lower it for 32-bit float files that go past full scale.\n\n{PICKING}"
                     ));
                     ui.add(egui::Slider::new(&mut gain, GAIN).step_by(1.0).suffix(" dB"));
+                    reset = views::reset_button(ui, gain != 0.0, "0 dB");
                 })
                 .response
                 .rect;
             self.mark_control(Control::Gain, group);
+            if reset {
+                gain = 0.0;
+            }
             if gain != self.settings.gain {
                 self.settings.gain = gain;
                 if let Some(player) = &self.player {
@@ -1773,6 +1938,43 @@ impl App {
         });
     }
 
+    /// Any speed from a thousandth to a thousand times, and any typed in up
+    /// to what playback can do.
+    fn speed_slider(&mut self, ui: &mut egui::Ui) {
+        let mut reset = false;
+        let group = ui
+            .scope(|ui| {
+                ui.add(
+                    egui::Slider::new(&mut self.settings.speed, Speed::SLIDER)
+                        .logarithmic(true)
+                        .clamping(egui::SliderClamping::Never)
+                        .custom_formatter(|v, _| playback::speed_text(v))
+                        .custom_parser(playback::parse_speed),
+                )
+                .on_hover_text(format!(
+                    "From a thousandth to a thousand times, or click the number and type any speed: 3, 1/250, 0.02.\n\n{PICKING}"
+                ));
+                reset = views::reset_button(ui, self.settings.speed != 1.0, "1×");
+            })
+            .response
+            .rect;
+        self.mark_control(Control::Speed, group);
+        if reset {
+            self.reset(Control::Speed);
+        }
+        self.settings.speed = Speed::new(self.settings.speed).value();
+        let plays = self.speed();
+        if plays.value() != self.settings.speed {
+            let why = if plays.value() < self.settings.speed {
+                "The fastest this file plays: any faster, and reading and filtering it would fall behind the sound going out"
+            } else {
+                "The slowest this file plays: its highest frequency already comes out at 2.4 Hz, far below hearing, and any slower would only keep each start and seek waiting"
+            };
+            ui.weak(format!("plays at {}", plays.label()))
+                .on_hover_text(why);
+        }
+    }
+
     fn display(&mut self, ui: &mut egui::Ui) {
         let nyquist = self.current.as_ref().map_or(96_000.0, |c| c.info.nyquist());
         let rate = self.current.as_ref().map_or(0, |c| c.info.sample_rate);
@@ -1780,6 +1982,8 @@ impl App {
         let channels = self.channel_count();
         let names: Vec<String> = (0..channels).map(|c| self.channel_name(c)).collect();
         let look = self.look().view;
+        let start = Settings::default();
+        let mut reset = None;
         ui.horizontal_wrapped(|ui| {
             ui.label("FFT");
             egui::ComboBox::from_id_salt("fft")
@@ -1826,6 +2030,10 @@ impl App {
                             .step_by(1.0)
                             .suffix(" dB"),
                     );
+                    let changed = self.settings.brightness != start.brightness;
+                    if views::reset_button(ui, changed, "0 dB") {
+                        reset = Some(Control::Brightness);
+                    }
                 })
                 .response
                 .rect;
@@ -1840,6 +2048,10 @@ impl App {
                             .step_by(1.0)
                             .suffix(" dB"),
                     );
+                    let changed = self.settings.contrast != start.contrast;
+                    if views::reset_button(ui, changed, "90 dB") {
+                        reset = Some(Control::Contrast);
+                    }
                 })
                 .response
                 .rect;
@@ -1860,6 +2072,9 @@ impl App {
                     self.listeners
                         .show(ui, lo as f32, views::Animal::Whale)
                         .on_hover_text(HEARING);
+                    if views::reset_button(ui, self.settings.band_low > 0.0, "0 Hz") {
+                        reset = Some(Control::Low);
+                    }
                 })
                 .response
                 .rect;
@@ -1885,11 +2100,15 @@ impl App {
                     self.listeners
                         .show(ui, hi as f32, views::Animal::Bat)
                         .on_hover_text(HEARING);
+                    let changed = self.settings.band_high.is_some();
+                    if views::reset_button(ui, changed, "the highest the file holds") {
+                        reset = Some(Control::High);
+                    }
                 })
                 .response
                 .rect;
             self.mark_control(Control::High, group);
-            if min_changed || max_changed {
+            if (min_changed || max_changed) && reset.is_none() {
                 let (lo, hi) = (lo as f32 / scale, hi as f32 / scale);
                 self.settings.band_low = lo;
                 self.settings.band_high = (hi < nyquist - 0.5).then_some(hi);
@@ -1901,45 +2120,53 @@ impl App {
             ui.checkbox(&mut self.settings.log, "Log");
         });
         let tools = self.settings.tools;
-        if !tools.pitch && !tools.expansion {
-            return;
+        if tools.pitch || tools.expansion {
+            ui.horizontal_wrapped(|ui| {
+                if tools.pitch {
+                    let group = ui
+                        .scope(|ui| {
+                            ui.label("Pitch").on_hover_text(format!(
+                                "Moves the sound up or down in semitones, twelve to the octave, at the same speed, and the frequencies shown with it. Three octaves down, bat calls at 40 to 90 kHz come out at 5 to 11 kHz.\n\n{PICKING}"
+                            ));
+                            ui.add(
+                                egui::Slider::new(&mut self.settings.pitch, PITCH)
+                                    .step_by(1.0)
+                                    .suffix(" st"),
+                            );
+                            if views::reset_button(ui, self.settings.pitch != 0.0, "0 st") {
+                                reset = Some(Control::Pitch);
+                            }
+                        })
+                        .response
+                        .rect;
+                    self.mark_control(Control::Pitch, group);
+                }
+                if tools.expansion {
+                    let group = ui
+                        .scope(|ui| {
+                            ui.label("Time expansion").on_hover_text(format!(
+                                "For recordings from time-expansion bat detectors: how many times slower than it happened the detector recorded. Frequencies and times show as they were; playback stays as recorded.\n\n{PICKING}"
+                            ));
+                            ui.add(
+                                egui::Slider::new(&mut self.settings.expansion, EXPANSION)
+                                    .step_by(1.0)
+                                    .fixed_decimals(0)
+                                    .logarithmic(true)
+                                    .prefix("×"),
+                            );
+                            if views::reset_button(ui, self.settings.expansion != 1.0, "×1") {
+                                reset = Some(Control::Expansion);
+                            }
+                        })
+                        .response
+                        .rect;
+                    self.mark_control(Control::Expansion, group);
+                }
+            });
         }
-        ui.horizontal_wrapped(|ui| {
-            if tools.pitch {
-                let group = ui
-                    .scope(|ui| {
-                        ui.label("Pitch").on_hover_text(format!(
-                            "Moves the sound up or down in semitones, twelve to the octave, at the same speed, and the frequencies shown with it. Three octaves down, bat calls at 40 to 90 kHz come out at 5 to 11 kHz.\n\n{PICKING}"
-                        ));
-                        ui.add(
-                            egui::Slider::new(&mut self.settings.pitch, PITCH)
-                                .step_by(1.0)
-                                .suffix(" st"),
-                        );
-                    })
-                    .response
-                    .rect;
-                self.mark_control(Control::Pitch, group);
-            }
-            if tools.expansion {
-                let group = ui
-                    .scope(|ui| {
-                        ui.label("Time expansion").on_hover_text(format!(
-                            "For recordings from time-expansion bat detectors: how many times slower than it happened the detector recorded. Frequencies and times show as they were; playback stays as recorded.\n\n{PICKING}"
-                        ));
-                        ui.add(
-                            egui::Slider::new(&mut self.settings.expansion, EXPANSION)
-                                .step_by(1.0)
-                                .fixed_decimals(0)
-                                .logarithmic(true)
-                                .prefix("×"),
-                        );
-                    })
-                    .response
-                    .rect;
-                self.mark_control(Control::Expansion, group);
-            }
-        });
+        if let Some(control) = reset {
+            self.reset(control);
+        }
     }
 
     fn placeholder(&self, ui: &mut egui::Ui) {
@@ -1977,49 +2204,87 @@ impl App {
         }
     }
 
-    /// The views beside: the spectrum over the markers over the metadata,
-    /// each split resizable.
+    /// The views beside: the spectrum over the markers over the metadata
+    /// over renaming, each split resizable.
     fn side(&mut self, ui: &mut egui::Ui) {
         let height = Self::claim(ui).height();
         let views = self.settings.views;
-        let top: fn(&mut Self, &mut egui::Ui) = if views.spectrum {
-            Self::spectrum_view
-        } else if views.markers {
-            Self::markers_view
-        } else {
-            Self::metadata_view
+        type View = fn(&mut App, &mut egui::Ui);
+        let shown: Vec<(&str, View)> = [
+            (views.spectrum, "spectrum", Self::spectrum_view as View),
+            (views.markers, "markers", Self::markers_view),
+            (views.metadata, "metadata", Self::metadata_view),
+            (views.rename, "rename", Self::rename_view),
+        ]
+        .into_iter()
+        .filter(|(on, _, _)| *on)
+        .map(|(_, id, view)| (id, view))
+        .collect();
+        let Some(&(_, top)) = shown.first() else {
+            return;
         };
         // Split only once a file is open: until then the column is taller
         // than it will be with the meters and timeline beneath it, and a
-        // split keeps the size it is first given.
+        // split keeps the size it is first given. Renaming needs no file,
+        // so it shows on its own until then.
         if self.current.is_none() {
-            top(self, ui);
+            let alone = if views.rename {
+                Self::rename_view as View
+            } else {
+                top
+            };
+            alone(self, ui);
             return;
         }
-        let shown = [views.spectrum, views.markers, views.metadata]
-            .iter()
-            .filter(|v| **v)
-            .count()
-            .max(1) as f32;
-        if views.metadata && (views.spectrum || views.markers) {
-            egui::Panel::bottom("metadata")
+        // Each set of views keeps splits of its own, so one switched on
+        // starts with an even share rather than squeezing the others.
+        let set: Vec<&str> = shown.iter().map(|(id, _)| *id).collect();
+        let share = height / shown.len() as f32;
+        for &(id, view) in shown[1..].iter().rev() {
+            egui::Panel::bottom(egui::Id::new((id, &set)))
                 .frame(egui::Frame::NONE)
                 .resizable(true)
-                .default_size(height / shown)
+                .default_size(share)
                 .min_size(80.0)
-                .show(ui, |ui| self.metadata_view(ui));
-        }
-        if views.markers && views.spectrum {
-            egui::Panel::bottom("markers")
-                .frame(egui::Frame::NONE)
-                .resizable(true)
-                .default_size(height / shown)
-                .min_size(80.0)
-                .show(ui, |ui| self.markers_view(ui));
+                .show(ui, |ui| view(self, ui));
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| top(self, ui));
+    }
+
+    fn rename_view(&mut self, ui: &mut egui::Ui) {
+        Self::claim(ui);
+        ui.add_space(4.0);
+        let locked = self.saving.is_some();
+        if let Some(request) = self.renamer.simple(ui, locked) {
+            self.rename_request(ui.ctx(), request);
+        }
+    }
+
+    /// The window with every rename rule, a window of its own where the
+    /// system gives one.
+    fn rename_window(&mut self, ctx: &egui::Context) {
+        let locked = self.saving.is_some();
+        let (mut closed, mut asked) = (false, None);
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("bulk rename"),
+            egui::ViewportBuilder::default()
+                .with_title("Bulk rename")
+                .with_inner_size([1360.0, 860.0])
+                .with_min_inner_size([980.0, 620.0]),
+            |ui, class| {
+                closed = ui.ctx().input(|i| i.viewport().close_requested());
+                let embedded = class == egui::ViewportClass::EmbeddedWindow;
+                asked = self.renamer.full(ui, locked, embedded);
+            },
+        );
+        if closed {
+            self.rename_window = false;
+        }
+        if let Some(request) = asked {
+            self.rename_request(ctx, request);
+        }
     }
 
     /// Claims the whole of `ui`, whatever the view then shows: a panel keeps
@@ -2298,9 +2563,10 @@ impl App {
         }
     }
 
-    /// The whole file. Dragging an end of the part in view moves that end;
-    /// dragging anywhere else shows the span dragged over; a click centres
-    /// the view there; a right-drag moves it along.
+    /// The whole file. Dragging an end of the part in view moves that end,
+    /// dragging the part itself moves it along, and dragging anywhere else
+    /// shows the span dragged over; a click centres the view there; a
+    /// right-drag moves it along. Picked, the arrows move and size it.
     fn timeline_view(&mut self, ui: &mut egui::Ui) {
         let area = Self::claim(ui);
         // Room for the outline, and clear of the handle resizing the panel.
@@ -2312,6 +2578,7 @@ impl App {
             return;
         };
         let response = ui.interact(rect, ui.id().with("timeline"), Sense::click_and_drag());
+        self.controls.push((Control::Timeline, rect));
         let painter = ui.painter_at(area);
         let frames = current.info.frames as f64;
         views::timeline(
@@ -2337,11 +2604,16 @@ impl App {
                 Some(Grab::End)
             }
         };
+        let inside = |x: f32| x > x0 + GRIP && x < x1 - GRIP;
         if let Some(pos) = response.hover_pos() {
             let resizing =
                 end_at(pos.x).is_some() || matches!(self.grab, Some(Grab::Start | Grab::End));
             ui.ctx().set_cursor_icon(if resizing {
                 CursorIcon::ResizeHorizontal
+            } else if matches!(self.grab, Some(Grab::Move(_))) {
+                CursorIcon::Grabbing
+            } else if inside(pos.x) && self.zoomed() {
+                CursorIcon::Grab
             } else {
                 CursorIcon::Crosshair
             });
@@ -2350,7 +2622,12 @@ impl App {
             let from = ui
                 .input(|i| i.pointer.press_origin())
                 .map_or(rect.left(), |p| p.x);
-            self.grab = Some(end_at(from).unwrap_or(Grab::Span(frame_at(from))));
+            let taken = frame_at(from) - self.view.start;
+            self.grab = Some(end_at(from).unwrap_or(if inside(from) && self.zoomed() {
+                Grab::Move(taken)
+            } else {
+                Grab::Span(frame_at(from))
+            }));
         }
         if response.dragged_by(PointerButton::Primary)
             && let (Some(grab), Some(pos)) = (self.grab, response.interact_pointer_pos())
@@ -2361,6 +2638,7 @@ impl App {
             match grab {
                 Grab::Start => self.set_view_range(at.min(end - shortest), end),
                 Grab::End => self.set_view_range(start, at.max(start + shortest)),
+                Grab::Move(taken) => self.set_view(at - taken, end - start),
                 // Past a few points, so a click that wobbles stays a click.
                 Grab::Span(from) if (x_of(from) - pos.x).abs() > 3.0 => {
                     self.set_view_range(from.min(at), from.max(at));
@@ -2429,11 +2707,15 @@ impl App {
         if plot.width() < 20.0 || plot.height() < 20.0 {
             return;
         }
+        let response = ui.interact(plot, ui.id().with("spectrum"), Sense::hover());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+        }
         let painter = ui.painter_at(area);
         let nyquist = current.info.nyquist();
         let view = self.look().view;
-        let lo = view.f_min.max(10.0).min(nyquist / 4.0);
-        let hi = view.f_max.clamp(lo * 4.0, nyquist);
+        // The same band as the spectrogram, on the same kind of axis.
+        let (lo, hi) = spectrogram::band(&view, current.info.sample_rate, spectrum.request.fft);
         // The floor follows the spectrogram's, but the top stays at full
         // scale or above, so a brighter spectrogram never flattens the
         // peaks here.
@@ -2451,15 +2733,21 @@ impl App {
                 levels,
             })
             .collect();
-        let scale = self.hz_scale();
+        let axes = views::Axes {
+            lo,
+            hi,
+            log: view.log,
+            top,
+            bottom,
+            scale: self.hz_scale(),
+        };
         views::spectrum(
             &painter,
             plot,
             &curves,
             nyquist,
-            (lo, hi),
-            (top, bottom),
-            scale,
+            &axes,
+            response.hover_pos(),
         );
     }
 
@@ -2580,6 +2868,9 @@ impl eframe::App for App {
             self.open_external(&ctx, path);
         }
         self.poll(&ctx);
+        if self.settings.views.rename || self.rename_window {
+            self.renamer.follow(self.explorer.root(), &ctx);
+        }
         self.input(&ctx);
         self.controls.clear();
         self.follow_playback(&ctx);
@@ -2637,7 +2928,7 @@ impl eframe::App for App {
         }
         self.refresh_textures(&ctx);
         let central = views.spectrogram || views.waveform;
-        let side = views.spectrum || views.markers || views.metadata;
+        let side = views.spectrum || views.markers || views.metadata || views.rename;
         if central && side {
             egui::Panel::right("side")
                 .resizable(true)
@@ -2670,6 +2961,9 @@ impl eframe::App for App {
                 Stroke::new(1.5, PICKED),
                 StrokeKind::Outside,
             );
+        }
+        if self.rename_window {
+            self.rename_window(&ctx);
         }
         self.ask(&ctx);
     }

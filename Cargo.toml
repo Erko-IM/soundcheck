@@ -6,11 +6,13 @@ description = "Fast spectrogram and spectrum viewer for field recordings"
 publish = false
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 colorous = "1.0.16"
 cpal = "0.18.2"
 eframe = { version = "0.36.2", features = ["persistence"] }
 rayon = "1.12.0"
 realfft = "3.5.0"
+regex = { version = "1.13.1", default-features = false, features = ["std", "unicode"] }
 rtrb = "0.4.0"
 rubato = "5.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -28,6 +30,9 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSURL",
     "objc2-core-services",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

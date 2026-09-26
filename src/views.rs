@@ -2,6 +2,7 @@
 //! meters, the spectrum and the metadata.
 
 use std::collections::HashMap;
+use std::f32::consts::PI;
 use std::ops::Range;
 
 use eframe::egui::{
@@ -13,6 +14,7 @@ use eframe::egui::{
 use crate::edit::{BEXT_FIELDS, Edits};
 use crate::levels::{FLOOR_DB, Level};
 use crate::meta::{self, Details};
+use crate::spectrogram::SILENCE_DB;
 use crate::wav::Marker;
 
 pub const CURSOR: Color32 = Color32::from_rgb(235, 70, 60);
@@ -782,31 +784,55 @@ pub struct Curve<'a> {
     pub levels: &'a [f32],
 }
 
-/// Level against log frequency, `top` to `bottom` dB, with a legend once
-/// there is more than one curve. Frequencies are the file's, labelled
-/// `scale` times over.
+/// How the spectrum is laid out: `lo` to `hi` across, in the file's own
+/// frequencies and labelled `scale` times over; `top` to `bottom` dB up.
+pub struct Axes {
+    pub lo: f32,
+    pub hi: f32,
+    pub log: bool,
+    pub top: f32,
+    pub bottom: f32,
+    pub scale: f32,
+}
+
+/// Level against frequency, with a legend once there is more than one
+/// curve, and where the pointer is, the frequency under it and each curve's
+/// level there.
 pub fn spectrum(
     painter: &Painter,
     plot: Rect,
     curves: &[Curve<'_>],
     nyquist: f32,
-    (lo, hi): (f32, f32),
-    (top, bottom): (f32, f32),
-    scale: f32,
+    axes: &Axes,
+    pointer: Option<Pos2>,
 ) {
-    let x_of = |f: f32| plot.left() + freq_t(f, lo, hi, true) * plot.width();
+    let Axes {
+        lo,
+        hi,
+        log,
+        top,
+        bottom,
+        scale,
+    } = *axes;
+    let x_of = |f: f32| plot.left() + freq_t(f, lo, hi, log) * plot.width();
     let y_of = |db: f32| plot.top() + ((top - db) / (top - bottom)).clamp(0.0, 1.0) * plot.height();
-    for f in freq_ticks(lo * scale, hi * scale, true, plot.width(), 34.0) {
+    let label = |f: f32| painter.layout_no_wrap(hz(f), FontId::monospace(10.0), AXIS);
+    let y = plot.bottom() + 4.0;
+    // Both ends of the band are always labelled, so the axis never seems to
+    // stop short of it; a tick label that would touch one gives way to it.
+    let (first, last) = (label(lo * scale), label(hi * scale));
+    let free = plot.left() + first.size().x + 4.0..=plot.right() - last.size().x - 4.0;
+    for f in freq_ticks(lo * scale, hi * scale, log, plot.width(), 34.0) {
         let x = x_of(f / scale);
         painter.vline(x, plot.y_range(), Stroke::new(1.0, GRID));
-        painter.text(
-            Pos2::new(x, plot.bottom() + 4.0),
-            Align2::CENTER_TOP,
-            hz(f),
-            FontId::monospace(10.0),
-            AXIS,
-        );
+        let tick = label(f);
+        let half = tick.size().x / 2.0;
+        if free.contains(&(x - half)) && free.contains(&(x + half)) {
+            painter.galley(Pos2::new(x - half, y), tick, AXIS);
+        }
     }
+    painter.galley(Pos2::new(plot.left(), y), first, AXIS);
+    painter.galley(Pos2::new(plot.right() - last.size().x, y), last, AXIS);
     let mut db = (top / 20.0).floor() * 20.0;
     while db >= bottom {
         let y = y_of(db);
@@ -822,12 +848,16 @@ pub fn spectrum(
     }
     for curve in curves.iter().filter(|c| c.levels.len() > 1) {
         let bin_hz = nyquist / (curve.levels.len() - 1) as f32;
-        let points: Vec<Pos2> = curve
+        // From edge to edge, whether or not a bin falls on either.
+        let inside = curve
             .levels
             .iter()
             .enumerate()
             .map(|(k, &level)| (k as f32 * bin_hz, level))
-            .filter(|(f, _)| (lo..=hi).contains(f))
+            .filter(|(f, _)| *f > lo && *f < hi);
+        let points: Vec<Pos2> = std::iter::once((lo, level_at(curve.levels, bin_hz, lo)))
+            .chain(inside)
+            .chain(std::iter::once((hi, level_at(curve.levels, bin_hz, hi))))
             .map(|(f, level)| Pos2::new(x_of(f), y_of(level)))
             .collect();
         painter.add(Shape::line(points, Stroke::new(1.2, curve.color)));
@@ -846,6 +876,87 @@ pub fn spectrum(
             painter.galley(Pos2::new(x, y), galley, curve.color);
             y += size.y + 2.0;
         }
+    }
+    if let Some(pos) = pointer.filter(|p| plot.contains(*p)) {
+        readout(painter, plot, curves, nyquist, axes, pos);
+    }
+}
+
+/// `levels` at `f`, between the two bins either side of it.
+fn level_at(levels: &[f32], bin_hz: f32, f: f32) -> f32 {
+    let at = (f / bin_hz).clamp(0.0, (levels.len() - 1) as f32);
+    let (below, t) = (at.floor() as usize, at.fract());
+    let above = (below + 1).min(levels.len() - 1);
+    levels[below] + (levels[above] - levels[below]) * t
+}
+
+/// The bin nearest the pointer, marked on each curve, and what it holds.
+fn readout(
+    painter: &Painter,
+    plot: Rect,
+    curves: &[Curve<'_>],
+    nyquist: f32,
+    axes: &Axes,
+    pos: Pos2,
+) {
+    let Some(first) = curves.iter().find(|c| c.levels.len() > 1) else {
+        return;
+    };
+    let bins = first.levels.len();
+    let bin_hz = nyquist / (bins - 1) as f32;
+    let pointed = freq_at(
+        (pos.x - plot.left()) / plot.width(),
+        axes.lo,
+        axes.hi,
+        axes.log,
+    );
+    let bin = ((pointed / bin_hz).round() as usize).min(bins - 1);
+    let f = (bin as f32 * bin_hz).clamp(axes.lo, axes.hi);
+    let x = plot.left() + freq_t(f, axes.lo, axes.hi, axes.log) * plot.width();
+    let y_of = |db: f32| {
+        plot.top() + ((axes.top - db) / (axes.top - axes.bottom)).clamp(0.0, 1.0) * plot.height()
+    };
+    painter.vline(
+        x,
+        plot.y_range(),
+        Stroke::new(0.5, Color32::from_white_alpha(90)),
+    );
+    let mut lines = vec![(hz_exact(f * axes.scale), Color32::WHITE)];
+    for curve in curves.iter().filter(|c| c.levels.len() == bins) {
+        let level = curve.levels[bin];
+        painter.circle_filled(Pos2::new(x, y_of(level)), 3.0, curve.color);
+        let level = if level <= SILENCE_DB + 1.0 {
+            "silent".to_owned()
+        } else {
+            format!("{level:.1} dB")
+        };
+        let text = if curves.len() > 1 {
+            format!("{}  {level}", curve.name)
+        } else {
+            level
+        };
+        lines.push((text, curve.color));
+    }
+    let galleys: Vec<_> = lines
+        .into_iter()
+        .map(|(text, color)| painter.layout_no_wrap(text, FontId::monospace(12.0), color))
+        .collect();
+    let width = galleys.iter().map(|g| g.size().x).fold(0.0, f32::max);
+    let height: f32 = galleys.iter().map(|g| g.size().y).sum();
+    // On the side with room, so it is never cut off at the edge.
+    let left = if pos.x > plot.center().x {
+        pos.x - 14.0 - width
+    } else {
+        pos.x + 14.0
+    };
+    let top = (pos.y - height - 12.0).clamp(plot.top(), plot.bottom() - height);
+    let back = Rect::from_min_size(Pos2::new(left, top), Vec2::new(width, height)).expand(4.0);
+    painter.rect_filled(back, 3.0, Color32::from_black_alpha(190));
+    let mut y = top;
+    for galley in galleys {
+        let h = galley.size().y;
+        painter.galley(Pos2::new(left, y), galley, Color32::WHITE);
+        y += h;
     }
 }
 
@@ -1019,6 +1130,55 @@ pub fn hz(f: f32) -> String {
         format!("{k:.0}k")
     } else {
         format!("{k:.1}k")
+    }
+}
+
+/// A small circular arrow that puts a control back as it starts. Dim, and
+/// doing nothing, while the control already is.
+pub fn reset_button(ui: &mut Ui, changed: bool, to: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::click());
+    let color = if !changed {
+        Color32::from_gray(70)
+    } else if response.hovered() {
+        Color32::WHITE
+    } else {
+        Color32::from_gray(150)
+    };
+    // Round anticlockwise from the top right, most of the way.
+    let (c, r) = (rect.center(), rect.width() * 0.36);
+    let (from, sweep) = (-0.25 * PI, -1.6 * PI);
+    let arc: Vec<Pos2> = (0..=20)
+        .map(|i| c + Vec2::angled(from + sweep * i as f32 / 20.0) * r)
+        .collect();
+    let end = from + sweep;
+    let tip = c + Vec2::angled(end) * r;
+    let ahead = Vec2::new(end.sin(), -end.cos());
+    let across = Vec2::new(-ahead.y, ahead.x);
+    let painter = ui.painter();
+    painter.add(Shape::line(arc, Stroke::new(1.3, color)));
+    painter.add(Shape::convex_polygon(
+        vec![
+            tip + ahead * 2.6,
+            tip + across * 2.4 - ahead * 0.8,
+            tip - across * 2.4 - ahead * 0.8,
+        ],
+        color,
+        Stroke::NONE,
+    ));
+    if !changed {
+        return false;
+    }
+    response.on_hover_text(format!("Back to {to}")).clicked()
+}
+
+/// A frequency to the resolution of a spectrum's bins.
+pub fn hz_exact(f: f32) -> String {
+    if f >= 10_000.0 {
+        format!("{:.2} kHz", f / 1000.0)
+    } else if f >= 1000.0 {
+        format!("{:.3} kHz", f / 1000.0)
+    } else {
+        format!("{f:.1} Hz")
     }
 }
 

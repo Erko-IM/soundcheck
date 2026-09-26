@@ -11,6 +11,8 @@ mod levels;
 mod meta;
 mod playback;
 mod probe;
+mod rename;
+mod rename_ui;
 mod save;
 mod spectrogram;
 mod views;

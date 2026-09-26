@@ -7,7 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::f32::consts::TAU;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
@@ -18,57 +18,102 @@ use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample};
 use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
-use rubato::{Fft, FixedSync, Resampler};
+use rubato::{Async, FixedAsync, Resampler, SincInterpolationParameters, WindowFunction};
 
 use crate::audio::{Info, Reader, Source};
 
-/// A playback speed, as the fraction of whole numbers the resampler works
-/// in. Pitch moves with speed, as on tape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Speed {
-    times: u32,
-    over: u32,
-}
+/// A playback speed: how many times faster than it was recorded. Pitch
+/// moves with speed, as on tape.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Speed(f64);
 
 impl Speed {
-    pub const NORMAL: Self = Self::new(1, 1);
-    pub const FAST: [Self; 4] = [
-        Self::NORMAL,
-        Self::new(2, 1),
-        Self::new(4, 1),
-        Self::new(8, 1),
-    ];
+    pub const NORMAL: Self = Self(1.0);
+    pub const FAST: [Self; 4] = [Self(1.0), Self(2.0), Self(4.0), Self(8.0)];
     /// At a tenth of the speed, a bat's call is ten times lower and long
     /// enough to follow.
-    pub const SLOW: [Self; 4] = [
-        Self::new(1, 10),
-        Self::new(1, 8),
-        Self::new(1, 4),
-        Self::new(1, 2),
-    ];
+    pub const SLOW: [Self; 4] = [Self(0.1), Self(0.125), Self(0.25), Self(0.5)];
+    /// The ends of the speed slider; a speed typed in goes further.
+    pub const SLIDER: RangeInclusive<f64> = 0.001..=1000.0;
+    /// Any slower and a second of sound would last more than a day.
+    pub const SLOWEST: f64 = 1e-5;
+    /// No file could be read faster; most stop sooner, see [`fastest`].
+    pub const FASTEST: f64 = 1e5;
 
-    const fn new(times: u32, over: u32) -> Self {
-        Self { times, over }
+    /// `value` as a speed playback can go at.
+    pub fn new(value: f64) -> Self {
+        if value.is_finite() {
+            Self(value.clamp(Self::SLOWEST, Self::FASTEST))
+        } else {
+            Self::NORMAL
+        }
     }
 
     pub fn value(self) -> f64 {
-        f64::from(self.times) / f64::from(self.over)
+        self.0
     }
 
-    /// The speed offered at `value`.
-    pub fn of(value: f64) -> Option<Self> {
+    /// The preset at `value`, if it is one.
+    pub fn preset(value: f64) -> Option<Self> {
         Self::SLOW
             .into_iter()
             .chain(Self::FAST)
-            .find(|s| (s.value() - value).abs() < 1e-6)
+            .find(|s| (s.0 - value).abs() < 1e-9)
     }
 
     pub fn label(self) -> String {
-        match self.over {
-            1 => format!("{}×", self.times),
-            over => format!("1/{over}×"),
-        }
+        speed_text(self.0)
     }
+}
+
+/// A speed as a label shows it: a whole number of times slower as a
+/// fraction, like 1/8×, and anything else to four significant digits.
+pub fn speed_text(value: f64) -> String {
+    let over = 1.0 / value;
+    if value < 1.0 && (over - over.round()).abs() < 1e-6 {
+        return format!("1/{}×", over.round());
+    }
+    let decimals = (3 - value.log10().floor() as i32).max(0) as usize;
+    let shown = format!("{value:.decimals$}");
+    let shown = if shown.contains('.') {
+        shown.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        &shown
+    };
+    format!("{shown}×")
+}
+
+/// A speed typed as 2, 2.5, 1/8 or 0.125, with × or x or without.
+pub fn parse_speed(text: &str) -> Option<f64> {
+    let marks: &[char] = &['×', 'x', 'X'];
+    let text = text.trim().trim_matches(marks).trim();
+    let value = match text.split_once('/') {
+        Some((a, b)) => a.trim().parse::<f64>().ok()? / b.trim().parse::<f64>().ok()?,
+        None => text.parse().ok()?,
+    };
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+/// The slowest a file at `sample_rate` plays: its highest frequency comes
+/// out at 2.4 Hz, over three octaves below hearing. Any slower only keeps
+/// each start and seek waiting, while the resampler works through the
+/// thousands of frames it makes of each one before the first is heard.
+pub fn slowest(sample_rate: u32) -> f64 {
+    // Frames a second, a ten-thousandth of a 48 kHz file's.
+    const FLOOR: f64 = 4.8;
+    (FLOOR / f64::from(sample_rate)).max(Speed::SLOWEST)
+}
+
+/// The fastest `source` plays: any faster and reading and filtering it
+/// would fall behind the sound going out.
+pub fn fastest(source: &Source, sample_rate: u32) -> f64 {
+    // Frames a second the feeder keeps up with: plain samples read and
+    // filter far faster than a codec decodes.
+    let budget = match source {
+        Source::Pcm { .. } => 5e7,
+        Source::Coded(_) => 1e7,
+    };
+    (budget / f64::from(sample_rate)).min(Speed::FASTEST)
 }
 
 const CHUNK: usize = 1024;
@@ -522,8 +567,7 @@ fn feed(
 struct Renderer {
     input: Box<dyn Frames>,
     frames: usize,
-    resampler: Fft<f32>,
-    shifter: Option<Shifter>,
+    chain: Chain,
     sample_rate: u32,
     device_rate: u32,
     speed: Speed,
@@ -534,28 +578,76 @@ struct Renderer {
     /// the last frame read until this reaches the end, so the resampler's
     /// tail is heard instead of cut off.
     heard: f64,
-    /// Output frames still to drop after a (re)start: the resampler's and
-    /// the shifter's delay, which would otherwise play as a gap and put the
-    /// playhead late.
+    /// Output frames still to drop after a (re)start: the chain's delay,
+    /// which would otherwise play as a gap and put the playhead late.
     skip: usize,
     /// Frames played over and over: reading wraps from the end to the start
     /// and never finishes.
     looping: Option<Range<usize>>,
     block: Vec<[f32; 2]>,
+    thinned: Vec<[f32; 2]>,
     output: Vec<f32>,
 }
 
-fn resampler(sample_rate: u32, device_rate: u32, speed: Speed) -> Result<Fft<f32>, String> {
-    let input_rate = sample_rate as usize * speed.times as usize;
-    let output_rate = device_rate as usize * speed.over as usize;
-    Fft::new(input_rate, output_rate, CHUNK, 2, FixedSync::Input).map_err(|e| {
-        let speed = speed.label();
-        format!("cannot play {sample_rate} Hz audio at {speed} on this output: {e}")
-    })
+/// What the source frames go through on the way out, built for one speed
+/// and pitch.
+struct Chain {
+    /// Source frames to each frame going on: more than one only at speeds
+    /// where the resampler would otherwise have to thin out by far.
+    factor: usize,
+    decimator: Option<Decimator>,
+    shifter: Option<Shifter>,
+    resampler: Async<f32>,
 }
 
-fn shifter(pitch: f32, sample_rate: u32) -> Option<Shifter> {
-    (pitch != 0.0).then(|| Shifter::new(2f32.powf(pitch / 12.0), sample_rate))
+impl Chain {
+    fn new(sample_rate: u32, device_rate: u32, speed: Speed, pitch: f32) -> Result<Self, String> {
+        let ratio = 2f64.powf(f64::from(pitch) / 12.0);
+        let step = step(sample_rate, speed, device_rate);
+        // Thinned by as much as still keeps all that will be heard, pitch
+        // shifted down included, with room for the filter to fall.
+        let factor = ((step * ratio.min(1.0) / 2.0).floor() as usize).max(1);
+        let rate = f64::from(sample_rate) / factor as f64;
+        let out_per_in = f64::from(device_rate) / (rate * speed.value());
+        // Longer where the resampler thins out, so it still falls steeply.
+        let sinc_len = ((128.0 / out_per_in.min(1.0)).ceil() as usize).clamp(256, 2048);
+        let parameters =
+            SincInterpolationParameters::new(sinc_len, WindowFunction::BlackmanHarris2)
+                .oversampling_factor(256);
+        let resampler =
+            Async::<f32>::new_sinc(out_per_in, 1.0, &parameters, CHUNK, 2, FixedAsync::Output)
+                .map_err(|e| {
+                    let speed = speed.label();
+                    format!("cannot play {sample_rate} Hz audio at {speed} on this output: {e}")
+                })?;
+        Ok(Self {
+            factor,
+            decimator: (factor > 1).then(|| Decimator::new(factor)),
+            shifter: (pitch != 0.0).then(|| Shifter::new(ratio as f32, rate)),
+            resampler,
+        })
+    }
+
+    fn reset(&mut self) {
+        if let Some(decimator) = &mut self.decimator {
+            decimator.reset();
+        }
+        if let Some(shifter) = &mut self.shifter {
+            shifter.reset();
+        }
+        self.resampler.reset();
+    }
+
+    /// Output frames that come out ahead of the source frame they start
+    /// from, with `step` source frames to each output frame.
+    fn delay(&self, step: f64) -> usize {
+        let thinned = self.decimator.as_ref().map_or(0.0, |d| d.delay() / step);
+        let shifted = self
+            .shifter
+            .as_ref()
+            .map_or(0.0, |s| s.latency() as f64 * self.factor as f64 / step);
+        self.resampler.output_delay() + (thinned + shifted).round() as usize
+    }
 }
 
 impl Renderer {
@@ -568,14 +660,13 @@ impl Renderer {
         pitch: f32,
         start: usize,
     ) -> Result<Self, String> {
-        let resampler = resampler(sample_rate, device_rate, speed)?;
+        let chain = Chain::new(sample_rate, device_rate, speed, pitch)?;
         let mut renderer = Self {
             input,
             frames,
             skip: 0,
-            output: vec![0.0; 2 * resampler.output_frames_max()],
-            resampler,
-            shifter: shifter(pitch, sample_rate),
+            output: vec![0.0; 2 * chain.resampler.output_frames_max()],
+            chain,
             sample_rate,
             device_rate,
             speed,
@@ -584,6 +675,7 @@ impl Renderer {
             heard: start as f64,
             looping: None,
             block: Vec::new(),
+            thinned: Vec::new(),
         };
         renderer.skip = renderer.delay();
         Ok(renderer)
@@ -595,11 +687,7 @@ impl Renderer {
 
     /// Output frames that come out ahead of the frame they start from.
     fn delay(&self) -> usize {
-        let shifted = self
-            .shifter
-            .as_ref()
-            .map_or(0.0, |s| s.latency() as f64 / self.step());
-        self.resampler.output_delay() + shifted.round() as usize
+        self.chain.delay(self.step())
     }
 
     /// Samples the next block can hold, so ring space is checked first.
@@ -614,20 +702,13 @@ impl Renderer {
         pitch: f32,
         looping: Option<Range<usize>>,
     ) -> Result<(), String> {
-        if speed != self.speed {
-            self.resampler = resampler(self.sample_rate, self.device_rate, speed)?;
+        if speed != self.speed || pitch != self.pitch {
+            self.chain = Chain::new(self.sample_rate, self.device_rate, speed, pitch)?;
             self.output
-                .resize(2 * self.resampler.output_frames_max(), 0.0);
-            self.speed = speed;
+                .resize(2 * self.chain.resampler.output_frames_max(), 0.0);
+            (self.speed, self.pitch) = (speed, pitch);
         }
-        if pitch != self.pitch {
-            self.shifter = shifter(pitch, self.sample_rate);
-            self.pitch = pitch;
-        }
-        self.resampler.reset();
-        if let Some(shifter) = &mut self.shifter {
-            shifter.reset();
-        }
+        self.chain.reset();
         self.skip = self.delay();
         self.next = frame;
         self.heard = frame as f64;
@@ -641,7 +722,14 @@ impl Renderer {
         if self.looping.is_none() && self.heard >= self.frames as f64 {
             return Ok(None);
         }
-        let count = self.resampler.input_frames_next();
+        let Chain {
+            factor,
+            decimator,
+            shifter,
+            resampler,
+        } = &mut self.chain;
+        let wanted = resampler.input_frames_next();
+        let count = wanted * *factor;
         self.block.clear();
         self.block.resize(count, [0.0; 2]);
         match self.looping.clone() {
@@ -666,31 +754,140 @@ impl Renderer {
                 }
             }
         }
-        if let Some(shifter) = &mut self.shifter {
-            shifter.process(&mut self.block);
+        let going_on = match decimator {
+            Some(decimator) => {
+                decimator.process(&self.block, &mut self.thinned);
+                &mut self.thinned
+            }
+            None => &mut self.block,
+        };
+        if let Some(shifter) = shifter {
+            shifter.process(going_on);
         }
-        let input = InterleavedSlice::new(self.block.as_flattened(), 2, count)
-            .map_err(|e| e.to_string())?;
+        let input =
+            InterleavedSlice::new(going_on.as_flattened(), 2, wanted).map_err(|e| e.to_string())?;
         let capacity = self.output.len() / 2;
         let mut output =
             InterleavedSlice::new_mut(&mut self.output, 2, capacity).map_err(|e| e.to_string())?;
-        let (_, produced) = self
-            .resampler
+        let (_, produced) = resampler
             .process_into_buffer(&input, &mut output, None)
             .map_err(|e| e.to_string())?;
         let dropped = produced.min(self.skip);
         self.skip -= dropped;
+        let step = step(self.sample_rate, self.speed, self.device_rate);
         let kept = if self.looping.is_some() {
             produced - dropped
         } else {
             // Up to the last source frame and no further, so playback ends
             // when the recording does.
-            let remaining = ((self.frames as f64 - self.heard) / self.step()).ceil() as usize;
+            let remaining = ((self.frames as f64 - self.heard) / step).ceil() as usize;
             (produced - dropped).min(remaining)
         };
-        self.heard += kept as f64 * self.step();
+        self.heard += kept as f64 * step;
         Ok(Some(&self.output[2 * dropped..2 * (dropped + kept)]))
     }
+}
+
+/// Low-passes and keeps one frame in every `factor`, so a high speed reads
+/// ahead fast without the resampler thinning out by hundreds.
+struct Decimator {
+    factor: usize,
+    /// A windowed sinc, cutting off at the Nyquist frequency of the frames
+    /// kept.
+    taps: Vec<f32>,
+    /// The frames before this block the filter still reaches, oldest first.
+    history: Vec<[f32; 2]>,
+    frames: Vec<[f32; 2]>,
+}
+
+impl Decimator {
+    /// Taps for each frame kept: enough for the filter to fall about 90 dB
+    /// between a frequency kept and one that would fold back onto it.
+    const TAPS_PER_FRAME: usize = 16;
+
+    fn new(factor: usize) -> Self {
+        let len = Self::TAPS_PER_FRAME * factor + 1;
+        let middle = (len - 1) as f64 / 2.0;
+        let cutoff = 0.5 / factor as f64;
+        // Kaiser's window at β 8.6, about 90 dB down.
+        let beta = 8.6;
+        let taps: Vec<f64> = (0..len)
+            .map(|k| {
+                let x = k as f64 - middle;
+                let sinc = if x == 0.0 {
+                    2.0 * cutoff
+                } else {
+                    (std::f64::consts::TAU * cutoff * x).sin() / (std::f64::consts::PI * x)
+                };
+                let edge = (1.0 - (x / middle).powi(2)).max(0.0).sqrt();
+                sinc * bessel_i0(beta * edge) / bessel_i0(beta)
+            })
+            .collect();
+        let sum: f64 = taps.iter().sum();
+        Self {
+            factor,
+            taps: taps.iter().map(|t| (t / sum) as f32).collect(),
+            history: vec![[0.0; 2]; len - 1],
+            frames: Vec::new(),
+        }
+    }
+
+    /// Source frames between one going in and its sound coming out.
+    fn delay(&self) -> f64 {
+        (self.taps.len() - 1) as f64 / 2.0 - (self.factor - 1) as f64
+    }
+
+    fn reset(&mut self) {
+        self.history.fill([0.0; 2]);
+    }
+
+    /// One frame for every `factor` of `block`, whose length is a multiple
+    /// of it.
+    fn process(&mut self, block: &[[f32; 2]], out: &mut Vec<[f32; 2]>) {
+        let (len, held) = (self.taps.len(), self.history.len());
+        self.frames.clear();
+        self.frames.extend_from_slice(&self.history);
+        self.frames.extend_from_slice(block);
+        out.clear();
+        out.extend((1..=block.len() / self.factor).map(|j| {
+            let end = held + j * self.factor;
+            dot(&self.taps, &self.frames[end - len..end])
+        }));
+        self.history
+            .copy_from_slice(&self.frames[self.frames.len() - held..]);
+    }
+}
+
+/// Both channels of `frames` weighted by `taps`, eight at a time so the
+/// compiler can work them side by side.
+fn dot(taps: &[f32], frames: &[[f32; 2]]) -> [f32; 2] {
+    let (mut left, mut right) = ([0.0f32; 8], [0.0f32; 8]);
+    let ((t8, t_rest), (f8, f_rest)) = (taps.as_chunks::<8>(), frames.as_chunks::<8>());
+    for (t, f) in t8.iter().zip(f8) {
+        for i in 0..8 {
+            left[i] += t[i] * f[i][0];
+            right[i] += t[i] * f[i][1];
+        }
+    }
+    let mut out = [left.iter().sum(), right.iter().sum()];
+    for (t, f) in t_rest.iter().zip(f_rest) {
+        out[0] += t * f[0];
+        out[1] += t * f[1];
+    }
+    out
+}
+
+/// The modified Bessel function I0, for Kaiser's window.
+fn bessel_i0(x: f64) -> f64 {
+    let (mut sum, mut term) = (1.0, 1.0);
+    for k in 1..50 {
+        term *= (x / (2.0 * k as f64)).powi(2);
+        sum += term;
+        if term < sum * 1e-12 {
+            break;
+        }
+    }
+    sum
 }
 
 /// Frames overlap this many times over in the shifter.
@@ -700,9 +897,10 @@ const OVERLAP: usize = 8;
 /// vocoder that moves each spectral peak with the bins around it, keeping
 /// their phases locked to the peak's (Laroche and Dolson, "New
 /// phase-vocoder techniques for pitch-shifting", 1999), so a partial keeps
-/// its strength at any ratio. It works at the file's own rate, before the
-/// resampler, so that calls far above hearing are brought down into it
-/// before the resampler would have filtered them out.
+/// its strength at any ratio. It works before the resampler, at the file's
+/// own rate unless a high speed thins the frames out first, so that calls
+/// far above hearing are brought down into it before the resampler would
+/// have filtered them out.
 struct Shifter {
     ratio: f32,
     size: usize,
@@ -739,9 +937,10 @@ fn wrap(angle: f32) -> f32 {
 }
 
 impl Shifter {
-    fn new(ratio: f32, sample_rate: u32) -> Self {
+    /// For frames at `rate` a second.
+    fn new(ratio: f32, rate: f64) -> Self {
         // About 20 ms: shorter smears a call less in time, longer its pitch.
-        let size = (sample_rate as usize / 50).next_power_of_two().max(256);
+        let size = ((rate / 50.0) as usize).next_power_of_two().max(256);
         let bins = size / 2 + 1;
         let mut planner = RealFftPlanner::<f32>::new();
         let voice = Voice {
@@ -937,7 +1136,7 @@ mod tests {
     }
 
     fn renderer(samples: Vec<f32>, rate: u32, device: u32, speed: u32) -> Renderer {
-        shifted(samples, rate, device, Speed::new(speed, 1), 0.0)
+        shifted(samples, rate, device, Speed::new(f64::from(speed)), 0.0)
     }
 
     fn shifted(samples: Vec<f32>, rate: u32, device: u32, speed: Speed, pitch: f32) -> Renderer {
@@ -981,6 +1180,35 @@ mod tests {
     fn middle_rms(signal: &[f32]) -> f32 {
         let middle = &signal[signal.len() / 10..signal.len() * 9 / 10];
         (middle.iter().map(|s| s * s).sum::<f32>() / middle.len() as f32).sqrt()
+    }
+
+    /// The level of `hz` over the middle of `signal` in dBFS, and how far
+    /// below it everything else there sits: a sine and cosine fitted at
+    /// `hz`, which neither a short signal nor `hz` falling between FFT bins
+    /// can throw off.
+    fn fit(signal: &[f32], rate: u32, hz: f64) -> (f64, f64) {
+        let middle = &signal[signal.len() / 10..signal.len() * 9 / 10];
+        let w = std::f64::consts::TAU * hz / f64::from(rate);
+        let wave = |n: usize| (w * n as f64).sin_cos();
+        let (mut a, mut b) = (0.0, 0.0);
+        for (n, &x) in middle.iter().enumerate() {
+            let (sin, cos) = wave(n);
+            a += f64::from(x) * sin;
+            b += f64::from(x) * cos;
+        }
+        let scale = 2.0 / middle.len() as f64;
+        let (a, b) = (a * scale, b * scale);
+        let rest: f64 = middle
+            .iter()
+            .enumerate()
+            .map(|(n, &x)| {
+                let (sin, cos) = wave(n);
+                (f64::from(x) - a * sin - b * cos).powi(2)
+            })
+            .sum();
+        let amplitude = a.hypot(b);
+        let rest = (rest * scale).sqrt();
+        (20.0 * amplitude.log10(), 20.0 * (rest / amplitude).log10())
     }
 
     #[test]
@@ -1117,7 +1345,7 @@ mod tests {
 
     #[test]
     fn slow_speeds_lower_the_pitch_and_lengthen_the_file() {
-        for (speed, expected) in [(Speed::new(1, 2), 500.0), (Speed::new(1, 10), 100.0)] {
+        for (speed, expected) in [(Speed::new(0.5), 500.0), (Speed::new(0.1), 100.0)] {
             let samples = tone(1_000.0, 48_000, 0.5);
             let frames = samples.len();
             let out = render_left(shifted(samples, 48_000, 44_100, speed, 0.0), usize::MAX);
@@ -1133,11 +1361,145 @@ mod tests {
     }
 
     #[test]
-    fn only_offered_speeds_are_found() {
-        assert_eq!(Speed::of(0.125), Some(Speed::new(1, 8)));
-        assert_eq!(Speed::of(2.0), Some(Speed::new(2, 1)));
-        assert_eq!(Speed::of(3.0), None);
-        assert_eq!(Speed::new(1, 10).label(), "1/10×");
+    fn presets_are_found_and_every_speed_reads_back_as_written() {
+        assert_eq!(Speed::preset(0.125), Some(Speed::new(0.125)));
+        assert_eq!(Speed::preset(3.0), None);
+        let labels: Vec<String> = [0.1, 0.5, 1.0, 8.0, 0.001, 2.5, 1000.0, 0.3, 1e-5]
+            .into_iter()
+            .map(speed_text)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "1/10×",
+                "1/2×",
+                "1×",
+                "8×",
+                "1/1000×",
+                "2.5×",
+                "1000×",
+                "0.3×",
+                "1/100000×"
+            ]
+        );
+        for typed in ["2.5", "2.5×", "x2.5", " 5/2 "] {
+            assert_eq!(parse_speed(typed), Some(2.5), "{typed}");
+        }
+        assert_eq!(parse_speed("0"), None);
+        assert_eq!(parse_speed("fast"), None);
+        assert_eq!(Speed::new(1e9).value(), Speed::FASTEST);
+    }
+
+    #[test]
+    fn a_speed_between_the_presets_plays_at_its_pitch_and_length() {
+        let samples = tone(1_000.0, 48_000, 2.0);
+        let frames = samples.len();
+        let out = render_left(
+            shifted(samples, 48_000, 48_000, Speed::new(3.7), 0.0),
+            usize::MAX,
+        );
+        let (hz, _) = peak(&out, 48_000);
+        assert!((hz - 3_700.0).abs() < 12.0, "peak at {hz} Hz");
+        let (level, rest) = fit(&out, 48_000, 3_700.0);
+        assert!(level > -0.1, "{level} dBFS");
+        assert!(rest < -80.0, "the rest {rest} dB below it");
+        let wanted = frames as f64 / 3.7;
+        assert!(
+            (out.len() as f64 - wanted).abs() < 3.0,
+            "{} frames",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn a_thousand_times_faster_brings_infrasound_up_and_filters_the_rest() {
+        // 12 Hz, 200 seconds of it, comes out at 12 kHz in a fifth of a
+        // second.
+        let out = render_left(
+            shifted(
+                tone(12.0, 48_000, 200.0),
+                48_000,
+                48_000,
+                Speed::new(1000.0),
+                0.0,
+            ),
+            usize::MAX,
+        );
+        let (hz, _) = peak(&out, 48_000);
+        assert!((hz - 12_000.0).abs() < 12.0, "peak at {hz} Hz");
+        let (level, rest) = fit(&out, 48_000, 12_000.0);
+        assert!(level > -0.1, "{level} dBFS");
+        assert!(rest < -80.0, "the rest {rest} dB below it");
+        // Everything above 24 Hz would come out past what the output holds,
+        // and must be filtered rather than folded back into hearing.
+        let out = render_left(
+            shifted(
+                tone(1_000.0, 48_000, 200.0),
+                48_000,
+                48_000,
+                Speed::new(1000.0),
+                0.0,
+            ),
+            usize::MAX,
+        );
+        assert!(middle_rms(&out) < 1e-3, "rms {}", middle_rms(&out));
+    }
+
+    #[test]
+    fn a_thousandth_of_the_speed_stretches_the_sound_out() {
+        let samples = tone(20_000.0, 48_000, 0.01);
+        let frames = samples.len();
+        let out = render_left(
+            shifted(samples, 48_000, 48_000, Speed::new(0.001), 0.0),
+            usize::MAX,
+        );
+        let (hz, _) = peak(&out, 48_000);
+        assert!((hz - 20.0).abs() < 6.0, "peak at {hz} Hz");
+        assert!(
+            (out.len() as f64 - frames as f64 * 1000.0).abs() < 3.0,
+            "{} frames",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn the_slowest_speed_loses_nothing_audible_and_starts_soon() {
+        for rate in [8_000, 48_000, 384_000] {
+            let speed = slowest(rate);
+            let top = f64::from(rate) / 2.0 * speed;
+            assert!((top - 2.4).abs() < 1e-9, "{rate} Hz: top at {top} Hz");
+            let mut renderer =
+                shifted(tone(100.0, rate, 1.0), rate, 48_000, Speed::new(speed), 0.0);
+            // The resampler's delay is dropped before anything plays: it
+            // must not take long to work through.
+            let blocks = (1..)
+                .find(|_| renderer.render().unwrap().is_none_or(|b| !b.is_empty()))
+                .unwrap();
+            assert!(
+                blocks < 1_300,
+                "{rate} Hz: first sound after {blocks} blocks"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pitch_shift_still_works_at_a_high_speed() {
+        // 20 Hz at 100 times is 2 kHz, an octave down 1 kHz.
+        let out = render_left(
+            shifted(
+                tone(20.0, 48_000, 20.0),
+                48_000,
+                48_000,
+                Speed::new(100.0),
+                -12.0,
+            ),
+            usize::MAX,
+        );
+        let (hz, _) = peak(&out, 48_000);
+        assert!((hz - 1_000.0).abs() < 12.0, "peak at {hz} Hz");
+        let (level, rest) = fit(&out, 48_000, 1_000.0);
+        assert!(level > -3.0, "{level} dBFS");
+        assert!(rest < -60.0, "the rest {rest} dB below it");
     }
 
     fn stereo_of(file: &[u8], channels: u16) -> (Stereo, std::path::PathBuf) {

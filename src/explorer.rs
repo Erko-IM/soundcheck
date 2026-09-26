@@ -17,7 +17,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "caf", "mka", "webm",
 ];
 
-fn is_audio(path: &Path) -> bool {
+pub(crate) fn is_audio(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| AUDIO_EXTENSIONS.iter().any(|a| a.eq_ignore_ascii_case(e)))
@@ -64,7 +64,7 @@ fn list(dir: &Path) -> Vec<Entry> {
 
 /// Compares names the way file managers do: a run of digits by its value,
 /// so `take 9` comes before `take 10`.
-fn natural(a: &str, b: &str) -> Ordering {
+pub(crate) fn natural(a: &str, b: &str) -> Ordering {
     let (mut a, mut b) = (a, b);
     loop {
         match (a.chars().next(), b.chars().next()) {
