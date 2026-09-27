@@ -199,16 +199,59 @@ pub struct MoveRule {
     pub separator: String,
 }
 
-/// Panel 7: Text added.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// What an insert puts in: the text given, or a number that counts on
+/// from one file to the next.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InsertKind {
+    #[default]
+    Text,
+    Number,
+}
+
+impl InsertKind {
+    pub const ALL: [Self; 2] = [Self::Text, Self::Number];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Text => "Text",
+            Self::Number => "Number",
+        }
+    }
+}
+
+/// Panel 7: Text added, and text or a number put in.
+#[derive(Clone, Debug, PartialEq)]
 pub struct AddRule {
     pub prefix: String,
-    /// Put before the character at `at`, counting from 1; 0 turns it off.
+    pub kind: InsertKind,
     pub insert: String,
+    /// Where the insert goes: before this character, counting from 1; 0
+    /// puts none in.
     pub at: usize,
+    /// The number the first file gets, how much it grows from each file to
+    /// the next, and the fewest digits it has.
+    pub from: i64,
+    pub step: i64,
+    pub digits: usize,
     pub suffix: String,
     /// A space before each capital that follows a small letter or digit.
     pub word_space: bool,
+}
+
+impl Default for AddRule {
+    fn default() -> Self {
+        Self {
+            prefix: String::new(),
+            kind: InsertKind::Text,
+            insert: String::new(),
+            at: 1,
+            from: 1,
+            step: 1,
+            digits: 1,
+            suffix: String::new(),
+            word_space: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -601,13 +644,17 @@ pub fn plan(files: &[Candidate], chosen: &[bool], rules: &Rules) -> Vec<Option<P
     };
     let now = Local::now().naive_local();
     let mut counter = Counter::new(&rules.numbering);
+    // The insert's number, which only chosen files take.
+    let mut inserted = rules.add.from;
     let mut planned: Vec<Option<Planned>> = files
         .iter()
         .zip(chosen)
         .map(|(file, &chosen)| {
             chosen.then(|| {
-                let (name, problem) = match new_name(file, rules, regex.as_ref(), now, &mut counter)
-                {
+                let number = inserted;
+                inserted += rules.add.step;
+                let named = new_name(file, rules, regex.as_ref(), now, &mut counter, number);
+                let (name, problem) = match named {
                     Ok(name) => {
                         let problem = invalid(&name).map(Problem::Invalid);
                         (name, problem)
@@ -738,6 +785,7 @@ fn new_name(
     regex: Option<&Regex>,
     now: NaiveDateTime,
     counter: &mut Counter,
+    inserted: i64,
 ) -> Result<String, Problem> {
     let (mut stem, mut ext) = split(&file.name());
     if let Some(regex) = regex {
@@ -759,7 +807,7 @@ fn new_name(
     stem = recase(&stem, &rules.case);
     stem = remove(&stem, &rules.remove);
     stem = shift(&stem, &rules.moves);
-    stem = add(&stem, &rules.add);
+    stem = add(&stem, &rules.add, inserted);
     if rules.date.side != Side::Off {
         let when = match rules.date.source {
             DateSource::Recorded => file
@@ -1036,7 +1084,8 @@ fn shift(stem: &str, rule: &MoveRule) -> String {
     }
 }
 
-fn add(stem: &str, rule: &AddRule) -> String {
+/// `stem` with `rule`'s text added, and its insert: the text, or `number`.
+fn add(stem: &str, rule: &AddRule, number: i64) -> String {
     let mut s = stem.to_owned();
     if rule.word_space {
         let mut spaced = String::with_capacity(s.len() + 8);
@@ -1050,8 +1099,12 @@ fn add(stem: &str, rule: &AddRule) -> String {
         }
         s = spaced;
     }
-    if rule.at > 0 && !rule.insert.is_empty() {
-        s = insert(&s, &rule.insert, rule.at);
+    let inserted = match rule.kind {
+        InsertKind::Text => rule.insert.clone(),
+        InsertKind::Number => format!("{number:0width$}", width = rule.digits),
+    };
+    if rule.at > 0 && !inserted.is_empty() {
+        s = insert(&s, &inserted, rule.at);
     }
     format!("{}{s}{}", rule.prefix, rule.suffix)
 }
@@ -1428,6 +1481,7 @@ mod tests {
                 at: 5,
                 suffix: "_A".into(),
                 word_space: true,
+                ..AddRule::default()
             },
             ..Rules::default()
         };
@@ -1501,6 +1555,45 @@ mod tests {
         assert_eq!(
             names(&files, &numbered(NumberKind::Lower, 26))[1],
             "aa_b.wav"
+        );
+    }
+
+    #[test]
+    fn an_insert_puts_in_text_or_a_number_counting_on_from_file_to_file() {
+        let files = [file("/f/a1.wav"), file("/f/b2.wav"), file("/f/c3.wav")];
+        let inserted = |kind, from, step| Rules {
+            add: AddRule {
+                kind,
+                insert: "-x-".into(),
+                at: 2,
+                from,
+                step,
+                digits: 2,
+                ..AddRule::default()
+            },
+            ..Rules::default()
+        };
+        assert_eq!(
+            names(&files, &inserted(InsertKind::Text, 1, 1)),
+            ["a-x-1.wav", "b-x-2.wav", "c-x-3.wav"]
+        );
+        assert_eq!(
+            names(&files, &inserted(InsertKind::Number, 7, 5)),
+            ["a071.wav", "b122.wav", "c173.wav"]
+        );
+        // Only the chosen files take a number.
+        let planned = plan(
+            &files,
+            &[true, false, true],
+            &inserted(InsertKind::Number, 1, 1),
+        );
+        let got: Vec<Option<String>> = planned
+            .iter()
+            .map(|p| p.as_ref().map(|p| file_name(&p.to)))
+            .collect();
+        assert_eq!(
+            got,
+            [Some("a011.wav".into()), None, Some("c023.wav".into())]
         );
     }
 

@@ -10,8 +10,8 @@ use chrono::{DateTime, Local, NaiveDateTime};
 use eframe::egui::{self, Color32, KeyboardShortcut, RichText, Sense, TextEdit, Ui, Vec2};
 
 use crate::rename::{
-    self, Candidate, Case, Crop, DATE_FORMATS, DateSource, ExtensionMode, Filters, MoveMode,
-    NameMode, NumberKind, NumberPlace, Place, Planned, Rules, Side,
+    self, Candidate, Case, Crop, DATE_FORMATS, DateSource, ExtensionMode, Filters, InsertKind,
+    MoveMode, NameMode, NumberKind, NumberPlace, Place, Planned, Rules, Side,
 };
 use crate::views;
 
@@ -236,7 +236,7 @@ impl Renamer {
             r.case.except != d.case.except,
             r.remove != d.remove,
             r.moves != d.moves,
-            r.add.insert != d.add.insert || r.add.word_space,
+            r.add.word_space,
             r.date != d.date,
             r.folder != d.folder,
             r.numbering
@@ -291,6 +291,22 @@ impl Renamer {
                     ui.label("after");
                 });
                 ui.end_row();
+                ui.label("Insert");
+                ui.horizontal(|ui| {
+                    insert_box(ui, "rename-simple-insert", &mut rules.add.kind);
+                    if rules.add.kind == InsertKind::Text {
+                        text(ui, &mut rules.add.insert, 90.0);
+                    }
+                    ui.label("at");
+                    count(ui, &mut rules.add.at);
+                });
+                ui.end_row();
+                // A row of its own, as a grid gives a wrapped one no room.
+                if rules.add.kind == InsertKind::Number {
+                    ui.label("");
+                    ui.horizontal(|ui| number_fields(ui, &mut rules.add));
+                    ui.end_row();
+                }
                 ui.label("Number");
                 ui.horizontal(|ui| {
                     let mut on = rules.numbering.place != NumberPlace::Off;
@@ -641,10 +657,16 @@ impl Renamer {
                     row(ui, "Prefix", |ui| text(ui, &mut rule.prefix, f32::INFINITY));
                     ui.horizontal(|ui| {
                         ui.label("Insert");
-                        text(ui, &mut rule.insert, 80.0);
+                        insert_box(ui, "rename-full-insert", &mut rule.kind);
                         ui.label("at");
                         count(ui, &mut rule.at);
                     });
+                    match rule.kind {
+                        InsertKind::Text => text(ui, &mut rule.insert, f32::INFINITY),
+                        InsertKind::Number => {
+                            ui.horizontal(|ui| number_fields(ui, rule));
+                        }
+                    }
                     row(ui, "Suffix", |ui| text(ui, &mut rule.suffix, f32::INFINITY));
                     ui.checkbox(&mut rule.word_space, "Space before capitals");
                 },
@@ -868,6 +890,28 @@ fn row(ui: &mut Ui, label: &str, field: impl FnOnce(&mut Ui)) -> egui::Response 
         field(ui);
     })
     .response
+}
+
+fn insert_box(ui: &mut Ui, id: &str, kind: &mut InsertKind) {
+    egui::ComboBox::from_id_salt(id)
+        .width(72.0)
+        .selected_text(kind.label())
+        .show_ui(ui, |ui| {
+            for k in InsertKind::ALL {
+                ui.selectable_value(kind, k, k.label());
+            }
+        });
+}
+
+/// The inserted number's first value, its step from file to file, and its
+/// fewest digits.
+fn number_fields(ui: &mut Ui, rule: &mut rename::AddRule) {
+    ui.label("from");
+    ui.add(egui::DragValue::new(&mut rule.from));
+    ui.label("step");
+    ui.add(egui::DragValue::new(&mut rule.step));
+    ui.label("digits");
+    ui.add(egui::DragValue::new(&mut rule.digits).range(1..=9));
 }
 
 fn case_box(ui: &mut Ui, id: &str, case: &mut Case) {

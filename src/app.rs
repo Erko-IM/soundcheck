@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontId, Key, KeyboardShortcut, Label, Modifiers, Painter,
-    PointerButton, Rect, Response, RichText, Sense, Stroke, StrokeKind, TextEdit, TextureHandle,
-    TextureOptions, Vec2, ViewportCommand,
+    PointerButton, Pos2, Rect, Response, RichText, Sense, Stroke, StrokeKind, TextEdit,
+    TextureHandle, TextureOptions, Vec2, ViewportCommand,
 };
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +20,7 @@ use crate::edit::Edits;
 use crate::explorer::Explorer;
 use crate::finder::Inbox;
 use crate::levels::{FLOOR_DB, Level};
-use crate::playback::{self, Player, Speed};
+use crate::playback::{self, Player, Region, Speed};
 use crate::probe::{self, Probe};
 use crate::rename;
 use crate::rename_ui::{self, Renamer, Request};
@@ -122,6 +122,9 @@ struct Settings {
     speed_slider: bool,
     /// Playback gain, in dB.
     gain: f32,
+    /// With a channel muted, the rest play in both speakers rather than on
+    /// their own side.
+    both_sides: bool,
     tools: Tools,
     /// Semitones the sound, and the frequencies shown, move with the pitch
     /// shift on.
@@ -157,6 +160,7 @@ impl Default for Settings {
             speed: 1.0,
             speed_slider: false,
             gain: 0.0,
+            both_sides: true,
             tools: Tools::default(),
             pitch: 0.0,
             expansion: 1.0,
@@ -460,9 +464,54 @@ pub struct App {
     renamer: Renamer,
     /// The window with every rename rule is open.
     rename_window: bool,
-    /// Channels 1 and 2 silenced in playback, to hear each mic alone. Kept
-    /// from file to file, not from one run to the next.
-    mute: [bool; 2],
+    /// Channels muted in playback, to hear the others alone. Kept from file
+    /// to file, not from one run to the next.
+    mute: Vec<bool>,
+    /// Areas picked on the spectrogram, played in place of the file.
+    regions: Vec<Region>,
+    /// An area being drawn with Shift held.
+    drawing: Option<Drawing>,
+}
+
+/// An area being drawn with Shift held.
+struct Drawing {
+    /// The spectrogram lane it began in; none on the waveform, where an area
+    /// takes every frequency.
+    lane: Option<Rect>,
+    /// Where the drag began and where it is now: frame, frequency and height
+    /// on screen.
+    from: (f64, f32, f32),
+    to: (f64, f32, f32),
+}
+
+/// The spectrogram's frequency axis, for picking areas: its lanes, and the
+/// band they show from bottom to top.
+struct FreqAxis {
+    lanes: Vec<Rect>,
+    lo: f32,
+    hi: f32,
+    log: bool,
+}
+
+impl FreqAxis {
+    fn lane_at(&self, pos: Pos2) -> Option<Rect> {
+        self.lanes.iter().copied().find(|l| l.contains(pos))
+    }
+
+    /// The frequency at the height of `pos` in `lane`, held within it.
+    fn hz(&self, lane: Rect, pos: Pos2) -> f32 {
+        let t = ((lane.bottom() - pos.y) / lane.height()).clamp(0.0, 1.0);
+        views::freq_at(t, self.lo, self.hi, self.log)
+    }
+
+    /// Where `band` lies up `lane`.
+    fn rows(&self, lane: Rect, band: (f32, f32)) -> egui::Rangef {
+        let y = |f: f32| {
+            let t = views::freq_t(f.clamp(self.lo, self.hi), self.lo, self.hi, self.log);
+            lane.bottom() - t * lane.height()
+        };
+        egui::Rangef::new(y(band.1), y(band.0))
+    }
 }
 
 impl App {
@@ -522,7 +571,9 @@ impl App {
             name_next: None,
             renamer: Renamer::default(),
             rename_window: false,
-            mute: [false; 2],
+            mute: Vec::new(),
+            regions: Vec::new(),
+            drawing: None,
         };
         if let Some(path) = initial.or_else(|| app.inbox.latest()) {
             app.open_external(&cc.egui_ctx, path);
@@ -587,6 +638,8 @@ impl App {
         self.view = 0.0..0.0;
         self.selection = None;
         self.selecting = None;
+        self.regions.clear();
+        self.drawing = None;
         self.cursor = None;
         self.probe = None;
         self.asked = None;
@@ -644,21 +697,19 @@ impl App {
                 Speed::new(
                     set.value()
                         .max(playback::slowest(rate))
-                        .min(playback::fastest(&c.source, rate)),
+                        .min(playback::fastest(&c.source, rate, !self.regions.is_empty())),
                 )
             }
             None => set,
         }
     }
 
-    /// The sides of the output silenced. A mono file plays its one channel
-    /// on both and shows no mute to silence it with.
-    fn muted(&self) -> [bool; 2] {
-        if self.channel_count() > 1 {
-            self.mute
-        } else {
-            [false; 2]
-        }
+    /// Each channel's share of the left and the right, with the mutes.
+    fn heard(&self) -> Vec<[f32; 2]> {
+        let muted: Vec<bool> = (0..self.channel_count())
+            .map(|c| self.mute.get(c) == Some(&true))
+            .collect();
+        playback::mix(&muted, self.settings.both_sides)
     }
 
     /// The preset nearest the speed set, among those shown.
@@ -1207,8 +1258,14 @@ impl App {
         self.set_view(0.0, self.frames() as f64);
     }
 
+    /// Shows the selection, or all the areas, with a margin.
     fn zoom_to_selection(&mut self) {
-        if let Some(s) = &self.selection {
+        let areas = || {
+            let start = self.regions.iter().map(|r| r.frames.start).min()?;
+            let end = self.regions.iter().map(|r| r.frames.end).max()?;
+            Some(start..end)
+        };
+        if let Some(s) = self.selection.clone().or_else(areas) {
             let pad = s.len() as f64 * 0.05;
             self.set_view(s.start as f64 - pad, s.len() as f64 + 2.0 * pad);
         }
@@ -1286,12 +1343,14 @@ impl App {
             start,
             self.speed(),
             self.pitch(),
+            self.heard(),
         ) {
             Ok(player) => {
                 player.set_gain(self.settings.gain);
-                player.set_muted(self.muted());
                 if let Some(range) = &self.selection {
                     player.set_loop(Some(range.clone()));
+                } else if !self.regions.is_empty() {
+                    player.set_regions(self.regions.clone(), start);
                 }
                 self.player = Some(player);
                 true
@@ -1329,10 +1388,15 @@ impl App {
         }
     }
 
-    /// Back to the start: of the selection when there is one, else of the
-    /// file.
+    /// Back to the start: of the selection or the first area when there is
+    /// one, else of the file.
     fn stop(&mut self) {
-        let home = self.selection.as_ref().map_or(0, |s| s.start);
+        let home = self
+            .selection
+            .as_ref()
+            .map(|s| s.start)
+            .or_else(|| self.regions.iter().map(|r| r.frames.start).min())
+            .unwrap_or(0);
         if let Some(player) = &self.player {
             player.pause();
             player.seek(home);
@@ -1346,7 +1410,7 @@ impl App {
     /// switch at the top may have just changed.
     fn tune_player(&self) {
         let Some(player) = &self.player else { return };
-        player.set_muted(self.muted());
+        player.set_mix(self.heard());
         if player.speed() != self.speed() {
             player.set_speed(self.speed());
         }
@@ -1910,25 +1974,6 @@ impl App {
                     player.set_gain(gain);
                 }
             }
-            if self.channel_count() > 1 {
-                for side in 0..2 {
-                    let muted = self.mute[side];
-                    let icon = if muted { "🔇" } else { "🔊" };
-                    let name = self.channel_name(side);
-                    let hint = if muted {
-                        format!("Unmute {name}")
-                    } else {
-                        format!("Mute {name}, to hear the other alone")
-                    };
-                    if ui
-                        .selectable_label(muted, format!("{icon} {}", side + 1))
-                        .on_hover_text(hint)
-                        .clicked()
-                    {
-                        self.mute[side] = !muted;
-                    }
-                }
-            }
             ui.separator();
             if has_file {
                 let rate = self.display_rate();
@@ -1965,8 +2010,9 @@ impl App {
             {
                 self.fit();
             }
+            let selected = self.selection.is_some() || !self.regions.is_empty();
             if ui
-                .add_enabled(self.selection.is_some(), egui::Button::new("Selection"))
+                .add_enabled(selected, egui::Button::new("Selection"))
                 .on_hover_text("S")
                 .clicked()
             {
@@ -1986,6 +2032,14 @@ impl App {
                     .color(views::AXIS),
                 )
                 .on_hover_text("Esc clears it");
+            }
+            if !self.regions.is_empty() {
+                let n = self.regions.len();
+                let areas = if n == 1 { "area" } else { "areas" };
+                ui.label(RichText::new(format!("{n} {areas}")).color(views::AXIS))
+                    .on_hover_text(
+                        "Shift-drag on the spectrogram adds an area, Shift-click on one takes it away, and a plain drag lets them all go",
+                    );
             }
         });
     }
@@ -2402,6 +2456,24 @@ impl App {
             );
         }
         self.overlays(&painter, plot, span);
+        let axis = FreqAxis {
+            lanes: lanes.clone(),
+            lo,
+            hi,
+            log: view.log,
+        };
+        for region in self.regions.iter().chain(&self.drawn()) {
+            let frames = region.frames.start as f64..region.frames.end as f64;
+            for lane in &lanes {
+                views::region(
+                    &painter,
+                    *lane,
+                    span,
+                    &frames,
+                    axis.rows(*lane, region.band),
+                );
+            }
+        }
         let tabs = views::markers_on(&painter, plot, span, self.markers(), true);
         if let Some(pos) = response.hover_pos()
             && let Some(lane) = lanes.iter().find(|l| l.contains(pos))
@@ -2430,7 +2502,7 @@ impl App {
         }
         self.busy(&painter, plot);
         self.marker_tabs(ui, tabs, span);
-        self.plot_input(ui, &response, span);
+        self.plot_input(ui, &response, span, Some(&axis));
     }
 
     fn waveform_view(&mut self, ui: &mut egui::Ui, axis: bool) {
@@ -2482,6 +2554,12 @@ impl App {
             );
         }
         self.overlays(&painter, plot, span);
+        for region in self.regions.iter().chain(&self.drawn()) {
+            let frames = region.frames.start as f64..region.frames.end as f64;
+            for lane in views::lanes(plot, channels) {
+                views::region(&painter, lane, span, &frames, lane.y_range());
+            }
+        }
         // The tabs go on whichever of the two is on top.
         let on_top = !self.settings.views.spectrogram;
         let tabs = views::markers_on(&painter, plot, span, self.markers(), on_top);
@@ -2489,7 +2567,7 @@ impl App {
             self.busy(&painter, plot);
         }
         self.marker_tabs(ui, tabs, span);
-        self.plot_input(ui, &response, span);
+        self.plot_input(ui, &response, span, None);
     }
 
     fn overlays(&self, painter: &Painter, plot: Rect, span: Span) {
@@ -2569,41 +2647,84 @@ impl App {
 
     /// Mouse on a plot, as in the original: click to seek, drag to select,
     /// right-drag to pan, pinch or ⌘/Ctrl-scroll to zoom, sideways scroll to
-    /// pan.
-    fn plot_input(&mut self, ui: &egui::Ui, response: &Response, span: Span) {
+    /// pan. With Shift held, a drag adds an area to play and a click on one
+    /// takes it away; on the spectrogram, `freq`, an area has a band as well
+    /// as a stretch.
+    fn plot_input(
+        &mut self,
+        ui: &egui::Ui,
+        response: &Response,
+        span: Span,
+        freq: Option<&FreqAxis>,
+    ) {
         let (frames, rate) = (self.frames(), self.rate());
+        let shift = ui.input(|i| i.modifiers.shift);
         if response.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
         }
         if response.drag_started_by(PointerButton::Primary) {
-            let from = ui
-                .input(|i| i.pointer.press_origin())
-                .map_or(span.start, |p| span.frame(p.x));
-            self.selecting = Some(from..from);
+            let origin = ui.input(|i| i.pointer.press_origin());
+            let from = origin.map_or(span.start, |p| span.frame(p.x));
+            if shift {
+                let lane = origin.zip(freq).and_then(|(p, f)| f.lane_at(p));
+                let hz = origin
+                    .zip(freq)
+                    .zip(lane)
+                    .map_or(0.0, |((p, f), l)| f.hz(l, p));
+                let y = origin.map_or(0.0, |p| p.y);
+                self.drawing = Some(Drawing {
+                    lane,
+                    from: (from, hz, y),
+                    to: (from, hz, y),
+                });
+            } else {
+                self.selecting = Some(from..from);
+            }
         }
         if response.dragged_by(PointerButton::Primary)
-            && let (Some(selecting), Some(pos)) =
-                (&mut self.selecting, response.interact_pointer_pos())
+            && let Some(pos) = response.interact_pointer_pos()
         {
-            selecting.end = span.frame(pos.x);
+            if let Some(selecting) = &mut self.selecting {
+                selecting.end = span.frame(pos.x);
+            }
+            if let Some(drawing) = &mut self.drawing {
+                let hz = freq.zip(drawing.lane).map_or(0.0, |(f, l)| f.hz(l, pos));
+                drawing.to = (span.frame(pos.x), hz, pos.y);
+            }
         }
-        if response.drag_stopped_by(PointerButton::Primary)
-            && let Some(s) = self.selecting.take()
-        {
-            let (from, to) = (s.start.min(s.end), s.start.max(s.end));
-            // Under a tenth of a second is a slip of the hand, as in the
-            // original.
-            if to - from >= 0.1 * rate {
-                self.select(Some(from as usize..(to as usize).min(frames)));
-            } else {
-                self.select(None);
+        if response.drag_stopped_by(PointerButton::Primary) {
+            if let Some(s) = self.selecting.take() {
+                // A plain drag lets every area go, and selects as it did.
+                self.clear_regions();
+                let (from, to) = (s.start.min(s.end), s.start.max(s.end));
+                // Under a tenth of a second is a slip of the hand, as in the
+                // original.
+                if to - from >= 0.1 * rate {
+                    self.select(Some(from as usize..(to as usize).min(frames)));
+                } else {
+                    self.select(None);
+                }
+            }
+            let drawn = self.drawn();
+            if let (Some(d), Some(mut region)) = (self.drawing.take(), drawn) {
+                region.frames.end = region.frames.end.min(frames);
+                // Too short or too flat to be meant.
+                let tall = d.lane.is_none() || (d.from.2 - d.to.2).abs() >= 3.0;
+                if region.frames.len() as f64 >= 0.05 * rate && tall {
+                    self.add_region(region);
+                }
             }
         }
         if response.clicked_by(PointerButton::Primary)
             && let Some(pos) = response.interact_pointer_pos()
         {
-            self.select(None);
-            self.seek(span.frame(pos.x) as usize);
+            match self.region_at(pos, span, freq).filter(|_| shift) {
+                Some(i) => self.remove_region(i),
+                None => {
+                    self.select(None);
+                    self.seek(span.frame(pos.x) as usize);
+                }
+            }
         }
         if response.dragged_by(PointerButton::Secondary) {
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
@@ -2617,6 +2738,63 @@ impl App {
             if scroll.x != 0.0 {
                 self.pan(-f64::from(scroll.x / span.width) * span.len);
             }
+        }
+    }
+
+    /// The area being drawn, as it would be added: on the waveform, with
+    /// every frequency.
+    fn drawn(&self) -> Option<Region> {
+        let d = self.drawing.as_ref()?;
+        let nyquist = self.current.as_ref().map_or(0.0, |c| c.info.nyquist());
+        Some(Region {
+            frames: d.from.0.min(d.to.0) as usize..d.from.0.max(d.to.0) as usize,
+            band: match d.lane {
+                Some(_) => (d.from.1.min(d.to.1), d.from.1.max(d.to.1)),
+                None => (0.0, nyquist),
+            },
+        })
+    }
+
+    /// The last area drawn under `pos`: in its stretch, and on the
+    /// spectrogram in its band too.
+    fn region_at(&self, pos: Pos2, span: Span, freq: Option<&FreqAxis>) -> Option<usize> {
+        let frame = span.frame(pos.x);
+        let hz = freq.and_then(|f| f.lane_at(pos).map(|lane| f.hz(lane, pos)));
+        self.regions.iter().rposition(|r| {
+            (r.frames.start as f64..r.frames.end as f64).contains(&frame)
+                && hz.is_none_or(|hz| (r.band.0..=r.band.1).contains(&hz))
+        })
+    }
+
+    /// Adds an area, and plays the areas from its start: in place of a
+    /// selection, which it lets go.
+    fn add_region(&mut self, region: Region) {
+        let start = region.frames.start;
+        self.regions.push(region);
+        self.selection = None;
+        self.cursor = Some(start);
+        if self.ensure_player(start)
+            && let Some(player) = &self.player
+        {
+            player.set_regions(self.regions.clone(), start);
+            player.play();
+        }
+    }
+
+    fn remove_region(&mut self, index: usize) {
+        self.regions.remove(index);
+        if let Some(player) = &self.player {
+            player.set_regions(self.regions.clone(), player.position());
+        }
+    }
+
+    fn clear_regions(&mut self) {
+        if self.regions.is_empty() {
+            return;
+        }
+        self.regions.clear();
+        if let Some(player) = &self.player {
+            player.set_regions(Vec::new(), player.position());
         }
     }
 
@@ -2727,22 +2905,27 @@ impl App {
         } else {
             (1..=channels).map(|c| c.to_string()).collect()
         };
+        let names: Vec<String> = (0..channels).map(|c| self.channel_name(c)).collect();
+        let mut muted: Vec<bool> = (0..channels)
+            .map(|c| self.mute.get(c) == Some(&true))
+            .collect();
         // What is heard: the file's level plus the playback gain, over the
-        // stretch of file one screen refresh covers at this speed.
+        // stretch of file one screen refresh covers at this speed, and
+        // nothing from a channel muted.
         let levels = self
             .player
             .as_ref()
             .filter(|p| p.is_playing())
             .map(|player| {
                 let span = f64::from(current.info.sample_rate) * self.speed().value() / 20.0;
-                let (gain, muted) = (self.settings.gain, self.muted());
+                let gain = self.settings.gain;
                 current
                     .levels
                     .at(player.position(), span as usize)
                     .into_iter()
-                    .enumerate()
-                    .map(|(channel, level)| {
-                        if muted.get(channel) == Some(&true) {
+                    .zip(&muted)
+                    .map(|(level, &off)| {
+                        if off {
                             Level {
                                 rms_db: FLOOR_DB,
                                 peak_db: FLOOR_DB,
@@ -2754,7 +2937,13 @@ impl App {
                     .collect::<Vec<_>>()
             });
         ui.add_space(4.0);
-        self.meters.ui(ui, levels.as_deref(), &labels);
+        let both = &mut self.settings.both_sides;
+        self.meters
+            .ui(ui, levels.as_deref(), &labels, &names, &mut muted, both);
+        if self.mute.len() < channels {
+            self.mute.resize(channels, false);
+        }
+        self.mute[..channels].copy_from_slice(&muted);
     }
 
     fn spectrum_view(&mut self, ui: &mut egui::Ui) {

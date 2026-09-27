@@ -23,7 +23,9 @@ Press "r" to reset the selected configuration box, or "shift+r" to reset all the
 Click in the file list, then the up and down arrows move through it, opening each file as you land on it. If the current one is playing, the next one starts playing too.
 Drag the zoomed part of the timeline to move it. After a drag or a click there, left and right move it along (shift for a whole view), up and down make it wider or narrower (shift doubles or halves), and "r" shows the whole file.
 "Slider" next to the speed buttons swaps them for a slider from 1/1000x to 1000x; click its number to type any speed, like 3.7 or 1/250.
-"Rename" under Show renames the files in the explorer's folder; "Bulk rename" opens a window with every rule, laid out like Bulk Rename Utility.
+"Bulk rename" under Show renames all the files in the explorer's folder at once, with an Insert for text or a counting number; "All rules" next to it opens a window with every rule, laid out like Bulk Rename Utility. Click the file name at the top to rename just that file.
+The yellow button next to each meter mutes that channel (it turns red); with "Both speakers" ticked, the channels left play in both speakers.
+Shift-drag on the spectrogram picks an area (a stretch of time and a band of frequencies) and plays just that; add more and they play in turn, together where they overlap. Shift-click one to drop it; a plain drag drops them all.
 The rest should be pretty self-explanatory.
 
 ## License

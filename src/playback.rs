@@ -8,7 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::f32::consts::TAU;
 use std::ops::{Range, RangeInclusive};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -104,16 +104,96 @@ pub fn slowest(sample_rate: u32) -> f64 {
     (FLOOR / f64::from(sample_rate)).max(Speed::SLOWEST)
 }
 
-/// The fastest `source` plays: any faster and reading and filtering it
-/// would fall behind the sound going out.
-pub fn fastest(source: &Source, sample_rate: u32) -> f64 {
+/// The fastest `source` plays, with `regions` or without: any faster and
+/// reading and filtering it would fall behind the sound going out.
+pub fn fastest(source: &Source, sample_rate: u32, regions: bool) -> f64 {
     // Frames a second the feeder keeps up with: plain samples read and
-    // filter far faster than a codec decodes.
-    let budget = match source {
-        Source::Pcm { .. } => 5e7,
-        Source::Coded(_) => 1e7,
+    // filter far faster than a codec decodes, and taking regions' bands out
+    // of them is slower than either.
+    let budget = match (source, regions) {
+        (_, true) => 5e6,
+        (Source::Pcm { .. }, false) => 5e7,
+        (Source::Coded(_), false) => 1e7,
     };
     (budget / f64::from(sample_rate)).min(Speed::FASTEST)
+}
+
+/// A stretch of time and band of frequencies, played with the rest of the
+/// file left out: an area picked on the spectrogram.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Region {
+    pub frames: Range<usize>,
+    /// Lowest and highest frequency, in the file's own Hz.
+    pub band: (f32, f32),
+}
+
+/// Frames in each step of the transform regions play through: about 40 ms,
+/// fine enough in frequency to cut close to a band's edges.
+fn region_frame(sample_rate: u32) -> usize {
+    (sample_rate as usize / 24).next_power_of_two().max(256)
+}
+
+/// Where playback goes with `regions`: each one's stretch with the half
+/// step of the transform either side that fades it in and out, those that
+/// meet joined, in order.
+pub fn segments(regions: &[Region], sample_rate: u32, frames: usize) -> Vec<Range<usize>> {
+    let fade = region_frame(sample_rate) / 2;
+    let mut spans: Vec<Range<usize>> = regions
+        .iter()
+        .map(|r| r.frames.start.saturating_sub(fade)..(r.frames.end + fade).min(frames))
+        .filter(|s| !s.is_empty())
+        .collect();
+    spans.sort_by_key(|s| s.start);
+    let mut joined: Vec<Range<usize>> = Vec::new();
+    for span in spans {
+        match joined.last_mut() {
+            Some(last) if span.start <= last.end => last.end = last.end.max(span.end),
+            _ => joined.push(span),
+        }
+    }
+    joined
+}
+
+/// `frame` where a stretch holds it, else the start of the next, or of the
+/// first once past them all.
+fn into_stretches(stretches: &[Range<usize>], frame: usize) -> usize {
+    match stretches.iter().find(|s| frame < s.end) {
+        Some(s) => frame.max(s.start),
+        None => stretches.first().map_or(frame, |s| s.start),
+    }
+}
+
+/// Each channel's share of the left and the right. Channels take turns,
+/// left then right, and a mono file plays on both. A muted channel is left
+/// out; with `both`, the rest then play in both speakers rather than on
+/// their own side.
+pub fn mix(muted: &[bool], both: bool) -> Vec<[f32; 2]> {
+    if let [muted] = muted {
+        let on = if *muted { 0.0 } else { 1.0 };
+        return vec![[on, on]];
+    }
+    let heard = muted.iter().filter(|m| !**m).count();
+    if both && heard < muted.len() {
+        let share = 1.0 / heard.max(1) as f32;
+        return muted
+            .iter()
+            .map(|&m| if m { [0.0; 2] } else { [share; 2] })
+            .collect();
+    }
+    // Each side's channels share it, muted or not, so muting one leaves the
+    // others as loud as they were.
+    let per_side = [muted.len().div_ceil(2), muted.len() / 2];
+    muted
+        .iter()
+        .enumerate()
+        .map(|(c, &m)| {
+            let mut gains = [0.0; 2];
+            if !m {
+                gains[c % 2] = 1.0 / per_side[c % 2] as f32;
+            }
+            gains
+        })
+        .collect()
 }
 
 const CHUNK: usize = 1024;
@@ -133,9 +213,6 @@ struct Shared {
     /// Linear gain as `f32` bits, applied on the way out so a change is
     /// heard at once rather than after the second of audio already queued.
     gain: AtomicU32,
-    /// The sides silenced, left in the lowest bit, applied on the way out
-    /// like the gain.
-    muted: AtomicU8,
     failure: Mutex<Option<String>>,
 }
 
@@ -167,18 +244,22 @@ struct Playhead {
     position: f64,
     /// Source frames per output frame.
     step: f64,
-    /// The frames being repeated: `position` wraps where the rendered audio
-    /// did.
-    looping: Option<Range<f64>>,
+    /// The stretches played round and round, in order: `position` goes on
+    /// from the end of one to the start of the next, and from the last back
+    /// to the first, where the rendered audio did.
+    looping: Vec<Range<f64>>,
 }
 
 impl Playhead {
     fn advance(&mut self) {
+        let from = self.position;
         self.position += self.step;
-        if let Some(r) = &self.looping
-            && self.position >= r.end
+        let stretches = &self.looping;
+        if let Some(i) = stretches.iter().position(|s| from < s.end)
+            && self.position >= stretches[i].end
         {
-            self.position -= r.end - r.start;
+            let next = &stretches[(i + 1) % stretches.len()];
+            self.position = next.start + (self.position - stretches[i].end);
         }
     }
 }
@@ -189,7 +270,9 @@ struct Restart {
     /// Semitones.
     pitch: f32,
     seek: u16,
-    looping: Option<Range<usize>>,
+    looping: Vec<Range<usize>>,
+    regions: Vec<Region>,
+    mix: Vec<[f32; 2]>,
 }
 
 enum Command {
@@ -205,9 +288,14 @@ pub struct Player {
     feeder: Option<JoinHandle<()>>,
     stream: cpal::Stream,
     frames: usize,
+    sample_rate: u32,
     speed: Cell<Speed>,
     pitch: Cell<f32>,
-    looping: RefCell<Option<Range<usize>>>,
+    /// The stretches played round and round: a selection, or where the
+    /// regions are. None plays the file through.
+    looping: RefCell<Vec<Range<usize>>>,
+    regions: RefCell<Vec<Region>>,
+    mix: RefCell<Vec<[f32; 2]>>,
     /// Seeks sent so far, and where the last one went: until the feeder has
     /// acted on it, playback is wherever it was last sent.
     seeks: Cell<u16>,
@@ -215,13 +303,15 @@ pub struct Player {
 }
 
 impl Player {
-    /// Plays from `start` at `speed`, `pitch` semitones up or down.
+    /// Plays from `start` at `speed`, `pitch` semitones up or down, each
+    /// channel mixed in as `mix` has it.
     pub fn new(
         source: &Source,
         info: &Info,
         start: usize,
         speed: Speed,
         pitch: f32,
+        mix: Vec<[f32; 2]>,
     ) -> Result<Self, String> {
         let (sample_rate, frames) = (info.sample_rate, info.frames);
         let channels = usize::from(info.channels);
@@ -240,7 +330,6 @@ impl Player {
             position: AtomicU64::new(pack(0, start as f64)),
             finished: AtomicU32::new(0),
             gain: AtomicU32::new(1.0f32.to_bits()),
-            muted: AtomicU8::new(0),
             failure: Mutex::new(None),
         });
         // A second of stereo.
@@ -250,7 +339,7 @@ impl Player {
             seek: 0,
             position: start as f64,
             step: step(sample_rate, speed, device_rate),
-            looping: None,
+            looping: Vec::new(),
         }));
         let stream = match format {
             SampleFormat::F32 => build::<f32>(&device, config, &playhead, &shared),
@@ -262,7 +351,7 @@ impl Player {
 
         let (commands, inbox) = mpsc::channel();
         let feeder = std::thread::spawn({
-            let (shared, source) = (Arc::clone(&shared), source.clone());
+            let (shared, source, mix) = (Arc::clone(&shared), source.clone(), mix.clone());
             move || {
                 // Opened here rather than on the UI thread, which a slow
                 // disk would stall.
@@ -271,6 +360,7 @@ impl Player {
                         reader,
                         channels,
                         scratch: Vec::new(),
+                        mix,
                     });
                     Renderer::new(input, frames, sample_rate, device_rate, speed, pitch, start)
                 });
@@ -286,9 +376,12 @@ impl Player {
             feeder: Some(feeder),
             stream,
             frames,
+            sample_rate,
             speed: Cell::new(speed),
             pitch: Cell::new(pitch),
-            looping: RefCell::new(None),
+            looping: RefCell::new(Vec::new()),
+            regions: RefCell::new(Vec::new()),
+            mix: RefCell::new(mix),
             seeks: Cell::new(0),
             target: Cell::new(start),
         })
@@ -371,29 +464,41 @@ impl Player {
         self.shared.gain.store(gain.to_bits(), Ordering::Relaxed);
     }
 
-    /// Silences the left or right of what plays, heard at once.
-    pub fn set_muted(&self, muted: [bool; 2]) {
-        self.shared.muted.store(mute_bits(muted), Ordering::Relaxed);
+    /// Takes each channel's share of the left and the right, as [`mix`]
+    /// gives it, from where playback is.
+    pub fn set_mix(&self, mix: Vec<[f32; 2]>) {
+        if *self.mix.borrow() != mix {
+            self.mix.replace(mix);
+            self.restart(self.position());
+        }
     }
 
     /// Repeats `range` from its start, or stops repeating where playback
-    /// now is.
+    /// now is. Either way, no regions play.
     pub fn set_loop(&self, range: Option<Range<usize>>) {
         let range = range
             .map(|r| r.start.min(self.frames)..r.end.min(self.frames))
             .filter(|r| !r.is_empty());
         let from = range.as_ref().map_or_else(|| self.position(), |r| r.start);
-        self.looping.replace(range);
+        self.looping.replace(range.into_iter().collect());
+        self.regions.borrow_mut().clear();
+        self.seek(from);
+    }
+
+    /// Plays only `regions`, from `from` on: one after another, together
+    /// where they overlap, round and round. None plays the file through
+    /// again.
+    pub fn set_regions(&self, regions: Vec<Region>, from: usize) {
+        self.looping
+            .replace(segments(&regions, self.sample_rate, self.frames));
+        self.regions.replace(regions);
         self.seek(from);
     }
 
     fn restart(&self, frame: usize) {
         let seek = self.seeks.get().wrapping_add(1);
         let looping = self.looping.borrow().clone();
-        let frame = match &looping {
-            Some(r) if frame >= r.end => r.start,
-            _ => frame.min(self.frames),
-        };
+        let frame = into_stretches(&looping, frame.min(self.frames));
         self.seeks.set(seek);
         self.target.set(frame);
         // The feeder only stops on `Quit`, which only `Drop` sends, so this
@@ -404,6 +509,8 @@ impl Player {
             pitch: self.pitch.get(),
             seek,
             looping,
+            regions: self.regions.borrow().clone(),
+            mix: self.mix.borrow().clone(),
         }));
     }
 }
@@ -415,16 +522,6 @@ impl Drop for Player {
             let _ = feeder.join();
         }
     }
-}
-
-fn mute_bits(muted: [bool; 2]) -> u8 {
-    u8::from(muted[0]) | u8::from(muted[1]) << 1
-}
-
-/// The gain for the left and the right on the way out: `gain`, or none for
-/// a side `muted` has the bit of.
-fn side_gains(gain: f32, muted: u8) -> [f32; 2] {
-    [0, 1].map(|side| if muted & (1 << side) == 0 { gain } else { 0.0 })
 }
 
 fn step(sample_rate: u32, speed: Speed, device_rate: u32) -> f64 {
@@ -456,8 +553,7 @@ where
                     return;
                 };
                 let gain = f32::from_bits(state.gain.load(Ordering::Relaxed));
-                let gains = side_gains(gain, state.muted.load(Ordering::Relaxed));
-                let level = |s: f32, side: usize| (s * gains[side]).clamp(-1.0, 1.0);
+                let level = |s: f32| (s * gain).clamp(-1.0, 1.0);
                 for frame in out.chunks_mut(channels) {
                     // Blocks go in whole, so two queued samples are always a
                     // left and its right.
@@ -465,8 +561,8 @@ where
                         frame.fill(T::EQUILIBRIUM);
                         continue;
                     }
-                    let left = level(head.ring.pop().unwrap_or(0.0), 0);
-                    let right = level(head.ring.pop().unwrap_or(0.0), 1);
+                    let left = level(head.ring.pop().unwrap_or(0.0));
+                    let right = level(head.ring.pop().unwrap_or(0.0));
                     head.advance();
                     match frame {
                         [mono] => *mono = T::from_sample(0.5 * (left + right)),
@@ -525,10 +621,15 @@ fn feed(
             pitch,
             seek: number,
             looping,
+            regions,
+            mix,
         }) = restart
         {
-            let wrap = looping.as_ref().map(|r| r.start as f64..r.end as f64);
-            if let Err(e) = renderer.restart(frame, speed, pitch, looping) {
+            let wrap = looping
+                .iter()
+                .map(|r| r.start as f64..r.end as f64)
+                .collect();
+            if let Err(e) = renderer.restart(frame, speed, pitch, looping, regions, &mix) {
                 shared.fail(e);
                 return;
             }
@@ -601,9 +702,12 @@ struct Renderer {
     /// Output frames still to drop after a (re)start: the chain's delay,
     /// which would otherwise play as a gap and put the playhead late.
     skip: usize,
-    /// Frames played over and over: reading wraps from the end to the start
-    /// and never finishes.
-    looping: Option<Range<usize>>,
+    /// The stretches played round and round, reading on from the end of one
+    /// to the start of the next, and never finishing. None plays the file
+    /// through to its end.
+    looping: Vec<Range<usize>>,
+    /// Takes the regions' bands out of what is read, while they play.
+    regions: Option<Regions>,
     block: Vec<[f32; 2]>,
     thinned: Vec<[f32; 2]>,
     output: Vec<f32>,
@@ -693,7 +797,8 @@ impl Renderer {
             pitch,
             next: start,
             heard: start as f64,
-            looping: None,
+            looping: Vec::new(),
+            regions: None,
             block: Vec::new(),
             thinned: Vec::new(),
         };
@@ -720,8 +825,16 @@ impl Renderer {
         frame: usize,
         speed: Speed,
         pitch: f32,
-        looping: Option<Range<usize>>,
+        looping: Vec<Range<usize>>,
+        regions: Vec<Region>,
+        mix: &[[f32; 2]],
     ) -> Result<(), String> {
+        self.input.set_mix(mix);
+        if regions.is_empty() {
+            self.regions = None;
+        } else if self.regions.as_ref().is_none_or(|r| r.regions != regions) {
+            self.regions = Some(Regions::new(regions, self.sample_rate));
+        }
         if speed != self.speed || pitch != self.pitch {
             self.chain = Chain::new(self.sample_rate, self.device_rate, speed, pitch)?;
             self.output
@@ -739,7 +852,7 @@ impl Renderer {
     /// The next block of interleaved stereo, or `None` once all of the
     /// source has been played.
     fn render(&mut self) -> Result<Option<&[f32]>, String> {
-        if self.looping.is_none() && self.heard >= self.frames as f64 {
+        if self.looping.is_empty() && self.heard >= self.frames as f64 {
             return Ok(None);
         }
         let Chain {
@@ -752,26 +865,30 @@ impl Renderer {
         let count = wanted * *factor;
         self.block.clear();
         self.block.resize(count, [0.0; 2]);
-        match self.looping.clone() {
-            None => {
-                let available = self.frames.saturating_sub(self.next).min(count);
-                if available > 0 {
-                    self.input.read(self.next, &mut self.block[..available])?;
-                }
-                self.next += count;
+        if self.looping.is_empty() {
+            let available = self.frames.saturating_sub(self.next).min(count);
+            if available > 0 {
+                self.input.read(self.next, &mut self.block[..available])?;
             }
-            Some(range) => {
-                let mut filled = 0;
-                while filled < count {
-                    if self.next >= range.end {
-                        self.next = range.start;
-                    }
-                    let n = (range.end - self.next).min(count - filled);
-                    self.input
-                        .read(self.next, &mut self.block[filled..filled + n])?;
-                    filled += n;
-                    self.next += n;
+            self.next += count;
+        } else {
+            let mut filled = 0;
+            while filled < count {
+                let stretch = into_stretches(&self.looping, self.next);
+                let end = self
+                    .looping
+                    .iter()
+                    .find(|s| s.contains(&stretch))
+                    .map_or(stretch, |s| s.end);
+                self.next = stretch;
+                let n = (end - self.next).min(count - filled);
+                let out = &mut self.block[filled..filled + n];
+                match &mut self.regions {
+                    Some(regions) => regions.read(&mut *self.input, self.frames, self.next, out)?,
+                    None => self.input.read(self.next, out)?,
                 }
+                filled += n;
+                self.next += n;
             }
         }
         let going_on = match decimator {
@@ -795,7 +912,7 @@ impl Renderer {
         let dropped = produced.min(self.skip);
         self.skip -= dropped;
         let step = step(self.sample_rate, self.speed, self.device_rate);
-        let kept = if self.looping.is_some() {
+        let kept = if !self.looping.is_empty() {
             produced - dropped
         } else {
             // Up to the last source frame and no further, so playback ends
@@ -1108,6 +1225,9 @@ trait Frames {
     /// Fills `out` with the frames from `first` on. Never asked for frames
     /// past the end.
     fn read(&mut self, first: usize, out: &mut [[f32; 2]]) -> Result<(), String>;
+
+    /// Takes each channel's share of the left and the right from now on.
+    fn set_mix(&mut self, _mix: &[[f32; 2]]) {}
 }
 
 /// The first two channels of a file: mono is doubled, and channels past
@@ -1116,6 +1236,8 @@ struct Stereo {
     reader: Reader,
     channels: usize,
     scratch: Vec<f32>,
+    /// Each channel's share of the left and the right, as [`mix`] gives it.
+    mix: Vec<[f32; 2]>,
 }
 
 impl Frames for Stereo {
@@ -1123,9 +1245,149 @@ impl Frames for Stereo {
         let ch = self.channels;
         self.scratch.resize(out.len() * ch, 0.0);
         self.reader.read(first, &mut self.scratch)?;
-        let right = usize::from(ch > 1);
         for (pair, frame) in out.iter_mut().zip(self.scratch.chunks_exact(ch)) {
-            *pair = [frame[0], frame[right]];
+            *pair = frame
+                .iter()
+                .zip(&self.mix)
+                .fold([0.0; 2], |[l, r], (s, g)| [l + s * g[0], r + s * g[1]]);
+        }
+        Ok(())
+    }
+
+    fn set_mix(&mut self, mix: &[[f32; 2]]) {
+        self.mix.clear();
+        self.mix.extend_from_slice(mix);
+    }
+}
+
+/// Only the regions of what is read: step by step of a short-time
+/// transform, each step keeping the bands of the regions whose stretch
+/// holds its middle, and nothing where none does. The steps sit on a grid
+/// fixed to the file, so reads in any pieces add up to the same sound.
+struct Regions {
+    regions: Vec<Region>,
+    size: usize,
+    hop: usize,
+    /// The square root of a Hann window, on the way in and again on the way
+    /// out, so the steps add back up to what went in.
+    window: Vec<f32>,
+    bin_hz: f32,
+    forward: Arc<dyn RealToComplex<f32>>,
+    inverse: Arc<dyn ComplexToReal<f32>>,
+    input: Vec<[f32; 2]>,
+    frame: Vec<f32>,
+    spectrum: Vec<Complex<f32>>,
+    /// How much of each bin the regions around the last step keep, and
+    /// which regions those were.
+    mask: Vec<f32>,
+    masked: Vec<usize>,
+}
+
+impl Regions {
+    fn new(regions: Vec<Region>, sample_rate: u32) -> Self {
+        let size = region_frame(sample_rate);
+        let mut planner = RealFftPlanner::<f32>::new();
+        Self {
+            regions,
+            size,
+            hop: size / 4,
+            window: (0..size)
+                .map(|i| (std::f32::consts::PI * i as f32 / size as f32).sin())
+                .collect(),
+            bin_hz: sample_rate as f32 / size as f32,
+            forward: planner.plan_fft_forward(size),
+            inverse: planner.plan_fft_inverse(size),
+            input: Vec::new(),
+            frame: vec![0.0; size],
+            spectrum: vec![Complex::default(); size / 2 + 1],
+            mask: vec![0.0; size / 2 + 1],
+            masked: Vec::new(),
+        }
+    }
+
+    /// Sets the mask for the regions around frame `middle`, or finds there
+    /// are none.
+    fn mask_at(&mut self, middle: i64) -> bool {
+        let around: Vec<usize> = (0..self.regions.len())
+            .filter(|&i| {
+                let r = &self.regions[i].frames;
+                (r.start as i64..r.end as i64).contains(&middle)
+            })
+            .collect();
+        if around != self.masked {
+            let bin_hz = self.bin_hz;
+            self.mask.fill(0.0);
+            for &i in &around {
+                let (lo, hi) = self.regions[i].band;
+                for (bin, keep) in self.mask.iter_mut().enumerate() {
+                    let f = bin as f32 * bin_hz;
+                    // Two bins of fall either side, so the edges do not ring.
+                    let past = ((lo - f).max(f - hi) / (2.0 * bin_hz)).clamp(0.0, 1.0);
+                    *keep = keep.max(0.5 + 0.5 * (std::f32::consts::PI * past).cos());
+                }
+            }
+            self.masked = around;
+        }
+        !self.masked.is_empty()
+    }
+
+    /// `out` from frame `first` of `inner`, `frames` long, through the
+    /// regions.
+    fn read(
+        &mut self,
+        inner: &mut dyn Frames,
+        frames: usize,
+        first: usize,
+        out: &mut [[f32; 2]],
+    ) -> Result<(), String> {
+        out.fill([0.0; 2]);
+        let (size, hop) = (self.size as i64, self.hop as i64);
+        let (start, end) = (first as i64, (first + out.len()) as i64);
+        // Every step reaching into `out`, and the input under them all.
+        let (k0, k1) = (
+            (start - size).div_euclid(hop) + 1,
+            (end - 1).div_euclid(hop),
+        );
+        let from = k0 * hop;
+        self.input.clear();
+        self.input
+            .resize((k1 * hop + size - from) as usize, [0.0; 2]);
+        let (a, b) = (from.max(0), (k1 * hop + size).min(frames as i64));
+        if a < b {
+            inner.read(
+                a as usize,
+                &mut self.input[(a - from) as usize..(b - from) as usize],
+            )?;
+        }
+        // The inverse transform comes out `size` times over, and the
+        // windows overlap to twice what went in.
+        let scale = 1.0 / (2.0 * size as f32);
+        for k in k0..=k1 {
+            if !self.mask_at(k * hop + size / 2) {
+                continue;
+            }
+            let base = (k * hop - from) as usize;
+            let inside = ((start - k * hop).max(0) as usize)..((end - k * hop).min(size) as usize);
+            for channel in 0..2 {
+                let taken = &self.input[base..base + self.size];
+                for ((f, x), w) in self.frame.iter_mut().zip(taken).zip(&self.window) {
+                    *f = x[channel] * w;
+                }
+                // The buffers are the sizes the plans were made for, so
+                // neither transform can fail.
+                let _ = self.forward.process(&mut self.frame, &mut self.spectrum);
+                for (s, keep) in self.spectrum.iter_mut().zip(&self.mask) {
+                    *s *= *keep;
+                }
+                let last = self.spectrum.len() - 1;
+                self.spectrum[0].im = 0.0;
+                self.spectrum[last].im = 0.0;
+                let _ = self.inverse.process(&mut self.spectrum, &mut self.frame);
+                for i in inside.clone() {
+                    let t = (k * hop + i as i64 - start) as usize;
+                    out[t][channel] += self.frame[i] * self.window[i] * scale;
+                }
+            }
         }
         Ok(())
     }
@@ -1266,7 +1528,14 @@ mod tests {
         samples[24_000..].fill(0.5);
         let mut looped = renderer(samples, 48_000, 44_100, 1);
         looped
-            .restart(30_000, Speed::NORMAL, 0.0, Some(24_000..48_000))
+            .restart(
+                30_000,
+                Speed::NORMAL,
+                0.0,
+                std::iter::once(24_000..48_000).collect(),
+                Vec::new(),
+                &[],
+            )
             .unwrap();
         let out = render_left(looped, 200_000);
         assert!(out.len() >= 200_000, "stopped after {} frames", out.len());
@@ -1285,7 +1554,7 @@ mod tests {
             seek: 0,
             position: 2_999.5,
             step: 1.0,
-            looping: Some(1_000.0..3_000.0),
+            looping: vec![1_000.0..3_000.0],
         };
         head.advance();
         assert_eq!(head.position, 1_000.5);
@@ -1535,12 +1804,13 @@ mod tests {
             reader,
             channels: usize::from(channels),
             scratch: Vec::new(),
+            mix: mix(&vec![false; usize::from(channels)], true),
         };
         (stereo, path)
     }
 
     #[test]
-    fn mono_is_doubled_and_channels_past_two_are_left_out() {
+    fn mono_plays_on_both_sides_and_channels_take_turns_left_then_right() {
         let (mut mono, path) = stereo_of(&wav::tests::build(false, &[], &[0, 16_384, -16_384]), 1);
         let mut out = [[0.0; 2]; 2];
         mono.read(1, &mut out).unwrap();
@@ -1552,15 +1822,111 @@ mod tests {
         let (mut three, path) = stereo_of(&file, 3);
         three.read(1, &mut out).unwrap();
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(out[0], [0.0, 0.5]);
+        // Channels 1 and 3 share the left, 2 has the right to itself.
+        assert_eq!(out[0], [-0.25, 0.5]);
     }
 
     #[test]
-    fn a_muted_side_is_silenced_and_the_other_plays_on() {
-        assert_eq!(side_gains(0.5, mute_bits([true, false])), [0.0, 0.5]);
-        assert_eq!(side_gains(0.5, mute_bits([false, true])), [0.5, 0.0]);
-        assert_eq!(side_gains(0.5, mute_bits([false; 2])), [0.5; 2]);
-        assert_eq!(side_gains(0.5, mute_bits([true; 2])), [0.0; 2]);
+    fn a_muted_mic_is_left_out_and_the_rest_play_in_both_speakers() {
+        assert_eq!(mix(&[false, false], true), [[1.0, 0.0], [0.0, 1.0]]);
+        assert_eq!(mix(&[true, false], true), [[0.0, 0.0], [1.0, 1.0]]);
+        assert_eq!(mix(&[true, false], false), [[0.0, 0.0], [0.0, 1.0]]);
+        assert_eq!(mix(&[true, true], true), [[0.0; 2]; 2]);
+        assert_eq!(mix(&[true], true), [[0.0; 2]]);
+        let third = 1.0 / 3.0;
+        assert_eq!(
+            mix(&[false, true, false, false], true),
+            [[third; 2], [0.0; 2], [third; 2], [third; 2]]
+        );
+        assert_eq!(
+            mix(&[false, false, true], false),
+            [[0.5, 0.0], [0.0, 1.0], [0.0, 0.0]]
+        );
+    }
+
+    #[test]
+    fn the_playhead_goes_on_from_stretch_to_stretch_and_round() {
+        let (_, ring) = rtrb::RingBuffer::new(2);
+        let mut head = Playhead {
+            ring,
+            seek: 0,
+            position: 999.5,
+            step: 1.0,
+            looping: vec![0.0..1_000.0, 5_000.0..6_000.0],
+        };
+        head.advance();
+        assert_eq!(head.position, 5_000.5);
+        head.position = 5_999.5;
+        head.advance();
+        assert_eq!(head.position, 0.5);
+        assert_eq!(into_stretches(&[10..20, 30..40], 25), 30);
+        assert_eq!(into_stretches(&[10..20, 30..40], 45), 10);
+        assert_eq!(into_stretches(&[10..20, 30..40], 15), 15);
+    }
+
+    fn region(from: f64, to: f64, band: (f32, f32)) -> Region {
+        Region {
+            frames: (from * 48_000.0) as usize..(to * 48_000.0) as usize,
+            band,
+        }
+    }
+
+    #[test]
+    fn a_region_plays_its_band_and_leaves_the_rest_out() {
+        let mut samples = tone(1_000.0, 48_000, 2.0);
+        for (s, t) in samples.iter_mut().zip(tone(6_000.0, 48_000, 2.0)) {
+            *s = 0.5 * (*s + t);
+        }
+        let mut renderer = shifted(samples, 48_000, 48_000, Speed::NORMAL, 0.0);
+        let regions = vec![region(0.5, 1.5, (4_000.0, 8_000.0))];
+        let stretches = segments(&regions, 48_000, 96_000);
+        assert_eq!((stretches.len(), &stretches[0]), (1, &(22_976..73_024)));
+        renderer
+            .restart(24_000, Speed::NORMAL, 0.0, stretches, regions, &[])
+            .unwrap();
+        let out = render_left(renderer, 48_000);
+        let (kept, rest) = fit(&out, 48_000, 6_000.0);
+        let (gone, _) = fit(&out, 48_000, 1_000.0);
+        assert!(
+            (kept + 6.02).abs() < 0.2,
+            "6 kHz at {kept} dBFS, the rest {rest} dB below"
+        );
+        assert!(gone < -70.0, "1 kHz at {gone} dBFS");
+    }
+
+    #[test]
+    fn regions_play_in_turn_together_where_they_overlap() {
+        let mut samples = tone(1_000.0, 48_000, 3.0);
+        for (s, t) in samples.iter_mut().zip(tone(6_000.0, 48_000, 3.0)) {
+            *s = 0.5 * (*s + t);
+        }
+        let regions = vec![
+            region(0.2, 1.0, (4_000.0, 8_000.0)),
+            region(0.6, 1.4, (500.0, 2_000.0)),
+            region(2.2, 2.6, (4_000.0, 8_000.0)),
+        ];
+        let stretches = segments(&regions, 48_000, 144_000);
+        assert_eq!(stretches, [8_576..68_224, 104_576..125_824]);
+        let mut renderer = shifted(samples, 48_000, 48_000, Speed::NORMAL, 0.0);
+        renderer
+            .restart(8_576, Speed::NORMAL, 0.0, stretches, regions, &[])
+            .unwrap();
+        // Once round: the first stretch, then straight on to the second.
+        let out = render_left(renderer, 59_648 + 21_248);
+        let both = &out[(0.8 * 48_000.0) as usize - 8_576..(1.0 * 48_000.0) as usize - 8_576];
+        let (high, _) = fit(both, 48_000, 6_000.0);
+        let (low, _) = fit(both, 48_000, 1_000.0);
+        assert!(
+            high > -6.5 && low > -6.5,
+            "overlap: 6 kHz {high}, 1 kHz {low} dBFS"
+        );
+        let second = &out[59_648 + 2_000..59_648 + 19_000];
+        let (high, _) = fit(second, 48_000, 6_000.0);
+        let (low, _) = fit(second, 48_000, 1_000.0);
+        assert!(
+            high > -6.5 && low < -70.0,
+            "second: 6 kHz {high}, 1 kHz {low} dBFS"
+        );
     }
 
     #[test]

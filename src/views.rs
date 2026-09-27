@@ -24,6 +24,11 @@ const ELAPSED: Color32 = Color32::from_gray(220);
 const WALL_CLOCK: Color32 = Color32::from_gray(115);
 /// Orange, like a control picked for the keys: what is chosen.
 const SELECTION: Color32 = Color32::from_rgba_unmultiplied_const(255, 140, 50, 45);
+const REGION: Color32 = Color32::from_rgba_unmultiplied_const(70, 210, 255, 40);
+const REGION_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(70, 210, 255, 210);
+/// A mute button while its channel plays, and once muted.
+const LIVE: Color32 = Color32::from_rgb(240, 200, 60);
+const MUTED: Color32 = Color32::from_rgb(215, 55, 50);
 const SELECTION_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(255, 140, 50, 180);
 const STRIP_BACK: Color32 = Color32::from_gray(22);
 const STRIP_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(236, 224, 160, 170);
@@ -120,6 +125,21 @@ pub fn place(painter: &Painter, lane: Rect, span: Span, texture: TextureId, rang
     let uv = Rect::from_min_max(Pos2::new(u(left), 0.0), Pos2::new(u(right), 1.0));
     let rect = Rect::from_x_y_ranges(left..=right, lane.y_range());
     painter.image(texture, rect, uv, Color32::WHITE);
+}
+
+/// An area picked to play: its stretch across `lane`, and its band, `rows`,
+/// up it.
+pub fn region(painter: &Painter, lane: Rect, span: Span, frames: &Range<f64>, rows: egui::Rangef) {
+    let (left, right) = (
+        span.x(frames.start).max(lane.left()),
+        span.x(frames.end).min(lane.right()),
+    );
+    if right <= left {
+        return;
+    }
+    let rect = Rect::from_x_y_ranges(left..=right, rows);
+    painter.rect_filled(rect, 0.0, REGION);
+    painter.rect_stroke(rect, 0.0, Stroke::new(1.5, REGION_EDGE), StrokeKind::Inside);
 }
 
 pub fn selection(painter: &Painter, plot: Rect, span: Span, range: &Range<f64>) {
@@ -657,9 +677,12 @@ const HOLD_SECONDS: f64 = 1.5;
 const DECAY_DB_PER_SECOND: f32 = 15.0;
 /// Numbers change this often at most, so they can be read.
 const NUMBERS_EVERY: f64 = 0.15;
-const METER_ROW: f32 = 12.0;
+const METER_ROW: f32 = 14.0;
 const METER_GAP: f32 = 4.0;
-const METER_LABEL: f32 = 22.0;
+/// Room left of the meters for each channel's number and mute button, and
+/// under them for the choice of where the rest play.
+const METER_LEFT: f32 = 104.0;
+const MUTE_WIDTH: f32 = 26.0;
 const METER_NUMBERS: f32 = 116.0;
 
 /// Per-channel level bars on the original's -60 to 0 dBFS scale: the peak
@@ -687,7 +710,18 @@ fn level_text(db: f32) -> String {
 
 impl Meters {
     /// `levels` is `None` while nothing plays, which empties the meters.
-    pub fn ui(&mut self, ui: &mut Ui, levels: Option<&[Level]>, labels: &[String]) {
+    /// The button beside each meter flips its channel in `muted`, `names`
+    /// saying which it is; with more than one channel, `both` says whether
+    /// the rest then play in both speakers.
+    pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        levels: Option<&[Level]>,
+        labels: &[String],
+        names: &[String],
+        muted: &mut [bool],
+        both: &mut bool,
+    ) {
         let channels = labels.len();
         let now = ui.input(|i| i.time);
         let dt = (now - self.last).max(0.0) as f32;
@@ -718,19 +752,29 @@ impl Meters {
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
         let painter = ui.painter_at(rect);
-        let track_x = rect.left() + METER_LABEL + 6.0..=rect.right() - METER_NUMBERS - 8.0;
+        let track_x = rect.left() + METER_LEFT + 4.0..=rect.right() - METER_NUMBERS - 8.0;
         let track_width = track_x.end() - track_x.start();
         let x_of = |db: f32| track_x.start() + meter_t(db) * track_width;
         for (c, label) in labels.iter().enumerate() {
             let y = rect.top() + 2.0 + c as f32 * (METER_ROW + METER_GAP);
             let track = Rect::from_x_y_ranges(track_x.clone(), y..=y + METER_ROW);
+            let button = Rect::from_min_size(
+                Pos2::new(rect.left() + METER_LEFT - MUTE_WIDTH, y),
+                Vec2::new(MUTE_WIDTH, METER_ROW),
+            );
             painter.text(
-                Pos2::new(rect.left() + METER_LABEL, track.center().y),
+                Pos2::new(button.left() - 6.0, track.center().y),
                 Align2::RIGHT_CENTER,
                 label,
                 FontId::monospace(11.0),
                 AXIS,
             );
+            if let Some(m) = muted.get_mut(c) {
+                let name = names.get(c).map_or(label.as_str(), String::as_str);
+                if mute_button(ui, button, c, *m, name) {
+                    *m = !*m;
+                }
+            }
             painter.rect_filled(track, 2.0, METER_BACK);
             if let Some(level) = levels.and_then(|l| l.get(c)) {
                 let bands: [(f32, f32, Color32); 3] = [
@@ -790,6 +834,71 @@ impl Meters {
             FontId::proportional(10.0),
             AXIS,
         );
+        if channels > 1 {
+            let room = Rect::from_min_size(
+                Pos2::new(rect.left(), rect.bottom() - 17.0),
+                Vec2::new(METER_LEFT - 8.0, 16.0),
+            );
+            let text = RichText::new("Both speakers").size(11.0);
+            ui.put(room, egui::Checkbox::new(both, text)).on_hover_text(
+                "With a channel muted, the rest play in both speakers rather than on their own side",
+            );
+        }
+    }
+}
+
+/// A channel's mute: yellow while the channel plays, red with its
+/// microphone struck through once muted.
+fn mute_button(ui: &mut Ui, rect: Rect, channel: usize, muted: bool, name: &str) -> bool {
+    let response = ui.interact(rect, ui.id().with(("mute", channel)), Sense::click());
+    let base = if muted { MUTED } else { LIVE };
+    let fill = if response.hovered() {
+        base.lerp_to_gamma(Color32::WHITE, 0.25)
+    } else {
+        base
+    };
+    let ink = if muted {
+        Color32::WHITE
+    } else {
+        Color32::from_gray(35)
+    };
+    ui.painter().rect_filled(rect, 3.0, fill);
+    mic(ui.painter(), rect.shrink2(Vec2::new(5.0, 1.5)), ink, muted);
+    let tip = if muted {
+        format!("Unmute {name}")
+    } else {
+        format!("Mute {name}")
+    };
+    response.on_hover_text(tip).clicked()
+}
+
+/// A microphone on its stand in `rect`, struck through when `off`.
+fn mic(painter: &Painter, rect: Rect, color: Color32, off: bool) {
+    let (c, h) = (rect.center(), rect.height());
+    let stroke = Stroke::new(1.2, color);
+    let head = Rect::from_center_size(c - Vec2::new(0.0, h * 0.15), Vec2::new(h * 0.36, h * 0.6));
+    painter.rect_filled(head, h * 0.18, color);
+    // The cradle round the bottom of the head, then the stem and the foot.
+    let (middle, r) = (c - Vec2::new(0.0, h * 0.08), h * 0.32);
+    let cradle: Vec<Pos2> = (0..=12)
+        .map(|i| {
+            let a = PI * i as f32 / 12.0;
+            middle + Vec2::new(-r * a.cos(), r * a.sin())
+        })
+        .collect();
+    painter.add(Shape::line(cradle, stroke));
+    let foot = c + Vec2::new(0.0, h * 0.46);
+    painter.line_segment([middle + Vec2::new(0.0, r), foot], stroke);
+    painter.line_segment(
+        [
+            foot - Vec2::new(h * 0.2, 0.0),
+            foot + Vec2::new(h * 0.2, 0.0),
+        ],
+        stroke,
+    );
+    if off {
+        let slash = Stroke::new(1.6, color);
+        painter.line_segment([rect.left_top(), rect.right_bottom()], slash);
     }
 }
 
@@ -1355,7 +1464,9 @@ mod tests {
                 time: Some(time),
                 ..Default::default()
             };
-            let mut out = ctx.run_ui(input, |ui| meters.ui(ui, Some(&level), &labels));
+            let mut out = ctx.run_ui(input, |ui| {
+                meters.ui(ui, Some(&level), &labels, &labels, &mut [false], &mut true)
+            });
             out.textures_delta.clear();
             meters.held[0].0
         };
@@ -1369,7 +1480,9 @@ mod tests {
             time: Some(2.0),
             ..Default::default()
         };
-        let mut out = ctx.run_ui(input, |ui| meters.ui(ui, None, &labels));
+        let mut out = ctx.run_ui(input, |ui| {
+            meters.ui(ui, None, &labels, &labels, &mut [false], &mut true)
+        });
         out.textures_delta.clear();
         assert_eq!(meters.held[0].0, FLOOR_DB, "stopping empties the meters");
     }
