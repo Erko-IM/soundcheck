@@ -2,7 +2,7 @@
 
 The point of this is to have a fast sound check tool to quickly check your sound files, get full pectral analysis and whatnot in order to get a sense of what you have in your files, what their primary characteristics are, and make it extremely fast and useable.
 
-It was inspired by https://github.com/mrkva/sound-explorer/tree/main - but rewritten in Rust, and made multiple useability improvements for myself and a friend of mine. Functionally it is a completely separate program, but it is very much inspired by this, but since I really... really don't like Javascript, then instead of forking and modifying, and having to use Javascript when I don't absolutely have to, a rewrite in Rust seemed like a better idea, because why not.
+It was inspired by https://github.com/mrkva/sound-explorer/ - but rewritten in Rust, and made multiple useability improvements for myself and a friend of mine. Functionally it is a completely separate program, but it is very much inspired by this, but since I really... really don't like Javascript, then instead of forking and modifying, and having to use Javascript when I don't absolutely have to, a rewrite in Rust seemed like a better idea, because why not.
 
 Easiest way to install it is from a terminal. On a Mac (Apple silicon) or Linux (x86_64):
 
@@ -18,7 +18,7 @@ irm https://raw.githubusercontent.com/Erko-IM/soundcheck/main/install.ps1 | iex
 
 Same command again updates it. It downloads the latest release and installs it: into /Applications on a Mac, into AppData\Local\soundcheck with a Start menu shortcut on Windows (Settings, Apps removes it), and into ~/.local/share/soundcheck on Linux, with an entry among your apps (deleting that folder, ~/.local/bin/soundcheck and ~/.local/share/applications/soundcheck.desktop removes it). Installed this way, macos and Windows don't complain about the app not being signed, because only what a browser or the like downloads gets marked as coming from the internet.
 
-The installers are also on the releases page: a dmg for Macs, an exe for Windows, and a deb and an AppImage for Linux. Repo root also contains the Mac one.
+The installers are also on the [releases page](https://github.com/Erko-IM/soundcheck/releases): a dmg for Macs, an exe for Windows, and a deb and an AppImage for Linux.
 
 The first time you open the dmg file after downloading, macos says it cannot verify soundcheck, this is because the app is not signed with a paid Apple developer account. It most likely never will be. Click Done, then open System Settings, go to Privacy & Security, scroll down to the message about soundcheck and click Open Anyway. After that it opens like any other app. 
 

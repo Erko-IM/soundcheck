@@ -103,19 +103,20 @@ packages: dmg exe linux
 # Publishes the four packages as a GitHub release, which install.sh and
 # install.ps1 download from, named after the version in Cargo.toml: bump
 # that for each one. The release tags the commit it's built from, so only
-# once everything is committed and pushed, the dmg aside, which the build
-# replaces. Needs the GitHub CLI, gh, logged in.
+# once everything is committed and pushed. Its notes open with
+# packaging/release-notes.md, ahead of GitHub's list of changes. Needs the
+# GitHub CLI, gh, logged in.
 VERSION = $(shell sed -n 's/^version = "\(.*\)"$$/\1/p' Cargo.toml | head -n 1)
 release: rust
 	@$(CARGO_BIN)cargo metadata --format-version 1 >/dev/null
-	@test -z "$$(git status --porcelain -- ':!soundcheck.dmg')" \
+	@test -z "$$(git status --porcelain)" \
 		|| { echo "commit your changes first, Cargo.lock too after a version bump" >&2; exit 1; }
 	@test -n "$$(git branch -r --contains HEAD)" || { echo "push first" >&2; exit 1; }
 	@! git ls-remote --exit-code --tags origin v$(VERSION) >/dev/null \
 		|| { echo "v$(VERSION) is out already: bump the version in Cargo.toml" >&2; exit 1; }
 	$(MAKE) packages
 	gh release create v$(VERSION) soundcheck.dmg soundcheck-setup.exe soundcheck.deb soundcheck.AppImage \
-		--target $$(git rev-parse HEAD) --title v$(VERSION) --generate-notes
+		--target $$(git rev-parse HEAD) --title v$(VERSION) --notes-file packaging/release-notes.md --generate-notes
 endif
 
 ifeq ($(SYSTEM),Windows)
