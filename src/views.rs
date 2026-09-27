@@ -24,8 +24,11 @@ const ELAPSED: Color32 = Color32::from_gray(220);
 const WALL_CLOCK: Color32 = Color32::from_gray(115);
 /// Orange, like a control picked for the keys: what is chosen.
 const SELECTION: Color32 = Color32::from_rgba_unmultiplied_const(255, 140, 50, 45);
-const REGION: Color32 = Color32::from_rgba_unmultiplied_const(70, 210, 255, 40);
-const REGION_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(70, 210, 255, 210);
+const REGION: Color32 = Color32::from_rgba_unmultiplied_const(255, 45, 45, 45);
+const REGION_EDGE: Color32 = Color32::from_rgb(255, 45, 45);
+/// Under an area's edge, so the red stands out on the reds of the colour
+/// maps too.
+const REGION_RIM: Color32 = Color32::from_black_alpha(200);
 /// A mute button while its channel plays, and once muted.
 const LIVE: Color32 = Color32::from_rgb(240, 200, 60);
 const MUTED: Color32 = Color32::from_rgb(215, 55, 50);
@@ -139,7 +142,8 @@ pub fn region(painter: &Painter, lane: Rect, span: Span, frames: &Range<f64>, ro
     }
     let rect = Rect::from_x_y_ranges(left..=right, rows);
     painter.rect_filled(rect, 0.0, REGION);
-    painter.rect_stroke(rect, 0.0, Stroke::new(1.5, REGION_EDGE), StrokeKind::Inside);
+    painter.rect_stroke(rect, 0.0, Stroke::new(6.0, REGION_RIM), StrokeKind::Middle);
+    painter.rect_stroke(rect, 0.0, Stroke::new(3.0, REGION_EDGE), StrokeKind::Middle);
 }
 
 pub fn selection(painter: &Painter, plot: Rect, span: Span, range: &Range<f64>) {
