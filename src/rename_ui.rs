@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local, NaiveDateTime};
-use eframe::egui::{self, Color32, RichText, Sense, TextEdit, Ui, Vec2};
+use eframe::egui::{self, Color32, KeyboardShortcut, RichText, Sense, TextEdit, Ui, Vec2};
 
 use crate::rename::{
     self, Candidate, Case, Crop, DATE_FORMATS, DateSource, ExtensionMode, Filters, MoveMode,
@@ -258,7 +258,7 @@ impl Renamer {
     pub fn simple(&mut self, ui: &mut Ui, locked: bool) -> Option<Request> {
         let mut request = None;
         ui.horizontal(|ui| {
-            ui.strong("Rename");
+            ui.strong("Bulk rename");
             ui.weak(format!("files in {}", self.folder_name()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -383,16 +383,16 @@ impl Renamer {
         }
     }
 
-    /// The window with every rule. `embedded` inside the main window, where
-    /// it needs a button of its own to close.
-    pub fn full(&mut self, ui: &mut Ui, locked: bool, embedded: bool) -> Option<Request> {
+    /// The window with every rule, closed with its button, Esc or `close`.
+    pub fn full(&mut self, ui: &mut Ui, locked: bool, close: &KeyboardShortcut) -> Option<Request> {
         let mut request = None;
         let folder = self
             .folder
             .as_ref()
             .map_or_else(|| "no folder".into(), |f| f.display().to_string());
         ui.horizontal(|ui| {
-            if embedded && ui.small_button("Close").clicked() {
+            let keys = format!("Esc or {}", ui.ctx().format_shortcut(close));
+            if ui.button("Close").on_hover_text(keys).clicked() {
                 request = Some(Request::Close);
             }
             ui.strong(folder);

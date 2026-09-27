@@ -8,7 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::f32::consts::TAU;
 use std::ops::{Range, RangeInclusive};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -133,6 +133,9 @@ struct Shared {
     /// Linear gain as `f32` bits, applied on the way out so a change is
     /// heard at once rather than after the second of audio already queued.
     gain: AtomicU32,
+    /// The sides silenced, left in the lowest bit, applied on the way out
+    /// like the gain.
+    muted: AtomicU8,
     failure: Mutex<Option<String>>,
 }
 
@@ -237,6 +240,7 @@ impl Player {
             position: AtomicU64::new(pack(0, start as f64)),
             finished: AtomicU32::new(0),
             gain: AtomicU32::new(1.0f32.to_bits()),
+            muted: AtomicU8::new(0),
             failure: Mutex::new(None),
         });
         // A second of stereo.
@@ -367,6 +371,11 @@ impl Player {
         self.shared.gain.store(gain.to_bits(), Ordering::Relaxed);
     }
 
+    /// Silences the left or right of what plays, heard at once.
+    pub fn set_muted(&self, muted: [bool; 2]) {
+        self.shared.muted.store(mute_bits(muted), Ordering::Relaxed);
+    }
+
     /// Repeats `range` from its start, or stops repeating where playback
     /// now is.
     pub fn set_loop(&self, range: Option<Range<usize>>) {
@@ -408,6 +417,16 @@ impl Drop for Player {
     }
 }
 
+fn mute_bits(muted: [bool; 2]) -> u8 {
+    u8::from(muted[0]) | u8::from(muted[1]) << 1
+}
+
+/// The gain for the left and the right on the way out: `gain`, or none for
+/// a side `muted` has the bit of.
+fn side_gains(gain: f32, muted: u8) -> [f32; 2] {
+    [0, 1].map(|side| if muted & (1 << side) == 0 { gain } else { 0.0 })
+}
+
 fn step(sample_rate: u32, speed: Speed, device_rate: u32) -> f64 {
     f64::from(sample_rate) * speed.value() / f64::from(device_rate)
 }
@@ -437,7 +456,8 @@ where
                     return;
                 };
                 let gain = f32::from_bits(state.gain.load(Ordering::Relaxed));
-                let level = |s: f32| (s * gain).clamp(-1.0, 1.0);
+                let gains = side_gains(gain, state.muted.load(Ordering::Relaxed));
+                let level = |s: f32, side: usize| (s * gains[side]).clamp(-1.0, 1.0);
                 for frame in out.chunks_mut(channels) {
                     // Blocks go in whole, so two queued samples are always a
                     // left and its right.
@@ -445,8 +465,8 @@ where
                         frame.fill(T::EQUILIBRIUM);
                         continue;
                     }
-                    let left = level(head.ring.pop().unwrap_or(0.0));
-                    let right = level(head.ring.pop().unwrap_or(0.0));
+                    let left = level(head.ring.pop().unwrap_or(0.0), 0);
+                    let right = level(head.ring.pop().unwrap_or(0.0), 1);
                     head.advance();
                     match frame {
                         [mono] => *mono = T::from_sample(0.5 * (left + right)),
@@ -1533,6 +1553,14 @@ mod tests {
         three.read(1, &mut out).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert_eq!(out[0], [0.0, 0.5]);
+    }
+
+    #[test]
+    fn a_muted_side_is_silenced_and_the_other_plays_on() {
+        assert_eq!(side_gains(0.5, mute_bits([true, false])), [0.0, 0.5]);
+        assert_eq!(side_gains(0.5, mute_bits([false, true])), [0.5, 0.0]);
+        assert_eq!(side_gains(0.5, mute_bits([false; 2])), [0.5; 2]);
+        assert_eq!(side_gains(0.5, mute_bits([true; 2])), [0.0; 2]);
     }
 
     #[test]

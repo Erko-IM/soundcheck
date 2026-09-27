@@ -309,7 +309,8 @@ pub fn timeline(
     for m in markers {
         painter.vline(x_of(m.frame as f64), rect.y_range(), Stroke::new(1.0, MARK));
     }
-    let shown = Rect::from_x_y_ranges(x_of(view.start)..=x_of(view.end), rect.y_range());
+    let (left, right) = view_span(rect, frames as f64, view);
+    let shown = Rect::from_x_y_ranges(left..=right, rect.y_range());
     painter.rect_filled(shown, 0.0, VIEWPORT);
     painter.rect_stroke(shown, 0.0, Stroke::new(1.0, STRIP_EDGE), StrokeKind::Inside);
     let grip = rect.center().y - 7.0..=rect.center().y + 7.0;
@@ -319,6 +320,21 @@ pub fn timeline(
     if let Some(frame) = playhead {
         painter.vline(x_of(frame as f64), rect.y_range(), Stroke::new(1.0, CURSOR));
     }
+}
+
+/// The narrowest the part in view is drawn on the timeline, so a moment of
+/// a long file can still be seen and taken hold of.
+const NARROWEST_VIEW: f32 = 20.0;
+
+/// Where the part in view lies across the timeline `rect`: at least
+/// [`NARROWEST_VIEW`] wide around its middle, and within the strip.
+pub fn view_span(rect: Rect, frames: f64, view: &Range<f64>) -> (f32, f32) {
+    let x_of = |frame: f64| rect.left() + (frame / frames) as f32 * rect.width();
+    let (left, right) = (x_of(view.start), x_of(view.end));
+    let spare = ((NARROWEST_VIEW - (right - left)) / 2.0).max(0.0);
+    let (left, right) = (left - spare, right + spare);
+    let back = (rect.left() - left).max(0.0) - (right - rect.right()).max(0.0);
+    (left + back, right + back)
 }
 
 /// Markers across `plot`: a line at each and each region's span shaded,

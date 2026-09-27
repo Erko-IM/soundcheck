@@ -19,8 +19,11 @@ Will add the same for Linux and Windows later on.
 This project is open-source - no catch, nothing proprietary, just seems like a useful tool to have, and thus... if you find it useful, feel free to use, fork, do whatever you want, but you cannot fork it to make it proprietary.
 
 Press "m" to mark a place on the soundfile, it will also immediately put you on the name place.
-Press "r" to reset the selected configuration box, or "shift+r" to reset all the configs.
+Press "r" to reset the selected configuration box, or "shift+r" to reset all the configs. The small circular arrow next to each slider does the same for that one.
 Click in the file list, then the up and down arrows move through it, opening each file as you land on it. If the current one is playing, the next one starts playing too.
+Drag the zoomed part of the timeline to move it. After a drag or a click there, left and right move it along (shift for a whole view), up and down make it wider or narrower (shift doubles or halves), and "r" shows the whole file.
+"Slider" next to the speed buttons swaps them for a slider from 1/1000x to 1000x; click its number to type any speed, like 3.7 or 1/250.
+"Rename" under Show renames the files in the explorer's folder; "Bulk rename" opens a window with every rule, laid out like Bulk Rename Utility.
 The rest should be pretty self-explanatory.
 
 ## License

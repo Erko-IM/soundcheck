@@ -44,7 +44,14 @@ const PLOT_LEFT: f32 = 54.0;
 const PLOT_RIGHT: f32 = 10.0;
 const PLOT_EDGE: f32 = 6.0;
 const TIME_AXIS: f32 = 44.0;
-/// How close to an end of the part in view a timeline drag takes that end.
+/// Closes the bulk rename window, as Esc does.
+const CLOSE_RENAME: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
+
+fn rename_viewport() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("bulk rename")
+}
+
+/// How far past an end of the part in view a timeline drag takes that end.
 const GRIP: f32 = 6.0;
 /// How long the view must rest before the part in view is analysed again.
 const SETTLE: Duration = Duration::from_millis(150);
@@ -453,6 +460,9 @@ pub struct App {
     renamer: Renamer,
     /// The window with every rename rule is open.
     rename_window: bool,
+    /// Channels 1 and 2 silenced in playback, to hear each mic alone. Kept
+    /// from file to file, not from one run to the next.
+    mute: [bool; 2],
 }
 
 impl App {
@@ -512,6 +522,7 @@ impl App {
             name_next: None,
             renamer: Renamer::default(),
             rename_window: false,
+            mute: [false; 2],
         };
         if let Some(path) = initial.or_else(|| app.inbox.latest()) {
             app.open_external(&cc.egui_ctx, path);
@@ -637,6 +648,16 @@ impl App {
                 )
             }
             None => set,
+        }
+    }
+
+    /// The sides of the output silenced. A mono file plays its one channel
+    /// on both and shows no mute to silence it with.
+    fn muted(&self) -> [bool; 2] {
+        if self.channel_count() > 1 {
+            self.mute
+        } else {
+            [false; 2]
         }
     }
 
@@ -1017,7 +1038,12 @@ impl App {
 
     fn rename_request(&mut self, ctx: &egui::Context, request: Request) {
         match request {
-            Request::AllRules => self.rename_window = true,
+            Request::AllRules => {
+                if self.rename_window {
+                    ctx.send_viewport_cmd_to(rename_viewport(), ViewportCommand::Focus);
+                }
+                self.rename_window = true;
+            }
             Request::Close => self.rename_window = false,
             Request::Rename(batch) => self.bulk_rename(ctx, batch, false),
             Request::Undo(batch) => self.bulk_rename(ctx, batch, true),
@@ -1263,6 +1289,7 @@ impl App {
         ) {
             Ok(player) => {
                 player.set_gain(self.settings.gain);
+                player.set_muted(self.muted());
                 if let Some(range) = &self.selection {
                     player.set_loop(Some(range.clone()));
                 }
@@ -1319,6 +1346,7 @@ impl App {
     /// switch at the top may have just changed.
     fn tune_player(&self) {
         let Some(player) = &self.player else { return };
+        player.set_muted(self.muted());
         if player.speed() != self.speed() {
             player.set_speed(self.speed());
         }
@@ -1649,11 +1677,16 @@ impl App {
             ui.checkbox(&mut views.metadata, "Metadata");
             ui.checkbox(&mut views.timeline, "Timeline");
             ui.checkbox(&mut views.meters, "Meters");
-            ui.checkbox(&mut views.rename, "Rename").on_hover_text(
-                "Rename the files in the explorer's folder: replace, add, number and change case",
+            ui.checkbox(&mut views.rename, "Bulk rename").on_hover_text(
+                "Renames every file in the explorer's folder at once: replace, add, number and change case. The name at the top renames just the file open.",
             );
-            ui.checkbox(&mut self.rename_window, "Bulk rename")
-                .on_hover_text("Every renaming rule, in a window of its own");
+            if ui
+                .selectable_label(self.rename_window, "All rules")
+                .on_hover_text("Bulk rename with every rule, in a window of its own")
+                .clicked()
+            {
+                self.rename_window = !self.rename_window;
+            }
             ui.separator();
             let tools = &mut self.settings.tools;
             ui.checkbox(&mut tools.pitch, "Pitch shift").on_hover_text(
@@ -1875,6 +1908,25 @@ impl App {
                 self.settings.gain = gain;
                 if let Some(player) = &self.player {
                     player.set_gain(gain);
+                }
+            }
+            if self.channel_count() > 1 {
+                for side in 0..2 {
+                    let muted = self.mute[side];
+                    let icon = if muted { "🔇" } else { "🔊" };
+                    let name = self.channel_name(side);
+                    let hint = if muted {
+                        format!("Unmute {name}")
+                    } else {
+                        format!("Mute {name}, to hear the other alone")
+                    };
+                    if ui
+                        .selectable_label(muted, format!("{icon} {}", side + 1))
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        self.mute[side] = !muted;
+                    }
                 }
             }
             ui.separator();
@@ -2268,15 +2320,20 @@ impl App {
         let locked = self.saving.is_some();
         let (mut closed, mut asked) = (false, None);
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("bulk rename"),
+            rename_viewport(),
             egui::ViewportBuilder::default()
                 .with_title("Bulk rename")
-                .with_inner_size([1360.0, 860.0])
+                .with_inner_size([1180.0, 780.0])
                 .with_min_inner_size([980.0, 620.0]),
-            |ui, class| {
-                closed = ui.ctx().input(|i| i.viewport().close_requested());
-                let embedded = class == egui::ViewportClass::EmbeddedWindow;
-                asked = self.renamer.full(ui, locked, embedded);
+            |ui, _| {
+                // Esc only once no box is being typed in, which it leaves.
+                let typing = ui.ctx().egui_wants_keyboard_input();
+                closed = ui.input_mut(|i| {
+                    i.viewport().close_requested()
+                        || i.consume_shortcut(&CLOSE_RENAME)
+                        || (!typing && i.consume_key(Modifiers::NONE, Key::Escape))
+                });
+                asked = self.renamer.full(ui, locked, &CLOSE_RENAME);
             },
         );
         if closed {
@@ -2593,18 +2650,20 @@ impl App {
         let x_of = |frame: f64| rect.left() + (frame / frames) as f32 * rect.width();
         let frame_at =
             |x: f32| f64::from(((x - rect.left()) / rect.width()).clamp(0.0, 1.0)) * frames;
-        let (x0, x1) = (x_of(self.view.start), x_of(self.view.end));
+        let (x0, x1) = views::view_span(rect, frames, &self.view);
+        // Each end is held from just outside the box to a quarter of the way
+        // in, so even a narrow box keeps a middle to move it by.
+        let reach = GRIP.min((x1 - x0) / 4.0);
         let end_at = |x: f32| {
-            let (to_start, to_end) = ((x - x0).abs(), (x - x1).abs());
-            if to_start.min(to_end) > GRIP {
-                None
-            } else if to_start < to_end {
+            if (-GRIP..=reach).contains(&(x - x0)) {
                 Some(Grab::Start)
-            } else {
+            } else if (-GRIP..=reach).contains(&(x1 - x)) {
                 Some(Grab::End)
+            } else {
+                None
             }
         };
-        let inside = |x: f32| x > x0 + GRIP && x < x1 - GRIP;
+        let inside = |x: f32| x > x0 + reach && x < x1 - reach;
         if let Some(pos) = response.hover_pos() {
             let resizing =
                 end_at(pos.x).is_some() || matches!(self.grab, Some(Grab::Start | Grab::End));
@@ -2676,12 +2735,22 @@ impl App {
             .filter(|p| p.is_playing())
             .map(|player| {
                 let span = f64::from(current.info.sample_rate) * self.speed().value() / 20.0;
-                let gain = self.settings.gain;
+                let (gain, muted) = (self.settings.gain, self.muted());
                 current
                     .levels
                     .at(player.position(), span as usize)
                     .into_iter()
-                    .map(|level| lift(level, gain))
+                    .enumerate()
+                    .map(|(channel, level)| {
+                        if muted.get(channel) == Some(&true) {
+                            Level {
+                                rms_db: FLOOR_DB,
+                                peak_db: FLOOR_DB,
+                            }
+                        } else {
+                            lift(level, gain)
+                        }
+                    })
                     .collect::<Vec<_>>()
             });
         ui.add_space(4.0);
