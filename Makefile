@@ -1,10 +1,15 @@
 # `make install` rebuilds soundcheck and installs it over the copy before, so
-# updating after a change is one command. `make dmg` on a Mac, `make exe` on
-# Windows and `make linux` on Linux build the packages to hand to someone
-# else in the repo root, replacing the ones before: soundcheck.dmg,
-# soundcheck-setup.exe, or soundcheck.deb and soundcheck.AppImage. All of
-# them first install anything they need that's missing: rustup (except on
-# Windows), the Rust version rust-toolchain.toml names, and cargo-packager.
+# updating after a change is one command. `make dmg`, `make exe` and `make
+# linux` build the packages to hand to someone else in the repo root,
+# replacing the ones before: soundcheck.dmg, soundcheck-setup.exe, and
+# soundcheck.deb plus soundcheck.AppImage; `make packages` builds all four on
+# a Mac, and `make release` publishes them as a GitHub release. They first
+# install anything they need that's missing: rustup (except on Windows), the
+# Rust version rust-toolchain.toml names, and cargo-packager.
+#
+# The dmg needs a Mac. The exe builds on Windows, Linux or a Mac, and the
+# Linux packages on Linux or a Mac. A Mac builds those two in a Linux
+# container, so Docker Desktop has to be running for them.
 #
 # On Windows, set up Git Bash, make, rustup and Microsoft's C++ build tools
 # once, then run make in Git Bash:
@@ -12,9 +17,9 @@
 #   winget install --id ezwinports.make -e
 #   winget install --id Rustlang.Rustup -e
 #   winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
-# On Linux, set up a C compiler, curl, file and ALSA's headers once, on
-# Debian or Ubuntu with:
-#   sudo apt-get install -y build-essential curl file pkg-config libasound2-dev
+# On Linux, set up a C compiler, curl, file and ALSA's headers once, and
+# MinGW and NSIS for the exe, on Debian or Ubuntu with:
+#   sudo apt-get install -y build-essential curl file pkg-config libasound2-dev gcc-mingw-w64-x86-64 nsis
 PACKAGER_VERSION := 0.11.8
 APPS ?= /Applications
 # A code-signing identity from your keychain. Without one, every build is a
@@ -44,7 +49,7 @@ endif
 .PHONY: check packager rust
 
 ifeq ($(SYSTEM),macOS)
-.PHONY: app install dmg
+.PHONY: app install dmg exe linux packages builder release
 
 # Signed ad hoc, which seals the whole app: without it a downloaded copy is
 # "damaged". Here rather than by cargo-packager, which then warns on every
@@ -64,7 +69,7 @@ install: app
 # image as well, and macOS blocks a downloaded image with an ad-hoc signature
 # outright; unsigned, it opens and macOS checks only the app. diskutil image
 # from macOS 26 on, which deprecates hdiutil; hdiutil before that, as on the
-# Release workflow's runner.
+# Packages workflow's runner.
 dmg: app
 	rm -rf target/dmg
 	mkdir target/dmg
@@ -76,13 +81,48 @@ dmg: app
 		hdiutil create -volname soundcheck -srcfolder target/dmg -fs HFS+ -format UDZO -ov soundcheck.dmg; \
 	fi
 	@echo "built $(CURDIR)/soundcheck.dmg"
+
+# cargo-packager builds the Linux packages on Linux only, so these two run the
+# Linux targets below in a container from packaging/Dockerfile. Its Rust,
+# cargo-packager and build caches stay between runs in the Docker volume
+# soundcheck-build, rather than in the repo, where macOS's file times would
+# have part of the Windows build redone every time; `docker volume rm
+# soundcheck-build` clears them. A cache for each of the two, as they'd
+# rebuild much of a shared one for each other.
+exe linux: builder
+	docker run --rm --volume "$(CURDIR)":/src --volume soundcheck-build:/build --workdir /src \
+		--env CARGO_HOME=/build/cargo --env RUSTUP_HOME=/build/rustup \
+		--env CARGO_TARGET_DIR=/build/$@ --env XDG_CACHE_HOME=/build/cache \
+		soundcheck-builder make $@
+
+builder:
+	docker build --tag soundcheck-builder packaging
+
+packages: dmg exe linux
+
+# Publishes the four packages as a GitHub release, which install.sh and
+# install.ps1 download from, named after the version in Cargo.toml: bump
+# that for each one. The release tags the commit it's built from, so only
+# once everything is committed and pushed, the dmg aside, which the build
+# replaces. Needs the GitHub CLI, gh, logged in.
+VERSION = $(shell sed -n 's/^version = "\(.*\)"$$/\1/p' Cargo.toml | head -n 1)
+release: rust
+	@$(CARGO_BIN)cargo metadata --format-version 1 >/dev/null
+	@test -z "$$(git status --porcelain -- ':!soundcheck.dmg')" \
+		|| { echo "commit your changes first, Cargo.lock too after a version bump" >&2; exit 1; }
+	@test -n "$$(git branch -r --contains HEAD)" || { echo "push first" >&2; exit 1; }
+	@! git ls-remote --exit-code --tags origin v$(VERSION) >/dev/null \
+		|| { echo "v$(VERSION) is out already: bump the version in Cargo.toml" >&2; exit 1; }
+	$(MAKE) packages
+	gh release create v$(VERSION) soundcheck.dmg soundcheck-setup.exe soundcheck.deb soundcheck.AppImage \
+		--target $$(git rev-parse HEAD) --title v$(VERSION) --generate-notes
 endif
 
 ifeq ($(SYSTEM),Windows)
 .PHONY: exe install
 
 # cargo-packager puts the version in the installer's name. The copy is named
-# the same every time, for the Release workflow to publish and install.ps1 to
+# the same every time, for `make release` to publish and install.ps1 to
 # fetch; older versions' installers go first so the copy finds only this one.
 exe: packager
 	rm -f target/packages/*-setup.exe
@@ -101,18 +141,69 @@ install: exe
 endif
 
 ifeq ($(SYSTEM),Linux)
-.PHONY: linux install
+.PHONY: exe linux install
 
-# Copied to names that stay the same, as on Windows, for install.sh. The
-# AppImage tools cargo-packager fetches are AppImages themselves, which this
-# has unpack themselves to run rather than need FUSE.
+# Rust's name for the PCs the Linux packages are for: this one, unless it's
+# the container a Mac builds them in, which asks for x86_64.
+LINUX_TARGET ?= $(shell uname -m)-unknown-linux-gnu
+LINUX_ARCH := $(firstword $(subst -, ,$(LINUX_TARGET)))
+BUILD := $(or $(CARGO_TARGET_DIR),target)
+
+# appimagetool, and the runtime every AppImage starts with, pinned and checked
+# against these.
+APPIMAGETOOL_VERSION := 1.9.1
+APPIMAGE_RUNTIME_VERSION := 20251108
+sha256_appimagetool-x86_64 := ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+sha256_appimagetool-aarch64 := f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158
+sha256_runtime-x86_64 := 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+sha256_runtime-aarch64 := 00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444
+HOST_ARCH := $(shell uname -m)
+APPIMAGETOOL := $(BUILD)/tools/appimagetool-$(APPIMAGETOOL_VERSION)-$(HOST_ARCH).AppImage
+APPIMAGE_RUNTIME := $(BUILD)/tools/runtime-$(APPIMAGE_RUNTIME_VERSION)-$(LINUX_ARCH)
+# $(call fetch,url,sha256) downloads url to $@, if what arrives has that sha256.
+fetch = mkdir -p $(@D) && curl -fsSL -o $@.part $(1) && echo "$(2)  $@.part" | sha256sum -c --quiet && mv $@.part $@
+
+# Cross-built with MinGW, as Microsoft's tools run on Windows only, and
+# named as the Windows build names it. cargo-packager warns twice that it can
+# sign the exe only on Windows; it isn't signed there either.
+exe: packager
+	@$(CARGO_BIN)rustup target list --installed | grep -qx x86_64-pc-windows-gnu \
+		|| $(CARGO_BIN)rustup target add x86_64-pc-windows-gnu
+	rm -f target/packages/*-setup.exe
+	env CARGO_BUILD_TARGET=x86_64-pc-windows-gnu $(CARGO_BIN)cargo packager --release --formats nsis --target x86_64-pc-windows-gnu
+	cp target/packages/*-setup.exe soundcheck-setup.exe
+	@echo "built $(CURDIR)/soundcheck-setup.exe"
+
+# The deb from cargo-packager and the AppImage from appimagetool, both under
+# names that stay the same, as on Windows. appimagetool because the tools
+# cargo-packager builds an AppImage with run only on the kind of PC it's
+# for; an AppImage itself, it unpacks itself to run rather than need FUSE.
+# Nothing to bundle into it: soundcheck needs only ALSA and the C library,
+# which every desktop has, as the deb says. No AppStream listing for
+# software centres to check either, and appimagetool's squashfs statistics,
+# on stdout, left out.
 linux: export APPIMAGE_EXTRACT_AND_RUN := 1
-linux: packager
-	rm -f target/packages/*.deb target/packages/*.AppImage
-	$(CARGO_BIN)cargo packager --release --formats deb,appimage
+linux: packager $(APPIMAGETOOL) $(APPIMAGE_RUNTIME)
+	@$(CARGO_BIN)rustup target list --installed | grep -qx $(LINUX_TARGET) \
+		|| $(CARGO_BIN)rustup target add $(LINUX_TARGET)
+	rm -f target/packages/*.deb
+	env CARGO_BUILD_TARGET=$(LINUX_TARGET) $(CARGO_BIN)cargo packager --release --formats deb --target $(LINUX_TARGET)
 	cp target/packages/*.deb soundcheck.deb
-	cp target/packages/*.AppImage soundcheck.AppImage
+	rm -rf $(BUILD)/AppDir
+	mkdir -p $(BUILD)/AppDir/usr/bin
+	cp $(BUILD)/$(LINUX_TARGET)/release/soundcheck $(BUILD)/AppDir/usr/bin/
+	cp packaging/soundcheck.desktop $(BUILD)/AppDir/
+	cp packaging/icon.png $(BUILD)/AppDir/soundcheck.png
+	ln -s usr/bin/soundcheck $(BUILD)/AppDir/AppRun
+	env ARCH=$(LINUX_ARCH) $(APPIMAGETOOL) --no-appstream --runtime-file $(APPIMAGE_RUNTIME) $(BUILD)/AppDir soundcheck.AppImage >/dev/null
 	@echo "built $(CURDIR)/soundcheck.deb and $(CURDIR)/soundcheck.AppImage"
+
+$(APPIMAGETOOL):
+	$(call fetch,https://github.com/AppImage/appimagetool/releases/download/$(APPIMAGETOOL_VERSION)/appimagetool-$(HOST_ARCH).AppImage,$(sha256_appimagetool-$(HOST_ARCH)))
+	chmod +x $@
+
+$(APPIMAGE_RUNTIME):
+	$(call fetch,https://github.com/AppImage/type2-runtime/releases/download/$(APPIMAGE_RUNTIME_VERSION)/runtime-$(LINUX_ARCH),$(sha256_runtime-$(LINUX_ARCH)))
 
 # The same install as the one-line one, from the AppImage just built.
 install: linux

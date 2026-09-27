@@ -28,7 +28,7 @@ From a terminal, this does the same if you don't want to bother with UI:
 
 Windows complains the same way about a downloaded exe: when it says "Windows protected your PC", click More info, then Run anyway.
 
-Other option is to clone repo to your machine, and run "make install" from repo root from terminal. It builds soundcheck, installs it, and installs all the necessary dependencies as well, except for a few things Windows and Linux need set up first, which the top of the Makefile lists. "make dmg", "make exe" and "make linux" build the installers themselves. Check Makefile contents to see what it is actually doing, in case you are worried.
+Other option is to clone repo to your machine, and run "make install" from repo root from terminal. It builds soundcheck, installs it, and installs all the necessary dependencies as well, except for a few things Windows and Linux need set up first, which the top of the Makefile lists. "make dmg", "make exe" and "make linux" build the installers themselves, and on a Mac "make packages" builds all four; a Mac builds the Windows and Linux ones in a Linux container, so Docker Desktop has to be running. Check Makefile contents to see what it is actually doing, in case you are worried.
 
 This project is open-source - no catch, nothing proprietary, just seems like a useful tool to have, and thus... if you find it useful, feel free to use, fork, do whatever you want, but you cannot fork it to make it proprietary.
 

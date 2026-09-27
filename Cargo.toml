@@ -64,5 +64,7 @@ out-dir = "target/packages"
 info-plist-path = "packaging/Info.plist"
 
 [package.metadata.packager.deb]
+# A plain desktop entry rather than a template for cargo-packager to fill in,
+# so the AppImage the Makefile builds can take it as it is.
 desktop-template = "packaging/soundcheck.desktop"
 depends = ["libasound2"]

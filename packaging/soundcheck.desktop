@@ -1,11 +1,9 @@
 [Desktop Entry]
-Categories={{categories}}
-{{#if comment}}
-Comment={{comment}}
-{{/if}}
-Exec={{exec}} %f
-Icon={{icon}}
-Name={{name}}
+Categories=AudioVideo;Audio;Music;
+Comment=Fast spectrogram and spectrum viewer for field recordings
+Exec=soundcheck %f
+Icon=soundcheck
+Name=soundcheck
 Terminal=false
 Type=Application
 MimeType=audio/wav;audio/x-wav;audio/vnd.wave;audio/flac;audio/x-flac;audio/mpeg;audio/mp4;audio/x-m4a;audio/aac;audio/ogg;audio/x-vorbis+ogg;audio/x-aiff;audio/x-caf;
