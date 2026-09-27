@@ -44,7 +44,8 @@ The gear at the top right (or cmd+,) opens the menu with the views to show and t
 The yellow button next to each meter mutes that channel (it turns red); with "Both speakers" ticked, the channels left play in both speakers.
 Shift-drag on the spectrogram picks an area (a stretch of time and a band of frequencies) and plays just that; a new one takes its place. With "Multiple areas" ticked in the gear's menu, each new one adds to the rest, and they play in turn, together where they overlap. Shift-click one to drop it; a plain drag drops them all. "Area boxes" in the gear's menu sets how they look: edge colour and width, the dark rim and the fill.
 The frequency Max stops at half the file's sample rate, the highest a recording can hold (a 48 kHz file has nothing above 24 kHz). Type a higher number, up to 1 MHz, and the part past the file's limit shows hatched: handy for seeing that nothing is there, or for keeping one scale across files recorded at different rates.
-"Export PNG" saves the spectrogram as it shows, with its axes and at full detail, next to the recording.
+"Export PNG" saves the spectrogram as it shows, with its axes, next to the recording: at least 4096 by 2048 pixels, more for a long stretch or a large FFT, with the lettering sized to match.
+The FFT menu lists how long a stretch each size works from and how close together the frequencies it tells apart are, for the file open. Larger sizes draw steady tones finer but blur what changes quickly; smaller ones keep trills, fast calls and clicks sharp.
 The Metadata view edits every tag a file has: in WAV files Broadcast WAV, RIFF INFO, iXML, ID3 and GUANO (bat detectors write that one), in MP3 ID3v2, ID3v1 and APE, in FLAC and Ogg Vorbis comments, in M4A the iTunes ones and in AIFF ID3v2 and its text chunks. Each field can be changed or taken out with the ×, and "Add a field" adds one.
 The rest should be pretty self-explanatory.
 

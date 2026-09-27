@@ -13,9 +13,13 @@ use serde::{Deserialize, Serialize};
 
 pub const FFT_SIZES: [usize; 5] = [512, 1024, 2048, 4096, 8192];
 
-/// Columns in one analysis: wider than any screen, so the texture is only
-/// ever scaled down.
-pub const MAX_COLUMNS: usize = 2048;
+/// Columns an analysis for the screen gets: a column a pixel across the
+/// spectrogram, this many before it has been drawn, and at most the most.
+pub const DEFAULT_COLUMNS: usize = 2048;
+pub const MAX_COLUMNS: usize = 4096;
+/// The most levels an analysis keeps, of every plane together: 256 MB, which
+/// a wide one of many channels at the largest FFT would pass.
+const MOST_LEVELS: usize = 1 << 26;
 pub const SILENCE_DB: f32 = -200.0;
 /// Frames a thread takes at a time when a target's signal is drawn out of
 /// the interleaved samples.
@@ -251,15 +255,16 @@ impl Layout {
     }
 }
 
-impl Analyzer {
-    pub fn new(spec: Spec, range: Range<usize>, frames: usize, channels: usize) -> Self {
-        let columns = range.len().clamp(1, MAX_COLUMNS);
-        Self::with_columns(spec, range, frames, channels, columns)
-    }
+/// The columns an analysis of `len` frames gets when `wanted` are asked
+/// for: no more than there are frames, nor than [`MOST_LEVELS`] holds.
+pub fn columns(spec: Spec, len: usize, channels: usize, wanted: usize) -> usize {
+    let levels = (spec.fft / 2 + 1) * spec.channels.targets(channels).len();
+    wanted.min(MOST_LEVELS / levels).clamp(1, len.max(1))
+}
 
-    /// As [`Analyzer::new`], with `columns` across rather than at most
-    /// [`MAX_COLUMNS`].
-    pub fn with_columns(
+impl Analyzer {
+    /// An analysis of `range` about `columns` wide, as [`columns`] allows.
+    pub fn new(
         spec: Spec,
         range: Range<usize>,
         frames: usize,
@@ -267,7 +272,7 @@ impl Analyzer {
         columns: usize,
     ) -> Self {
         let len = range.len().max(1);
-        let columns = columns.clamp(1, len);
+        let columns = self::columns(spec, len, channels, columns);
         let span = len as f64 / columns as f64;
         // Enough windows that every sample passes near the middle of one
         // rather than only through faded edges, and each column keeps the
@@ -563,15 +568,27 @@ pub fn colorize(
         .par_chunks_mut(a.columns)
         .enumerate()
         .for_each(|(row, line)| {
-            // Each row shows the loudest bin it covers, so narrow tones
-            // survive being scaled down.
+            // A row a bin tall or more shows the loudest bin it covers, so
+            // narrow tones survive being scaled down. A shorter one shows
+            // the level between the two bins nearest its middle, so a band
+            // drawn taller than its bins comes out smooth rather than in
+            // steps.
             let top = freq(1.0 - row as f32 / rows as f32);
             let bottom = freq(1.0 - (row + 1) as f32 / rows as f32);
             let first = ((bottom / bin_hz).floor() as usize).min(a.bins - 1);
             let last = ((top / bin_hz).ceil() as usize).clamp(first + 1, a.bins);
+            let middle = freq(1.0 - (row as f32 + 0.5) / rows as f32) / bin_hz;
+            let below = (middle.floor().max(0.0) as usize).min(a.bins - 2);
+            let between = (top - bottom < bin_hz).then(|| (middle - below as f32).clamp(0.0, 1.0));
             for (column, px) in line.iter_mut().enumerate() {
-                let spectrum = &db[column * a.bins..][first..last];
-                let level = spectrum.iter().copied().fold(SILENCE_DB, f32::max);
+                let spectrum = &db[column * a.bins..][..a.bins];
+                let level = match between {
+                    Some(t) => spectrum[below] + (spectrum[below + 1] - spectrum[below]) * t,
+                    None => spectrum[first..last]
+                        .iter()
+                        .copied()
+                        .fold(SILENCE_DB, f32::max),
+                };
                 let t = ((level + view.brightness) / view.contrast + 1.0).clamp(0.0, 1.0);
                 *px = lut[(t * 255.0) as usize];
             }
@@ -600,7 +617,7 @@ pub(crate) mod tests {
         piece: usize,
     ) -> Analysis {
         let frames = samples.len() / channels;
-        let mut a = Analyzer::new(spec, range, frames, channels);
+        let mut a = Analyzer::new(spec, range, frames, channels, DEFAULT_COLUMNS);
         let wanted = a.wanted();
         let mut at = wanted.start;
         while at < wanted.end {
@@ -739,6 +756,46 @@ pub(crate) mod tests {
         assert_eq!(held(&view, 48_000, 2048).map(|b| b.1), Some(24_000.0));
         view.f_min = 30_000.0;
         assert_eq!(held(&view, 48_000, 2048), None);
+    }
+
+    #[test]
+    fn a_band_drawn_taller_than_its_bins_is_smooth_rather_than_in_steps() {
+        let signal = sine(3_000.0, 48_000.0, 0.5);
+        let a = analyse(&signal, 1, mix(1024), 0..signal.len(), 100_000);
+        // 2.5 to 3.5 kHz: about 21 bins of 47 Hz, over 400 rows.
+        let view = View {
+            brightness: 0.0,
+            contrast: 90.0,
+            f_min: 2_500.0,
+            f_max: 3_500.0,
+            log: false,
+        };
+        let image = colorize(&a, 0, 48_000, &view, colorous::VIRIDIS, 400);
+        let column = a.columns / 2;
+        let floor = image.pixels[column];
+        let lit: Vec<Color32> = (0..400)
+            .map(|row| image.pixels[row * a.columns + column])
+            .filter(|&px| px != floor)
+            .collect();
+        // A bin is 19 rows tall here: in steps, each would be one colour.
+        let longest = lit
+            .chunk_by(|a, b| a == b)
+            .map(<[Color32]>::len)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            lit.len() > 40 && longest < 8,
+            "{} lit rows, longest run {longest}",
+            lit.len()
+        );
+        // Still brightest at the tone, halfway up.
+        let brightest = (0..400)
+            .max_by_key(|&row| image.pixels[row * a.columns + column].g())
+            .unwrap();
+        assert!(
+            (190..=210).contains(&brightest),
+            "brightest row {brightest}"
+        );
     }
 
     #[test]

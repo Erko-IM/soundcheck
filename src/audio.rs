@@ -195,10 +195,12 @@ pub fn open(path: &Path) -> Result<Opened, String> {
 }
 
 /// The whole of `path` read once: the header, the metadata, the levels
-/// for the meters, and the spectrogram of the whole file as `spec` asks.
+/// for the meters, and the spectrogram of the whole file as `spec` asks,
+/// about `columns` wide.
 pub fn load(
     path: &Path,
     spec: Spec,
+    columns: usize,
     cancel: &AtomicBool,
     progress: &AtomicU32,
 ) -> Result<(Loaded, Analysis), String> {
@@ -216,7 +218,8 @@ pub fn load(
     // analysis starts on trust, and a second pass redoes it if the file
     // turns out different.
     let planned = info.frames;
-    let mut analyzer = (planned > 0).then(|| Analyzer::new(spec, 0..planned, planned, channels));
+    let mut analyzer =
+        (planned > 0).then(|| Analyzer::new(spec, 0..planned, planned, channels, columns));
     // Whole blocks of levels per read, so no block straddles two.
     let piece = (piece_frames(channels) / levels.block).max(1) * levels.block;
     let mut buffer = vec![0.0; piece * channels];
@@ -248,7 +251,7 @@ pub fn load(
     info.frames = at;
     let analysis = match analyzer {
         Some(analyzer) if planned == at => analyzer.finish(),
-        _ => analyse(&source, &info, spec, 0..at, cancel, progress)?.ok_or("cancelled")?,
+        _ => analyse(&source, &info, spec, 0..at, columns, cancel, progress)?.ok_or("cancelled")?,
     };
     details
         .sections
@@ -266,22 +269,9 @@ pub fn load(
     ))
 }
 
-/// The spectrogram of `range` as `spec` asks, or `None` once `cancel` is
-/// set.
+/// The spectrogram of `range` as `spec` asks, about `columns` wide, or
+/// `None` once `cancel` is set.
 pub fn analyse(
-    source: &Source,
-    info: &Info,
-    spec: Spec,
-    range: Range<usize>,
-    cancel: &AtomicBool,
-    progress: &AtomicU32,
-) -> Result<Option<Analysis>, String> {
-    let analyzer = Analyzer::new(spec, range, info.frames, usize::from(info.channels));
-    run(source, info, analyzer, cancel, progress)
-}
-
-/// As [`analyse`], with `columns` across.
-pub fn analyse_columns(
     source: &Source,
     info: &Info,
     spec: Spec,
@@ -291,7 +281,7 @@ pub fn analyse_columns(
     progress: &AtomicU32,
 ) -> Result<Option<Analysis>, String> {
     let channels = usize::from(info.channels);
-    let analyzer = Analyzer::with_columns(spec, range, info.frames, channels, columns);
+    let analyzer = Analyzer::new(spec, range, info.frames, channels, columns);
     run(source, info, analyzer, cancel, progress)
 }
 
@@ -734,7 +724,7 @@ impl Coded {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::spectrogram::Channels;
+    use crate::spectrogram::{Channels, DEFAULT_COLUMNS};
 
     /// A 16-bit mono AIFF: a format symphonia reads, so it goes through
     /// [`Coded`] rather than the WAV reader.
@@ -790,7 +780,7 @@ pub(crate) mod tests {
             &wav::tests::build_channels(false, 2, &[], &samples),
         );
         let (cancel, progress) = idle();
-        let (loaded, analysis) = load(&path, mix(), &cancel, &progress).unwrap();
+        let (loaded, analysis) = load(&path, mix(), DEFAULT_COLUMNS, &cancel, &progress).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert_eq!(loaded.info.frames, 96_000);
         assert_eq!(analysis.envelope.len(), 2);
@@ -808,7 +798,7 @@ pub(crate) mod tests {
         let samples: Vec<i16> = (0..200_000).map(|i| (i % 30_000) as i16).collect();
         let path = temp_file("pieces.wav", &wav::tests::build(false, &[], &samples));
         let (cancel, progress) = idle();
-        let (loaded, _) = load(&path, mix(), &cancel, &progress).unwrap();
+        let (loaded, _) = load(&path, mix(), DEFAULT_COLUMNS, &cancel, &progress).unwrap();
         let mut reader = Reader::open(&loaded.source, 1).unwrap();
         let mut big = vec![0.0; 150_000];
         assert_eq!(reader.read(40_000, &mut big).unwrap(), 150_000);
@@ -827,7 +817,7 @@ pub(crate) mod tests {
         let samples: Vec<i16> = (0..30_000).map(|i| (i % 20_000) as i16).collect();
         let path = temp_file("timeline.aiff", &aiff(&samples, 48_000));
         let (cancel, progress) = idle();
-        let (loaded, analysis) = load(&path, mix(), &cancel, &progress).unwrap();
+        let (loaded, analysis) = load(&path, mix(), DEFAULT_COLUMNS, &cancel, &progress).unwrap();
         assert!(matches!(loaded.source, Source::Coded(_)));
         assert_eq!((loaded.info.frames, analysis.range.end), (30_000, 30_000));
 
@@ -871,10 +861,10 @@ pub(crate) mod tests {
     fn an_empty_or_unknown_file_is_an_error_not_a_panic() {
         let (cancel, progress) = idle();
         let path = temp_file("empty.wav", &wav::tests::build(false, &[], &[]));
-        assert!(load(&path, mix(), &cancel, &progress).is_err());
+        assert!(load(&path, mix(), DEFAULT_COLUMNS, &cancel, &progress).is_err());
         std::fs::remove_file(&path).unwrap();
         let path = temp_file("noise.bin", &[7u8; 4096]);
-        assert!(load(&path, mix(), &cancel, &progress).is_err());
+        assert!(load(&path, mix(), DEFAULT_COLUMNS, &cancel, &progress).is_err());
         std::fs::remove_file(&path).unwrap();
     }
 }

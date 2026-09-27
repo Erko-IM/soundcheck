@@ -11,24 +11,27 @@ use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 use eframe::egui::{ColorImage, FontDefinitions};
 
 use crate::audio::{self, Info, Source};
-use crate::spectrogram::{self, MAX_COLUMNS, Spec, View};
+use crate::spectrogram::{self, Spec, View};
 use crate::views;
 
-/// The most columns an export gets, and the most pixels in all: past these
-/// a long stretch comes out coarser rather than too big to open.
+/// The fewest columns an export gets, as a short stretch has fewer windows
+/// than make a sharp picture, and the most, with the most pixels in all:
+/// past these a long stretch comes out coarser rather than too big to open.
+const FEWEST_COLUMNS: usize = 4096;
 const MOST_COLUMNS: usize = 16_384;
 const MOST_PIXELS: usize = 64_000_000;
-/// The fewest rows the part of a lane the file holds gets, so a narrow band
-/// still reads, and the most a lane gets, so a band set far past what the
+/// The fewest rows the part of a lane the file holds gets, however few bins
+/// its band has, and the most a lane gets, so a band set far past what the
 /// file holds does not make a picture mostly of nothing.
-const FEWEST_ROWS: usize = 512;
+const FEWEST_ROWS: usize = 2048;
 const MOST_ROWS: usize = 8192;
-/// Room around the lanes for the title and the labels, and between lanes.
-const LEFT: usize = 76;
-const RIGHT: usize = 24;
-const TOP: usize = 40;
-const BOTTOM: usize = 58;
-const GAP: usize = 6;
+/// Room around the lanes for the title and the labels, and between lanes,
+/// with lanes 1024 rows tall; taller ones get more, see [`Room`].
+const LEFT: f32 = 76.0;
+const RIGHT: f32 = 24.0;
+const TOP: f32 = 40.0;
+const BOTTOM: f32 = 58.0;
+const GAP: f32 = 6.0;
 
 type Rgb = [u8; 3];
 const BACKGROUND: Rgb = [27, 27, 27];
@@ -61,6 +64,44 @@ pub struct Request {
     pub to: PathBuf,
 }
 
+/// The room around an export's lanes, and the size of its lettering and
+/// ticks, in proportion to how tall its lanes are, so a large picture reads
+/// as the screen does rather than with lettering lost in it.
+#[derive(Clone, Copy)]
+struct Room {
+    scale: f32,
+    left: usize,
+    right: usize,
+    top: usize,
+    bottom: usize,
+    gap: usize,
+}
+
+impl Room {
+    fn new(rows: usize) -> Self {
+        let scale = (rows as f32 / 1024.0).clamp(1.0, 3.0);
+        let px = |v: f32| (v * scale).round() as usize;
+        Self {
+            scale,
+            left: px(LEFT),
+            right: px(RIGHT),
+            top: px(TOP),
+            bottom: px(BOTTOM),
+            gap: px(GAP),
+        }
+    }
+
+    /// A text size, at this size.
+    fn size(self, points: f32) -> f32 {
+        points * self.scale
+    }
+
+    /// A length, at this size, and never under a pixel.
+    fn px(self, points: f32) -> usize {
+        ((points * self.scale).round() as usize).max(1)
+    }
+}
+
 /// Where an export of `range` of the file at `path` goes: beside it, named
 /// after it and the stretch, and never over a file already there.
 pub fn path_for(path: &Path, range: &Range<usize>, rate: f64) -> PathBuf {
@@ -78,9 +119,9 @@ pub fn path_for(path: &Path, range: &Range<usize>, rate: f64) -> PathBuf {
 
 /// Columns across and rows up each of `lanes` lanes for `len` frames, the
 /// file holding a band `bins` bins tall in `share` of each lane from the
-/// bottom: a column a quarter window along, and at least as many as the
-/// screen shows; a row a bin there, and at least [`FEWEST_ROWS`], with the
-/// rest of the lane in proportion up to [`MOST_ROWS`].
+/// bottom: a column a quarter window along, and at least
+/// [`FEWEST_COLUMNS`]; a row a bin there, and at least [`FEWEST_ROWS`],
+/// with the rest of the lane in proportion up to [`MOST_ROWS`].
 fn size(len: usize, fft: usize, bins: usize, share: f32, lanes: usize) -> (usize, usize) {
     let held = bins.max(FEWEST_ROWS);
     let rows = if share > 0.0 {
@@ -90,7 +131,7 @@ fn size(len: usize, fft: usize, bins: usize, share: f32, lanes: usize) -> (usize
     };
     let columns = len
         .div_ceil((fft / 4).max(1))
-        .max(len.min(MAX_COLUMNS))
+        .max(len.min(FEWEST_COLUMNS))
         .min(MOST_COLUMNS)
         .min(MOST_PIXELS / (rows * lanes.max(1)))
         .max(1);
@@ -114,7 +155,7 @@ pub fn export(
     });
     let lanes = r.lanes.len().max(1);
     let (columns, rows) = size(r.range.len(), r.spec.fft, bins, share, lanes);
-    let analysis = audio::analyse_columns(
+    let analysis = audio::analyse(
         &r.source,
         &r.info,
         r.spec,
@@ -128,38 +169,42 @@ pub fn export(
     };
     let definitions = FontDefinitions::default();
     let fonts = Fonts::new(&definitions)?;
+    let room = Room::new(rows);
     let mut canvas = Canvas::new(
-        LEFT + analysis.columns + RIGHT,
-        TOP + lanes * rows + (lanes - 1) * GAP + BOTTOM,
+        room.left + analysis.columns + room.right,
+        room.top + lanes * rows + (lanes - 1) * room.gap + room.bottom,
     );
     // The rows the file holds, from the bottom of each lane, and above them
     // the rows past its limit.
     let held_rows = (rows as f32 * share).round() as usize;
     let past = rows - held_rows;
     for plane in 0..analysis.planes.len() {
-        let top = TOP + plane * (rows + GAP);
+        let top = room.top + plane * (rows + room.gap);
         if held_rows > 0 {
             let image =
                 spectrogram::colorize(&analysis, plane, rate, &r.view, r.gradient, held_rows);
-            canvas.image(LEFT, top + past, &image);
+            canvas.image(room.left, top + past, &image);
         }
         if past > 0 {
-            let across = LEFT..LEFT + analysis.columns;
+            let across = room.left..room.left + analysis.columns;
             canvas.hatch(across.clone(), top..top + past);
-            canvas.hline(across, top + past - 1, LIMIT);
+            for line in 0..room.px(1.0).min(past) {
+                canvas.hline(across.clone(), top + past - 1 - line, LIMIT);
+            }
             canvas.note(
                 &fonts.proportional,
-                (LEFT, top),
+                room.size(13.0),
+                (room.left, top),
                 (analysis.columns, past),
                 &r.beyond,
             );
         }
-        freq_axis(&mut canvas, &fonts, top, rows, (lo, hi), r);
+        freq_axis(&mut canvas, &fonts, room, top, rows, (lo, hi), r);
         if let Some(name) = r.lanes.get(plane).filter(|_| lanes > 1) {
             canvas.text(
                 &fonts.proportional,
-                13.0,
-                (LEFT + 6, top + 4),
+                room.size(13.0),
+                (room.left + room.px(6.0), top + room.px(4.0)),
                 Align::TopLeft,
                 name,
                 TITLE,
@@ -169,14 +214,15 @@ pub fn export(
     time_axis(
         &mut canvas,
         &fonts,
+        room,
         analysis.columns,
-        TOP + lanes * rows + (lanes - 1) * GAP,
+        room.top + lanes * rows + (lanes - 1) * room.gap,
         r,
     );
     canvas.text(
         &fonts.proportional,
-        17.0,
-        (LEFT, 10),
+        room.size(17.0),
+        (room.left, room.px(10.0)),
         Align::TopLeft,
         &r.title,
         TITLE,
@@ -190,6 +236,7 @@ pub fn export(
 fn freq_axis(
     canvas: &mut Canvas,
     fonts: &Fonts,
+    room: Room,
     top: usize,
     rows: usize,
     (lo, hi): (f32, f32),
@@ -197,14 +244,18 @@ fn freq_axis(
 ) {
     let (lo, hi) = (lo * r.scale, hi * r.scale);
     let bottom = (top + rows) as f32;
-    for f in views::freq_ticks(lo, hi, r.view.log, rows as f32, 16.0) {
+    let ticks = views::freq_ticks(lo, hi, r.view.log, rows as f32 / room.scale, 16.0);
+    for f in ticks {
         let y = (bottom - views::freq_t(f, lo, hi, r.view.log) * rows as f32).round() as usize;
-        canvas.hline(LEFT - 6..LEFT, y.min(top + rows - 1), AXIS);
+        for line in 0..room.px(1.0) {
+            let y = (y + line).min(top + rows - 1);
+            canvas.hline(room.left - room.px(6.0)..room.left, y, AXIS);
+        }
         let label = views::hz(f);
         canvas.text(
             &fonts.mono,
-            13.0,
-            (LEFT - 9, y),
+            room.size(13.0),
+            (room.left - room.px(9.0), y),
             Align::RightCentre,
             &label,
             AXIS,
@@ -213,8 +264,8 @@ fn freq_axis(
     let hz = if r.scale == 1.0 { "Hz" } else { "Hz, shifted" };
     canvas.text(
         &fonts.mono,
-        11.0,
-        (LEFT - 9, top.saturating_sub(4)),
+        room.size(11.0),
+        (room.left - room.px(9.0), top.saturating_sub(room.px(4.0))),
         Align::RightBottom,
         hz,
         WALL_CLOCK,
@@ -223,23 +274,36 @@ fn freq_axis(
 
 /// Elapsed time under the lanes, ending at `bottom`, and the time of day
 /// under that when the recording says when it started.
-fn time_axis(canvas: &mut Canvas, fonts: &Fonts, width: usize, bottom: usize, r: &Request) {
+fn time_axis(
+    canvas: &mut Canvas,
+    fonts: &Fonts,
+    room: Room,
+    width: usize,
+    bottom: usize,
+    r: &Request,
+) {
     let rate = f64::from(r.info.sample_rate);
     let (start, len) = (r.range.start as f64, r.range.len().max(1) as f64);
-    let step = views::time_step(len / rate, width as f32);
+    let step = views::time_step(len / rate, width as f32 / room.scale);
     let decimals = views::decimals(step);
     let first = (start / rate / step).ceil() as i64;
     let last = ((start + len) / rate / step).floor() as i64;
     for i in first..=last {
         let t = i as f64 * step;
-        let x = LEFT + (((t * rate - start) / len) * width as f64).round() as usize;
-        let x = x.min(LEFT + width - 1);
-        canvas.vline(x, bottom..bottom + 6, AXIS);
+        let x = room.left + (((t * rate - start) / len) * width as f64).round() as usize;
+        let x = x.min(room.left + width - 1);
+        for line in 0..room.px(1.0) {
+            canvas.vline(
+                (x + line).min(room.left + width - 1),
+                bottom..bottom + room.px(6.0),
+                AXIS,
+            );
+        }
         let label = views::clock_with(t, decimals);
         canvas.text(
             &fonts.mono,
-            14.0,
-            (x, bottom + 8),
+            room.size(14.0),
+            (x, bottom + room.px(8.0)),
             Align::TopCentre,
             &label,
             ELAPSED,
@@ -248,8 +312,8 @@ fn time_axis(canvas: &mut Canvas, fonts: &Fonts, width: usize, bottom: usize, r:
             let label = views::wall_with(wall + t, decimals);
             canvas.text(
                 &fonts.mono,
-                11.0,
-                (x, bottom + 28),
+                room.size(11.0),
+                (x, bottom + room.px(28.0)),
                 Align::TopCentre,
                 &label,
                 WALL_CLOCK,
@@ -353,23 +417,30 @@ impl Canvas {
         }
     }
 
-    /// `text` on a dark ground in the middle of the stretch `size` across
-    /// from `(x, y)`, where it fits.
+    /// `text`, `size` pixels high, on a dark ground in the middle of the
+    /// stretch `width` by `height` from `(x, y)`, where it fits.
     fn note(
         &mut self,
         font: &FontRef<'_>,
+        size: f32,
         (x, y): (usize, usize),
         (width, height): (usize, usize),
         text: &str,
     ) {
-        let size = 13.0;
         let scaled = font.as_scaled(PxScale::from(size));
         let wide: f32 = text
             .chars()
             .map(|c| scaled.h_advance(scaled.glyph_id(c)))
             .sum();
         let tall = scaled.ascent() - scaled.descent();
-        let (w, h) = (wide.ceil() as usize + 12, tall.ceil() as usize + 6);
+        let (pad_x, pad_y) = (
+            (size * 0.45).round() as usize,
+            (size * 0.23).round() as usize,
+        );
+        let (w, h) = (
+            wide.ceil() as usize + 2 * pad_x,
+            tall.ceil() as usize + 2 * pad_y,
+        );
         if w > width || h > height {
             return;
         }
@@ -379,7 +450,14 @@ impl Canvas {
                 self.blend(px as i64, py as i64, [0, 0, 0], 0.82);
             }
         }
-        self.text(font, size, (left + 6, top + 3), Align::TopLeft, text, AXIS);
+        self.text(
+            font,
+            size,
+            (left + pad_x, top + pad_y),
+            Align::TopLeft,
+            text,
+            AXIS,
+        );
     }
 
     fn text(
@@ -462,11 +540,16 @@ mod tests {
     use crate::wav;
 
     #[test]
-    fn a_short_view_keeps_the_screen_s_detail_and_a_long_one_gets_a_column_a_step() {
-        assert_eq!(size(4_000, 2048, 1025, 1.0, 1), (2048, 1025));
-        assert_eq!(size(10 * 48_000, 2048, 1025, 1.0, 1), (2048, 1025));
-        assert_eq!(size(60 * 48_000, 2048, 1025, 1.0, 1), (5625, 1025));
+    fn a_short_view_gets_the_fewest_columns_and_a_long_one_a_column_a_step() {
+        assert_eq!(size(4_000, 2048, 1025, 1.0, 1), (4000, FEWEST_ROWS));
+        assert_eq!(
+            size(10 * 48_000, 2048, 1025, 1.0, 1),
+            (FEWEST_COLUMNS, FEWEST_ROWS)
+        );
+        assert_eq!(size(60 * 48_000, 2048, 1025, 1.0, 1), (5625, FEWEST_ROWS));
         assert_eq!(size(3600 * 48_000, 2048, 1025, 1.0, 1).0, MOST_COLUMNS);
+        // More bins than the fewest rows: a row each.
+        assert_eq!(size(60 * 48_000, 8192, 4097, 1.0, 1).1, 4097);
     }
 
     #[test]
@@ -478,8 +561,8 @@ mod tests {
 
     #[test]
     fn a_band_past_what_the_file_holds_gets_rows_in_proportion_up_to_a_limit() {
-        // Up to 96 kHz on a 48 kHz file: the file fills a quarter of the lane.
-        assert_eq!(size(48_000, 2048, 1025, 0.25, 1).1, 4100);
+        // Up to 48 kHz on a 48 kHz file: the file fills half the lane.
+        assert_eq!(size(48_000, 2048, 1025, 0.5, 1).1, 2 * FEWEST_ROWS);
         assert_eq!(size(48_000, 2048, 1025, 0.001, 1).1, MOST_ROWS);
         assert_eq!(size(48_000, 2048, 0, 0.0, 1).1, FEWEST_ROWS);
     }
@@ -544,15 +627,22 @@ mod tests {
             (info.width as usize, info.height as usize, pixels)
         };
         let (width, height, _) = read(&to);
-        // 24 000 frames at a column every 256, and at least the screen's.
+        // 24 000 frames at a column every 256, which is fewer than the
+        // fewest, and a band of 512 bins, fewer than the fewest rows: twice
+        // the lanes a 1024-row one has, and twice its room.
+        let room = Room::new(FEWEST_ROWS);
+        assert_eq!(room.left, 2 * LEFT as usize);
         assert_eq!(
             (width, height),
-            (LEFT + 2048 + RIGHT, TOP + FEWEST_ROWS + BOTTOM)
+            (
+                room.left + FEWEST_COLUMNS + room.right,
+                room.top + FEWEST_ROWS + room.bottom
+            )
         );
         fs::remove_file(&to).unwrap();
 
-        // Up to 96 kHz: the file's 24 kHz fills the bottom quarter, and the
-        // rest is hatched, the same rows a bin as before.
+        // Up to 96 kHz: the file's 24 kHz fills the bottom quarter, as tall
+        // as before, and the rest is hatched.
         let past = Request {
             view: View {
                 f_max: 96_000.0,
@@ -562,12 +652,14 @@ mod tests {
         };
         export(&past, &cancel, &progress).unwrap();
         let (width, height, pixels) = read(&to);
-        assert_eq!(height, TOP + 4 * FEWEST_ROWS + BOTTOM);
+        let room = Room::new(4 * FEWEST_ROWS);
+        assert_eq!(height, room.top + 4 * FEWEST_ROWS + room.bottom);
         let at = |x: usize, y: usize| &pixels[(y * width + x) * 3..][..3];
-        let hatched = (0..9).any(|dx| at(LEFT + 100 + dx, TOP + 10) == BEYOND_HATCH)
-            && (0..9).any(|dx| at(LEFT + 100 + dx, TOP + 10) == BEYOND);
-        assert!(hatched, "{:?}", at(LEFT + 100, TOP + 10));
-        assert_eq!(at(LEFT + 100, TOP + 3 * FEWEST_ROWS - 1), LIMIT);
+        let (x, y) = (room.left + 100, room.top + 10);
+        let hatched = (0..9).any(|dx| at(x + dx, y) == BEYOND_HATCH)
+            && (0..9).any(|dx| at(x + dx, y) == BEYOND);
+        assert!(hatched, "{:?}", at(x, y));
+        assert_eq!(at(x, room.top + 3 * FEWEST_ROWS - 1), LIMIT);
         fs::remove_file(&to).unwrap();
         fs::remove_file(&path).unwrap();
     }

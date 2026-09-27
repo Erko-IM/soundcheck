@@ -351,8 +351,8 @@ impl Running {
 struct Shown {
     analysis: Analysis,
     textures: Vec<TextureHandle>,
-    /// What the images were coloured with.
-    look: Option<Look>,
+    /// What the images were coloured with, and the rows each has.
+    look: Option<(Look, usize)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -370,14 +370,20 @@ impl Shown {
         }
     }
 
-    fn refresh(&mut self, ctx: &egui::Context, look: Look, sample_rate: u32, name: &str) {
-        if self.look == Some(look) {
+    /// The images coloured as `look` has it, `rows` tall.
+    fn refresh(
+        &mut self,
+        ctx: &egui::Context,
+        look: Look,
+        rows: usize,
+        sample_rate: u32,
+        name: &str,
+    ) {
+        if self.look == Some((look, rows)) {
             return;
         }
-        self.look = Some(look);
+        self.look = Some((look, rows));
         let planes = self.analysis.planes.len();
-        // Lanes share the height, so they can share the rows.
-        let rows = (1024 / planes.max(1)).max(256);
         for plane in 0..planes {
             let image = spectrogram::colorize(
                 &self.analysis,
@@ -474,6 +480,13 @@ pub struct App {
     detail: Option<Shown>,
     detail_job: Option<Running>,
     detail_due: Option<Instant>,
+    /// The whole file analysed again, once the spectrogram is drawn wider
+    /// than its analysis has columns for.
+    whole_due: Option<Instant>,
+    /// Columns an analysis for the screen gets, and rows each lane's image
+    /// gets: a pixel each, as the spectrogram was last drawn.
+    columns: usize,
+    rows: usize,
     /// Frames in view.
     view: Range<f64>,
     /// When the view was last moved by hand, if it has been since the
@@ -610,6 +623,9 @@ impl App {
             detail: None,
             detail_job: None,
             detail_due: None,
+            whole_due: None,
+            columns: spectrogram::DEFAULT_COLUMNS,
+            rows: 1024,
             view: 0.0..0.0,
             moved_at: None,
             selection: None,
@@ -709,6 +725,7 @@ impl App {
         self.detail = None;
         self.detail_job = None;
         self.detail_due = None;
+        self.whole_due = None;
         self.view = 0.0..0.0;
         self.moved_at = None;
         self.selection = None;
@@ -732,14 +749,20 @@ impl App {
         self.export_error = None;
         let (running, cancel, progress) = Running::new(0);
         self.loading = Some(running);
-        let (tx, ctx, generation, spec) =
-            (self.tx.clone(), ctx.clone(), self.generation, self.spec());
+        let (tx, ctx, generation, spec, columns) = (
+            self.tx.clone(),
+            ctx.clone(),
+            self.generation,
+            self.spec(),
+            self.columns,
+        );
         std::thread::spawn(move || {
             // A decoder panic on a hostile or damaged file must end as an
             // error, not as a spinner that never stops.
-            let result = std::panic::catch_unwind(|| audio::load(&path, spec, &cancel, &progress))
-                .unwrap_or_else(|_| Err("the decoder crashed on this file".into()))
-                .map(Box::new);
+            let result =
+                std::panic::catch_unwind(|| audio::load(&path, spec, columns, &cancel, &progress))
+                    .unwrap_or_else(|_| Err("the decoder crashed on this file".into()))
+                    .map(Box::new);
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
@@ -931,16 +954,19 @@ impl App {
         };
         let (source, info) = (current.source.clone(), current.info.clone());
         self.jobs += 1;
-        let (id, generation, spec) = (self.jobs, self.generation, self.spec());
+        let (id, generation, spec, columns) =
+            (self.jobs, self.generation, self.spec(), self.columns);
         let (running, cancel, progress) = Running::new(id);
         if whole {
             self.whole_job = Some(running);
+            self.whole_due = None;
         } else {
             self.detail_job = Some(running);
+            self.detail_due = None;
         }
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let run = || audio::analyse(&source, &info, spec, range, &cancel, &progress);
+            let run = || audio::analyse(&source, &info, spec, range, columns, &cancel, &progress);
             let result = match std::panic::catch_unwind(run) {
                 Ok(Ok(Some(analysis))) => Ok(analysis),
                 Ok(Ok(None)) => return,
@@ -1161,7 +1187,7 @@ impl App {
     fn release(&mut self) {
         self.released = Some(Released {
             player: self.player.take().map(|p| (p.position(), p.is_playing())),
-            whole: self.whole_job.take().is_some(),
+            whole: self.whole_job.take().is_some() || self.whole_due.take().is_some(),
             detail: self.detail_job.take().is_some() || self.detail_due.take().is_some(),
         });
         self.probe = None;
@@ -1365,10 +1391,10 @@ impl App {
         let Some(rate) = self.current.as_ref().map(|c| c.info.sample_rate) else {
             return;
         };
-        let look = self.look();
+        let (look, rows) = (self.look(), self.rows);
         for (shown, name) in [(&mut self.whole, "whole"), (&mut self.detail, "detail")] {
             if let Some(shown) = shown {
-                shown.refresh(ctx, look, rate, name);
+                shown.refresh(ctx, look, rows, rate, name);
             }
         }
     }
@@ -1490,13 +1516,47 @@ impl App {
     }
 
     fn start_due_analysis(&mut self, ctx: &egui::Context) {
-        let Some(due) = self.detail_due else { return };
         let now = Instant::now();
-        if now >= due {
-            self.detail_due = None;
-            self.analyse(ctx, false);
-        } else {
-            ctx.request_repaint_after(due - now);
+        for whole in [true, false] {
+            let due = if whole {
+                self.whole_due
+            } else {
+                self.detail_due
+            };
+            match due {
+                Some(at) if now >= at => self.analyse(ctx, whole),
+                Some(at) => ctx.request_repaint_after(at - now),
+                None => {}
+            }
+        }
+    }
+
+    /// Fits the analyses and their images to the spectrogram as drawn,
+    /// `width` pixels across and each lane `lane` pixels up: a column and a
+    /// row a pixel. Once it is drawn wider than an analysis has columns
+    /// for, that one is done again when the size rests.
+    fn fit_to(&mut self, width: f32, lane: f32) {
+        self.rows = (lane.round() as usize).clamp(256, 4096);
+        let columns =
+            (width.round() as usize).clamp(spectrogram::DEFAULT_COLUMNS, spectrogram::MAX_COLUMNS);
+        if columns == self.columns {
+            return;
+        }
+        self.columns = columns;
+        let Some(current) = &self.current else { return };
+        let (spec, channels) = (self.spec(), usize::from(current.info.channels));
+        let narrow = |shown: &Option<Shown>| {
+            shown.as_ref().is_some_and(|s| {
+                let fits = spectrogram::columns(spec, s.analysis.range.len(), channels, columns);
+                s.analysis.columns * 10 < fits * 9
+            })
+        };
+        let due = Instant::now() + SETTLE;
+        if narrow(&self.whole) {
+            self.whole_due = Some(due);
+        }
+        if narrow(&self.detail) && self.zoomed() {
+            self.detail_due = Some(due);
         }
     }
 
@@ -2456,12 +2516,25 @@ impl App {
         let start = Settings::default();
         let mut reset = None;
         ui.horizontal_wrapped(|ui| {
-            ui.label("FFT");
+            ui.label("FFT").on_hover_text(
+                "How many samples each column is worked out from. A larger FFT separates frequencies that lie closer together, but blurs whatever changes quickly; a smaller one keeps fast calls, trills and clicks sharp, but blurs frequencies together. The list gives each size's length, and how far apart two frequencies have to be for it to tell them apart, in this file.",
+            );
+            let size = |n: usize| match rate {
+                0 => n.to_string(),
+                rate => {
+                    let rate = f64::from(rate);
+                    format!(
+                        "{n}    {:.1} ms, {} apart",
+                        n as f64 * 1000.0 / rate,
+                        views::hz_field(rate / n as f64)
+                    )
+                }
+            };
             egui::ComboBox::from_id_salt("fft")
                 .selected_text(self.settings.fft.to_string())
                 .show_ui(ui, |ui| {
                     for n in spectrogram::FFT_SIZES {
-                        ui.selectable_value(&mut self.settings.fft, n, n.to_string());
+                        ui.selectable_value(&mut self.settings.fft, n, size(n));
                     }
                 });
             ui.label("Colours");
@@ -2775,6 +2848,9 @@ impl App {
         if plot.width() < 20.0 || plot.height() < 20.0 {
             return;
         }
+        let ppp = ui.ctx().pixels_per_point();
+        let lane = views::lanes(plot, self.targets().len())[0].height();
+        self.fit_to(plot.width() * ppp, lane * ppp);
         let Some(current) = &self.current else { return };
         let response = ui.interact(plot, ui.id().with("spectrogram"), Sense::click_and_drag());
         let painter = ui.painter_at(area);
