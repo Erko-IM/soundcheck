@@ -35,11 +35,14 @@ This project is open-source - no catch, nothing proprietary, just seems like a u
 Press "m" to mark a place on the soundfile, it will also immediately put you on the name place.
 Press "r" to reset the selected configuration box, or "shift+r" to reset all the configs. The small circular arrow next to each slider does the same for that one.
 Click in the file list, then the up and down arrows move through it, opening each file as you land on it. If the current one is playing, the next one starts playing too.
-Drag the zoomed part of the timeline to move it. After a drag or a click there, left and right move it along (shift for a whole view), up and down make it wider or narrower (shift doubles or halves), and "r" shows the whole file.
+The waveform under the spectrogram is the whole file: drag across it to pick the part the spectrogram shows, drag that part's box or its ends to move or size it, and click to jump there with the playhead. After a drag or a click there, left and right move it along (shift for a whole view), up and down make it wider or narrower (shift doubles or halves), and "r" shows the whole file.
+The gear at the top right (or cmd+,) opens the menu with the views to show and the tools, like Pitch shift and Slow speeds.
 "Slider" next to the speed buttons swaps them for a slider from 1/1000x to 1000x; click its number to type any speed, like 3.7 or 1/250.
-"Bulk rename" under Show renames all the files in the explorer's folder at once, with an Insert for text or a counting number; "All rules" next to it opens a window with every rule, laid out like Bulk Rename Utility. Click the file name at the top to rename just that file.
+"Bulk rename" in the gear's menu renames all the files in the explorer's folder at once, with an Insert for text or a counting number; "All rules" next to it opens a window with every rule, laid out like Bulk Rename Utility. Click the file name at the top to rename just that file.
 The yellow button next to each meter mutes that channel (it turns red); with "Both speakers" ticked, the channels left play in both speakers.
-Shift-drag on the spectrogram picks an area (a stretch of time and a band of frequencies) and plays just that; add more and they play in turn, together where they overlap. Shift-click one to drop it; a plain drag drops them all.
+Shift-drag on the spectrogram picks an area (a stretch of time and a band of frequencies) and plays just that; a new one takes its place. With "Multiple areas" ticked in the gear's menu, each new one adds to the rest, and they play in turn, together where they overlap. Shift-click one to drop it; a plain drag drops them all.
+"Export PNG" saves the spectrogram as it shows, with its axes and at full detail, next to the recording.
+The Metadata view edits every tag a file has: in WAV files Broadcast WAV, RIFF INFO, iXML, ID3 and GUANO (bat detectors write that one), in MP3 ID3v2, ID3v1 and APE, in FLAC and Ogg Vorbis comments, in M4A the iTunes ones and in AIFF ID3v2 and its text chunks. Each field can be changed or taken out with the ×, and "Add a field" adds one.
 The rest should be pretty self-explanatory.
 
 ## License

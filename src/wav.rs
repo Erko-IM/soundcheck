@@ -114,6 +114,8 @@ pub struct Wav {
     pub data: Range<u64>,
     pub bext: Option<Bext>,
     pub ixml: Option<String>,
+    /// The `guan` chunk's text, as bat detectors write it.
+    pub guano: Option<String>,
     /// `LIST/INFO` entries, e.g. `(*b"ICMT", "a comment")`.
     pub info: Vec<([u8; 4], String)>,
     /// The file's markers, in order, or `None` when it has no `cue ` chunk.
@@ -206,6 +208,7 @@ pub fn parse<R: Read + Seek>(file: &mut R) -> Result<Wav, Error> {
     let mut data_size_64 = None;
     let mut bext = None;
     let mut ixml = None;
+    let mut guano = None;
     let mut info = Vec::new();
     let mut cue_points = None;
     let mut adtl = Adtl::default();
@@ -241,6 +244,7 @@ pub fn parse<R: Read + Seek>(file: &mut R) -> Result<Wav, Error> {
             // take the first.
             b"bext" if bext.is_none() => bext = parse_bext(body(file)?),
             b"iXML" if ixml.is_none() => ixml = Some(text(&body(file)?)),
+            b"guan" if guano.is_none() => guano = Some(text(&body(file)?)),
             b"cue " => cue_points
                 .get_or_insert_with(Vec::new)
                 .extend(parse_cue(&body(file)?)),
@@ -268,6 +272,7 @@ pub fn parse<R: Read + Seek>(file: &mut R) -> Result<Wav, Error> {
         data,
         bext,
         ixml,
+        guano,
         info,
         cues: cue_points.map(|points| adtl.markers(points)),
         chunks,

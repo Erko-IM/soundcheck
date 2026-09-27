@@ -11,6 +11,8 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::audio::Coded;
+use crate::tags::{self, Block, Kind};
 use crate::wav::{self, Chunk, Marker, Wav};
 
 /// What to write in place of each kind of chunk the editor handles. `None`
@@ -24,6 +26,9 @@ pub struct Changes {
     /// Written as a `cue ` chunk, even when empty, so that removing every
     /// marker sticks.
     pub markers: Option<Vec<Marker>>,
+    /// Each tag changed, as read and as edited: in a WAV file its ID3v2 and
+    /// GUANO, and in any other every kind lofty writes.
+    pub tags: Vec<(Block, Block)>,
 }
 
 const BLOCK: usize = 1 << 20;
@@ -34,9 +39,15 @@ pub fn save(path: &Path, changes: &Changes, progress: &AtomicU32) -> Result<(), 
     let _ = fs::remove_file(&temp);
     let written = (|| {
         let mut original = File::open(path).map_err(|e| format!("cannot open: {e}"))?;
-        let w = wav::parse(&mut original).map_err(|e| e.to_string())?;
-        write(&mut original, &w, changes, &temp, progress)?;
-        verify(&mut original, &w, changes, &temp, progress)?;
+        match wav::parse(&mut original) {
+            Ok(w) => {
+                let tags = TagChunks::new(path, &w, changes)?;
+                write(&mut original, &w, changes, &tags, &temp, progress)?;
+                verify(&mut original, &w, changes, &tags, &temp, progress)?;
+            }
+            Err(wav::Error::NotWav) => coded(path, changes, &temp)?,
+            Err(e) => return Err(e.to_string()),
+        }
         keep_attributes(path, &temp)
     })();
     let placed = written.and_then(|()| {
@@ -47,6 +58,67 @@ pub fn save(path: &Path, changes: &Changes, progress: &AtomicU32) -> Result<(), 
     }
     progress.store(1000, Ordering::Relaxed);
     placed
+}
+
+/// Tags written into a copy of a file other than WAV. Only lofty writes
+/// those, so the copy's audio, packet by packet, must be the original's,
+/// and its tags read back as edited.
+fn coded(path: &Path, changes: &Changes, temp: &Path) -> Result<(), String> {
+    fs::copy(path, temp).map_err(|e| format!("cannot write the new file: {e}"))?;
+    tags::write(temp, &changes.tags)?;
+    let wrong =
+        |what: &str| format!("the new file came out wrong ({what}), so nothing was changed");
+    if !same_packets(path, temp).map_err(|e| wrong(&e))? {
+        return Err(wrong("audio"));
+    }
+    tags::came_out(temp, &changes.tags).map_err(|e| wrong(&e))
+}
+
+fn same_packets(a: &Path, b: &Path) -> Result<bool, String> {
+    let (mut a, mut b) = (Coded::open(a)?, Coded::open(b)?);
+    loop {
+        match (a.raw_packet()?, b.raw_packet()?) {
+            (None, None) => return Ok(true),
+            (x, y) if x == y => {}
+            _ => return Ok(false),
+        }
+    }
+}
+
+/// The bodies of the WAV chunks tags go in, for each tag changed: `None`
+/// keeps the file's own, and an empty one drops it.
+struct TagChunks {
+    id3: Option<Vec<u8>>,
+    /// `id3 ` or `ID3 `, as the file has it.
+    id3_id: [u8; 4],
+    guano: Option<String>,
+}
+
+impl TagChunks {
+    fn new(path: &Path, w: &Wav, changes: &Changes) -> Result<Self, String> {
+        let id3_id = w
+            .chunks
+            .iter()
+            .find(|c| is_id3(&c.id))
+            .map_or(*b"id3 ", |c| c.id);
+        let mut chunks = Self {
+            id3: None,
+            id3_id,
+            guano: None,
+        };
+        for (saved, edited) in &changes.tags {
+            match saved.kind {
+                Kind::Id3v2 => chunks.id3 = Some(tags::wav_id3_bytes(path, saved, edited)?),
+                Kind::Guano => chunks.guano = Some(tags::guano_text(edited)?),
+                _ => return Err(format!("{} is not kept in WAV files", saved.title())),
+            }
+        }
+        Ok(chunks)
+    }
+}
+
+fn is_id3(id: &[u8; 4]) -> bool {
+    id == b"id3 " || id == b"ID3 "
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -140,12 +212,15 @@ struct Written {
     ixml: bool,
     info: bool,
     markers: bool,
+    id3: bool,
+    guano: bool,
 }
 
 fn write(
     original: &mut File,
     w: &Wav,
     changes: &Changes,
+    tags: &TagChunks,
     temp: &Path,
     progress: &AtomicU32,
 ) -> Result<(), String> {
@@ -217,6 +292,18 @@ fn write(
                     }
                 }
             }
+            "id3" if !done.id3 => {
+                done.id3 = true;
+                if let Some(id3) = tags.id3.as_ref().filter(|b| !b.is_empty()) {
+                    out.chunk(&tags.id3_id, id3)?;
+                }
+            }
+            "guan" if !done.guano => {
+                done.guano = true;
+                if let Some(guano) = tags.guano.as_ref().filter(|t| !t.is_empty()) {
+                    out.chunk(b"guan", guano.as_bytes())?;
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -239,6 +326,8 @@ fn write(
                 b"bext" if changes.bext.is_some() && !done.bext => Some(Some("bext")),
                 b"iXML" if changes.ixml.is_some() && !done.ixml => Some(Some("iXML")),
                 b"cue " if changes.markers.is_some() => Some(Some("cue ")),
+                id if is_id3(id) && tags.id3.is_some() && !done.id3 => Some(Some("id3")),
+                b"guan" if tags.guano.is_some() && !done.guano => Some(Some("guan")),
                 b"LIST" => match &list_type(original, chunk)? {
                     b"INFO" if changes.info.is_some() => Some(Some("INFO")),
                     // Written along with the cue points.
@@ -261,7 +350,7 @@ fn write(
             }
         }
         // Whatever the file had no chunk of goes after the audio.
-        for what in ["INFO", "cue ", "iXML"] {
+        for what in ["INFO", "cue ", "iXML", "id3", "guan"] {
             put(&mut out, &mut done, what)?;
         }
         out.file.flush()
@@ -294,6 +383,7 @@ fn verify(
     original: &mut File,
     w: &Wav,
     changes: &Changes,
+    tags: &TagChunks,
     temp: &Path,
     progress: &AtomicU32,
 ) -> Result<(), String> {
@@ -326,6 +416,20 @@ fn verify(
     }
     if c.ixml.as_deref() != ixml {
         return Err(wrong("iXML"));
+    }
+    let guano = match &tags.guano {
+        Some(text) if text.is_empty() => None,
+        Some(text) => Some(text.trim().to_owned()),
+        None => w.guano.clone(),
+    };
+    if c.guano != guano {
+        return Err(wrong("GUANO"));
+    }
+    if let Some((_, edited)) = changes.tags.iter().find(|(s, _)| s.kind == Kind::Id3v2) {
+        let back = tags::wav_id3(temp).map_err(|e| wrong(&e))?;
+        if !tags::matches(back.as_ref(), edited) {
+            return Err(wrong("ID3"));
+        }
     }
     Ok(())
 }
@@ -469,10 +573,192 @@ fn same_file(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::tests::temp_file;
+    use crate::audio::{self, tests::temp_file};
+    use crate::edit::Edits;
+    use crate::tags::Field;
     use crate::wav::tests::{build, marker};
     use std::io::Cursor;
     use std::time::{Duration, SystemTime};
+
+    /// A copy, named `copy`, of the file `name` in testdata, for a test to
+    /// change.
+    fn fixture(name: &str, copy: &str) -> PathBuf {
+        let from = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(name);
+        temp_file(copy, &fs::read(from).unwrap())
+    }
+
+    fn edits_of(path: &Path) -> Edits {
+        audio::open(path).unwrap().edits.unwrap()
+    }
+
+    fn fields(block: &Block) -> Vec<(&str, &str)> {
+        block
+            .fields
+            .iter()
+            .map(|f| (f.key.as_str(), f.value.as_str()))
+            .collect()
+    }
+
+    fn added(key: &str, value: &str) -> Field {
+        Field {
+            key: key.into(),
+            value: value.into(),
+            from: None,
+        }
+    }
+
+    #[test]
+    fn tags_change_in_every_kind_of_file_lofty_writes_and_the_audio_stays_as_it_was() {
+        for (name, key) in [
+            ("tagged.mp3", "TXXX:Species"),
+            ("tagged.aiff", "TXXX:Species"),
+            ("tagged.flac", "SPECIES"),
+            ("tagged.m4a", "----:com.apple.iTunes:Species"),
+            ("tagged.ogg", "SPECIES"),
+        ] {
+            let path = fixture(name, name);
+            let original = fixture(name, &format!("original-{name}"));
+            let saved = edits_of(&path);
+            let mut edits = saved.clone();
+            let block = &mut edits.tags[0];
+            block
+                .fields
+                .iter_mut()
+                .find(|f| f.value == "Pier")
+                .unwrap()
+                .value = "New pier".into();
+            block.fields.retain(|f| f.value != "Diane");
+            block.fields.push(added(key, "Myotis daubentonii"));
+            save(&path, &edits.changes(&saved).unwrap(), &AtomicU32::new(0)).unwrap();
+            let back = edits_of(&path);
+            let now = fields(&back.tags[0]);
+            assert!(
+                now.contains(&(key, "Myotis daubentonii")),
+                "{name}: {now:?}"
+            );
+            assert!(now.iter().any(|f| f.1 == "New pier"), "{name}: {now:?}");
+            assert!(
+                !now.iter().any(|f| f.1 == "Diane" || f.1 == "Pier"),
+                "{name}: {now:?}"
+            );
+            assert_eq!(back.tags[0].version, saved.tags[0].version, "{name}");
+            assert_eq!(
+                back.tags[1..],
+                saved.tags[1..],
+                "{name}: the other tags stay"
+            );
+            assert!(same_packets(&original, &path).unwrap(), "{name}");
+            assert!(!temp_path(&path).exists());
+            fs::remove_file(&path).unwrap();
+            fs::remove_file(&original).unwrap();
+        }
+    }
+
+    #[test]
+    fn tags_something_else_changed_since_opening_stop_the_save_and_the_file_stays() {
+        let path = fixture("tagged.mp3", "stale.mp3");
+        let saved = edits_of(&path);
+        let mut theirs = saved.clone();
+        theirs.tags[0].fields[0].value = "theirs".into();
+        save(&path, &theirs.changes(&saved).unwrap(), &AtomicU32::new(0)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut mine = saved.clone();
+        mine.tags[0].fields[0].value = "mine".into();
+        let why = save(&path, &mine.changes(&saved).unwrap(), &AtomicU32::new(0)).unwrap_err();
+        assert!(why.contains("changed since"), "{why}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn guano_in_a_wav_changes_gains_fields_and_leaves_the_audio_alone() {
+        let text = b"GUANO|Version: 1.0\nMake: Pettersson\n".to_vec();
+        let file = build(false, &[(b"guan", text)], &samples());
+        let path = temp_file("guano.wav", &file);
+        let saved = edits_of(&path);
+        let mut edits = saved.clone();
+        let guano = edits
+            .tags
+            .iter_mut()
+            .find(|b| b.kind == Kind::Guano)
+            .unwrap();
+        guano.fields[0].value = "Wildlife Acoustics".into();
+        guano
+            .fields
+            .push(added("Species Manual ID", "Myotis daubentonii"));
+        let saved_file = {
+            save(&path, &edits.changes(&saved).unwrap(), &AtomicU32::new(0)).unwrap();
+            fs::read(&path).unwrap()
+        };
+        let w = wav::parse(&mut Cursor::new(&saved_file)).unwrap();
+        let o = wav::parse(&mut Cursor::new(&file)).unwrap();
+        assert_eq!(
+            w.guano.as_deref(),
+            Some(
+                "GUANO|Version: 1.0\nMake: Wildlife Acoustics\nSpecies Manual ID: Myotis daubentonii"
+            )
+        );
+        let audio = |f: &[u8], w: &Wav| f[w.data.start as usize..w.data.end as usize].to_vec();
+        assert_eq!(audio(&saved_file, &w), audio(&file, &o));
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_wav_without_guano_gets_its_chunk_once_a_field_goes_in() {
+        let path = temp_file("new-guano.wav", &build(false, &[], &samples()));
+        let saved = edits_of(&path);
+        let mut edits = saved.clone();
+        let guano = edits
+            .tags
+            .iter_mut()
+            .find(|b| b.kind == Kind::Guano)
+            .unwrap();
+        guano.fields.push(added("Loc Position", "-14.3 -67.7"));
+        save(&path, &edits.changes(&saved).unwrap(), &AtomicU32::new(0)).unwrap();
+        let w = wav::parse(&mut File::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            w.guano.as_deref(),
+            Some("GUANO|Version: 1.0\nLoc Position: -14.3 -67.7")
+        );
+        assert_eq!(w.chunks.last().map(|c| c.id), Some(*b"guan"));
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn an_id3_tag_in_a_wav_changes_in_the_chunk_it_was_in() {
+        use lofty::config::WriteOptions;
+        use lofty::id3::v2::{Frame, FrameId, Id3v2Tag, TextInformationFrame};
+        use lofty::tag::TagExt;
+        let path = temp_file("id3.wav", &build(false, &[], &samples()));
+        let mut tag = Id3v2Tag::default();
+        let title = FrameId::new("TIT2").unwrap();
+        tag.insert(Frame::Text(TextInformationFrame::new(
+            title,
+            lofty::TextEncoding::UTF8,
+            "Pier",
+        )));
+        tag.save_to_path(&path, WriteOptions::default()).unwrap();
+        let before = wav::parse(&mut File::open(&path).unwrap()).unwrap();
+        let id3 = before.chunks.iter().find(|c| is_id3(&c.id)).unwrap().id;
+        let saved = edits_of(&path);
+        let mut edits = saved.clone();
+        let block = edits
+            .tags
+            .iter_mut()
+            .find(|b| b.kind == Kind::Id3v2)
+            .unwrap();
+        block.fields[0].value = "New pier".into();
+        save(&path, &edits.changes(&saved).unwrap(), &AtomicU32::new(0)).unwrap();
+        let back = tags::wav_id3(&path).unwrap().unwrap();
+        assert_eq!(fields(&back), [("TIT2", "New pier")]);
+        let after = wav::parse(&mut File::open(&path).unwrap()).unwrap();
+        let ids = |w: &Wav| w.chunks.iter().map(|c| c.id).collect::<Vec<_>>();
+        assert_eq!(ids(&after), ids(&before));
+        assert!(after.chunks.iter().any(|c| c.id == id3));
+        fs::remove_file(&path).unwrap();
+    }
 
     fn samples() -> Vec<i16> {
         (0..999).map(|i| (i * 37 % 2000) as i16 - 1000).collect()
@@ -524,6 +810,7 @@ mod tests {
             info: Some(vec![(*b"INAM", "Loobu".into())]),
             markers: Some(vec![marker(1, 100, 0, "start"), marker(2, 400, 50, "owl")]),
             ixml: Some("<BWFXML><NOTE>n</NOTE></BWFXML>".into()),
+            ..Changes::default()
         };
         let saved = run(&file, &changes, "changes.wav");
         let w = wav::parse(&mut Cursor::new(&saved)).unwrap();

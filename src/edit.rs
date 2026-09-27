@@ -1,11 +1,13 @@
-//! What the Metadata and Markers views can change in a WAV file. Values are
-//! kept as the text their fields show; saving writes only what was changed,
-//! and every field left alone goes back byte for byte.
+//! What the Metadata and Markers views can change: in a WAV file its own
+//! chunks and markers, and in any file its tags. Values are kept as the text
+//! their fields show; saving writes only what was changed, and every field
+//! left alone goes back byte for byte.
 
 use std::ops::Range;
 
 use crate::meta::{self, Element, Span};
 use crate::save::Changes;
+use crate::tags::{self, Block};
 use crate::wav::{Bext, Marker, Wav};
 
 /// The Broadcast WAV text fields: label, and bytes in the chunk.
@@ -31,11 +33,16 @@ pub struct Edits {
     /// iXML fields: label, and value.
     pub ixml: Vec<(String, String)>,
     pub markers: Vec<Marker>,
+    /// Tags in formats of their own: in a WAV file its ID3v2 and GUANO.
+    pub tags: Vec<Block>,
+    /// The file is a WAV, with the chunks and markers above; any other only
+    /// has tags.
+    pub wav: bool,
     held: Held,
 }
 
 /// What the file held, for writing changes into.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct Held {
     sample_rate: u32,
     bext: Option<Vec<u8>>,
@@ -91,12 +98,29 @@ impl Edits {
             // without one, sync points in iXML (the original app's
             // annotations) are shown instead.
             markers: w.cues.clone().unwrap_or_else(|| sync_points(root.as_ref())),
+            tags: vec![tags::guano(w.guano.as_deref().unwrap_or_default())],
+            wav: true,
             held: Held {
                 sample_rate: w.sample_rate,
                 bext: bext.map(|b| b.raw.clone()),
                 ixml: w.ixml.clone(),
                 ixml_spans: leaves.into_iter().map(|(_, _, s, n)| (s, n)).collect(),
             },
+        }
+    }
+
+    /// A file other than WAV: only its tags.
+    pub fn from_tags(tags: Vec<Block>) -> Self {
+        Self {
+            bext: Default::default(),
+            start: String::new(),
+            coding_history: String::new(),
+            info: Vec::new(),
+            ixml: Vec::new(),
+            markers: Vec::new(),
+            tags,
+            wav: false,
+            held: Held::default(),
         }
     }
 
@@ -136,6 +160,18 @@ impl Edits {
                 .collect();
             markers.sort_by_key(|m| (m.frame, m.id));
             changes.markers = Some(markers);
+        }
+        changes.tags = self
+            .tags
+            .iter()
+            .zip(&saved.tags)
+            .filter(|(new, old)| new != old)
+            .map(|(new, old)| (old.clone(), new.clone()))
+            .collect();
+        for (_, block) in &changes.tags {
+            for field in block.fields.iter().filter(|f| f.from.is_none()) {
+                block.kind.check_key(&field.key)?;
+            }
         }
         Ok(changes)
     }

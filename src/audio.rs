@@ -23,6 +23,7 @@ use crate::edit::Edits;
 use crate::levels::Levels;
 use crate::meta::{self, Details, Meta};
 use crate::spectrogram::{Analysis, Analyzer, Spec};
+use crate::tags;
 use crate::wav::{self, SampleKind};
 
 /// A timestamp further ahead than this is a damaged one, not a gap.
@@ -91,9 +92,8 @@ pub struct Loaded {
     pub details: Details,
     pub source: Source,
     pub levels: Levels,
-    /// Per channel, the extremes of each column across the whole file.
-    pub timeline: Vec<Vec<[f32; 2]>>,
-    /// What can be edited; only WAV files can be saved into.
+    /// What can be edited: a WAV file's own chunks and markers, and the
+    /// tags of any file lofty reads.
     pub edits: Option<Edits>,
 }
 
@@ -110,24 +110,36 @@ pub fn open(path: &Path) -> Result<Opened, String> {
     let mut file = File::open(path).map_err(|e| format!("cannot open: {e}"))?;
     let bytes = file.metadata().map_or(0, |m| m.len());
     match wav::parse(&mut file) {
-        Ok(w) => Ok(Opened {
-            info: Info {
-                container: w.container.to_owned(),
-                sample_rate: w.sample_rate,
-                channels: w.channels,
-                bits: Some(w.kind.bits()),
-                frames: w.frames(),
-                bytes,
-            },
-            meta: meta::from_wav(&w),
-            details: meta::wav_details(&w),
-            source: Source::Pcm {
-                path: path.to_owned(),
-                data: w.data.clone(),
-                kind: w.kind,
-            },
-            edits: Some(Edits::from_wav(&w)),
-        }),
+        Ok(w) => {
+            let mut edits = Edits::from_wav(&w);
+            // An ID3 tag lofty cannot read, in a kind of WAV it does not
+            // know, stays in the file as it is, but cannot be edited.
+            let id3 = w
+                .chunks
+                .iter()
+                .any(|c| &c.id == b"id3 " || &c.id == b"ID3 ");
+            if let Some(block) = id3.then(|| tags::wav_id3(path).ok().flatten()).flatten() {
+                edits.tags.insert(0, block);
+            }
+            Ok(Opened {
+                info: Info {
+                    container: w.container.to_owned(),
+                    sample_rate: w.sample_rate,
+                    channels: w.channels,
+                    bits: Some(w.kind.bits()),
+                    frames: w.frames(),
+                    bytes,
+                },
+                meta: meta::from_wav(&w),
+                details: meta::wav_details(&w),
+                source: Source::Pcm {
+                    path: path.to_owned(),
+                    data: w.data.clone(),
+                    kind: w.kind,
+                },
+                edits: Some(edits),
+            })
+        }
         Err(wav::Error::NotWav) => {
             let mut coded = Coded::open(path)?;
             let tags = coded
@@ -149,14 +161,18 @@ pub fn open(path: &Path) -> Result<Opened, String> {
                 _ => None,
             });
             let meta = meta::from_tag_text(description.chain(comment));
+            // Tags lofty reads can be edited; the rest only show as read.
+            let editable = tags::read(path);
             let mut details = Details::default();
-            details.add(
-                "Tags",
-                tags.iter()
-                    .filter(|t| !matches!(t.raw.value, RawValue::Binary(_) | RawValue::Flag))
-                    .map(|t| (t.raw.key.clone(), t.raw.value.to_string()))
-                    .collect(),
-            );
+            if editable.is_none() {
+                details.add(
+                    "Tags",
+                    tags.iter()
+                        .filter(|t| !matches!(t.raw.value, RawValue::Binary(_) | RawValue::Flag))
+                        .map(|t| (t.raw.key.clone(), t.raw.value.to_string()))
+                        .collect(),
+                );
+            }
             Ok(Opened {
                 info: Info {
                     container: path
@@ -171,7 +187,7 @@ pub fn open(path: &Path) -> Result<Opened, String> {
                 meta,
                 details,
                 source: Source::Coded(path.to_owned()),
-                edits: None,
+                edits: editable.map(Edits::from_tags),
             })
         }
         Err(e) => Err(e.to_string()),
@@ -237,7 +253,6 @@ pub fn load(
     details
         .sections
         .insert(0, ("File".into(), file_rows(path, &info)));
-    let timeline = analysis.envelope.clone();
     Ok((
         Loaded {
             info,
@@ -245,7 +260,6 @@ pub fn load(
             details,
             source,
             levels,
-            timeline,
             edits,
         },
         analysis,
@@ -262,9 +276,34 @@ pub fn analyse(
     cancel: &AtomicBool,
     progress: &AtomicU32,
 ) -> Result<Option<Analysis>, String> {
+    let analyzer = Analyzer::new(spec, range, info.frames, usize::from(info.channels));
+    run(source, info, analyzer, cancel, progress)
+}
+
+/// As [`analyse`], with `columns` across.
+pub fn analyse_columns(
+    source: &Source,
+    info: &Info,
+    spec: Spec,
+    range: Range<usize>,
+    columns: usize,
+    cancel: &AtomicBool,
+    progress: &AtomicU32,
+) -> Result<Option<Analysis>, String> {
+    let channels = usize::from(info.channels);
+    let analyzer = Analyzer::with_columns(spec, range, info.frames, channels, columns);
+    run(source, info, analyzer, cancel, progress)
+}
+
+fn run(
+    source: &Source,
+    info: &Info,
+    mut analyzer: Analyzer,
+    cancel: &AtomicBool,
+    progress: &AtomicU32,
+) -> Result<Option<Analysis>, String> {
     let channels = usize::from(info.channels);
     let mut reader = Reader::open(source, channels)?;
-    let mut analyzer = Analyzer::new(spec, range, info.frames, channels);
     let wanted = analyzer.wanted();
     let piece = piece_frames(channels).min(wanted.len().max(1));
     let mut buffer = vec![0.0; piece * channels];
@@ -539,6 +578,21 @@ fn unsupported(e: DecodeError) -> String {
 }
 
 impl Coded {
+    /// The next packet of the track as the file stores it, undecoded: when
+    /// it starts, and its bytes.
+    pub fn raw_packet(&mut self) -> Result<Option<(i64, Vec<u8>)>, String> {
+        loop {
+            match self.format.next_packet() {
+                Ok(Some(p)) if p.track_id == self.track => {
+                    return Ok(Some((p.pts.get(), p.data.to_vec())));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(None),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+
     pub fn open(path: &Path) -> Result<Self, String> {
         let file = File::open(path).map_err(|e| format!("cannot open: {e}"))?;
         let stream = MediaSourceStream::new(Box::new(file), Default::default());
@@ -722,12 +776,12 @@ pub(crate) mod tests {
         }
     }
 
-    fn idle() -> (AtomicBool, AtomicU32) {
+    pub fn idle() -> (AtomicBool, AtomicU32) {
         (AtomicBool::new(false), AtomicU32::new(0))
     }
 
     #[test]
-    fn a_wav_loads_with_levels_timeline_and_spectrogram() {
+    fn a_wav_loads_with_levels_and_its_spectrogram() {
         let samples: Vec<i16> = (0..96_000)
             .flat_map(|i| [(i % 200) as i16 * 100, 0])
             .collect();
@@ -739,7 +793,7 @@ pub(crate) mod tests {
         let (loaded, analysis) = load(&path, mix(), &cancel, &progress).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert_eq!(loaded.info.frames, 96_000);
-        assert_eq!(loaded.timeline.len(), 2);
+        assert_eq!(analysis.envelope.len(), 2);
         assert_eq!(analysis.range, 0..96_000);
         assert_eq!(progress.load(Ordering::Relaxed), 1000);
         let level = loaded.levels.at(50_000, 4_800);

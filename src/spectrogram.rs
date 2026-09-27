@@ -253,8 +253,21 @@ impl Layout {
 
 impl Analyzer {
     pub fn new(spec: Spec, range: Range<usize>, frames: usize, channels: usize) -> Self {
+        let columns = range.len().clamp(1, MAX_COLUMNS);
+        Self::with_columns(spec, range, frames, channels, columns)
+    }
+
+    /// As [`Analyzer::new`], with `columns` across rather than at most
+    /// [`MAX_COLUMNS`].
+    pub fn with_columns(
+        spec: Spec,
+        range: Range<usize>,
+        frames: usize,
+        channels: usize,
+        columns: usize,
+    ) -> Self {
         let len = range.len().max(1);
-        let columns = len.min(MAX_COLUMNS);
+        let columns = columns.clamp(1, len);
         let span = len as f64 / columns as f64;
         // Enough windows that every sample passes near the middle of one
         // rather than only through faded edges, and each column keeps the

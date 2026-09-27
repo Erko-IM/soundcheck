@@ -1,4 +1,5 @@
-//! Drawing for each view: axes and lanes, the waveform, the timeline, the
+//! Drawing for each view: axes and lanes, the waveform and the part in view
+//! on it, the
 //! meters, the spectrum and the metadata.
 
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ use crate::edit::{BEXT_FIELDS, Edits};
 use crate::levels::{FLOOR_DB, Level};
 use crate::meta::{self, Details};
 use crate::spectrogram::SILENCE_DB;
+use crate::tags::{Block, Field, Kind};
 use crate::wav::Marker;
 
 pub const CURSOR: Color32 = Color32::from_rgb(235, 70, 60);
@@ -35,9 +37,9 @@ const MUTED: Color32 = Color32::from_rgb(215, 55, 50);
 const SELECTION_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(255, 140, 50, 180);
 const STRIP_BACK: Color32 = Color32::from_gray(22);
 const STRIP_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(236, 224, 160, 170);
-/// The part in view, on the timeline: pale yellow like its edge.
+/// The part in view, on the waveform of the whole file: pale yellow like
+/// its edge.
 const VIEWPORT: Color32 = Color32::from_rgba_unmultiplied_const(236, 224, 160, 40);
-const TIMELINE_WAVE: Color32 = Color32::from_gray(85);
 pub const MARK: Color32 = Color32::from_rgb(255, 196, 70);
 const MARK_SPAN: Color32 = Color32::from_rgba_unmultiplied_const(255, 196, 70, 30);
 const LISTENER: Color32 = Color32::from_gray(150);
@@ -186,18 +188,22 @@ pub fn time_axis(painter: &Painter, plot: Rect, span: Span, rate: f64, wall_star
             plot.bottom()..=plot.bottom() + 5.0,
             Stroke::new(1.0, AXIS),
         );
-        painter.text(
-            Pos2::new(x, plot.bottom() + 7.0),
-            Align2::CENTER_TOP,
-            clock_with(t, decimals),
+        let label = clock_with(t, decimals);
+        under(
+            painter,
+            x,
+            plot.bottom() + 7.0,
+            label,
             FontId::monospace(13.0),
             ELAPSED,
         );
         if let Some(start) = wall_start {
-            painter.text(
-                Pos2::new(x, plot.bottom() + 25.0),
-                Align2::CENTER_TOP,
-                wall_with(start + t, decimals),
+            let label = wall_with(start + t, decimals);
+            under(
+                painter,
+                x,
+                plot.bottom() + 25.0,
+                label,
                 FontId::monospace(10.0),
                 WALL_CLOCK,
             );
@@ -205,8 +211,17 @@ pub fn time_axis(painter: &Painter, plot: Rect, span: Span, rate: f64, wall_star
     }
 }
 
+/// `text` centred under `x` from `top`, moved in from an edge it would run
+/// past.
+fn under(painter: &Painter, x: f32, top: f32, text: String, font: FontId, color: Color32) {
+    let galley = painter.layout_no_wrap(text, font, color);
+    let (half, clip) = (galley.size().x / 2.0, painter.clip_rect());
+    let x = x.min(clip.right() - half).max(clip.left() + half);
+    painter.galley(Pos2::new(x - half, top), galley, color);
+}
+
 /// Frequencies up `lane`, from `lo` to `hi` in the file, labelled `scale`
-/// times over as a pitch shift or time expansion shows them.
+/// times over as a pitch shift shows them.
 pub fn freq_axis(painter: &Painter, lane: Rect, lo: f32, hi: f32, log: bool, scale: f32) {
     let (lo, hi) = (lo * scale, hi * scale);
     for f in freq_ticks(lo, hi, log, lane.height(), 16.0) {
@@ -284,73 +299,31 @@ pub fn centre_line(painter: &Painter, lane: Rect) {
     painter.hline(lane.x_range(), lane.center().y, Stroke::new(1.0, GRID));
 }
 
-/// The dark grey ground of a waveform lane or the timeline, edged in pale
-/// yellow to stand out from the panel around it.
+/// The dark grey ground of a waveform lane, edged in pale yellow to stand
+/// out from the panel around it.
 pub fn strip(painter: &Painter, rect: Rect) {
     painter.rect_filled(rect, 2.0, STRIP_BACK);
     painter.rect_stroke(rect, 2.0, Stroke::new(1.0, STRIP_EDGE), StrokeKind::Outside);
 }
 
-/// The whole file, as in the original's minimap: the loudest channel
-/// mirrored about the middle, the markers, the part in view with a grip at
-/// each end, and the playhead.
-pub fn timeline(
-    painter: &Painter,
-    rect: Rect,
-    overview: &[Vec<[f32; 2]>],
-    frames: usize,
-    view: &Range<f64>,
-    playhead: Option<usize>,
-    markers: &[Marker],
-) {
-    strip(painter, rect);
-    let columns = overview.first().map_or(0, Vec::len);
-    if columns == 0 || frames == 0 {
-        return;
-    }
-    let (mid, half) = (rect.center().y, rect.height() / 2.0);
-    let pixels = rect.width().ceil().max(1.0) as usize;
-    let mut shapes = Vec::with_capacity(pixels);
-    for p in 0..pixels {
-        let first = (p * columns / pixels).min(columns - 1);
-        let last = ((p + 1) * columns)
-            .div_ceil(pixels)
-            .clamp(first + 1, columns);
-        let amplitude = overview
-            .iter()
-            .flat_map(|channel| &channel[first..last])
-            .fold(0.0f32, |a, e| a.max(e[0].abs()).max(e[1].abs()))
-            .min(1.0);
-        let x = rect.left() + p as f32;
-        shapes.push(Shape::rect_filled(
-            Rect::from_x_y_ranges(x..=x + 1.0, mid - amplitude * half..=mid + amplitude * half),
-            0.0,
-            TIMELINE_WAVE,
-        ));
-    }
-    painter.extend(shapes);
-    let x_of = |frame: f64| rect.left() + (frame / frames as f64) as f32 * rect.width();
-    for m in markers {
-        painter.vline(x_of(m.frame as f64), rect.y_range(), Stroke::new(1.0, MARK));
-    }
-    let (left, right) = view_span(rect, frames as f64, view);
-    let shown = Rect::from_x_y_ranges(left..=right, rect.y_range());
+/// The part in view, over the waveform of the whole file under it: shaded,
+/// with a grip at each end.
+pub fn viewport(painter: &Painter, plot: Rect, frames: f64, view: &Range<f64>) {
+    let (left, right) = view_span(plot, frames, view);
+    let shown = Rect::from_x_y_ranges(left..=right, plot.y_range());
     painter.rect_filled(shown, 0.0, VIEWPORT);
     painter.rect_stroke(shown, 0.0, Stroke::new(1.0, STRIP_EDGE), StrokeKind::Inside);
-    let grip = rect.center().y - 7.0..=rect.center().y + 7.0;
+    let grip = plot.center().y - 7.0..=plot.center().y + 7.0;
     for x in [shown.left() + 1.5, shown.right() - 1.5] {
         painter.vline(x, grip.clone(), Stroke::new(3.0, STRIP_EDGE));
     }
-    if let Some(frame) = playhead {
-        painter.vline(x_of(frame as f64), rect.y_range(), Stroke::new(1.0, CURSOR));
-    }
 }
 
-/// The narrowest the part in view is drawn on the timeline, so a moment of
-/// a long file can still be seen and taken hold of.
+/// The narrowest the part in view is drawn on the whole file's waveform, so
+/// a moment of a long file can still be seen and taken hold of.
 const NARROWEST_VIEW: f32 = 20.0;
 
-/// Where the part in view lies across the timeline `rect`: at least
+/// Where the part in view lies across the whole file's `rect`: at least
 /// [`NARROWEST_VIEW`] wide around its middle, and within the strip.
 pub fn view_span(rect: Rect, frames: f64, view: &Range<f64>) -> (f32, f32) {
     let x_of = |frame: f64| rect.left() + (frame / frames) as f32 * rect.width();
@@ -1151,41 +1124,215 @@ pub fn metadata(ui: &mut Ui, details: &Details, edits: Option<&mut Edits>, locke
                 });
             }
             let Some(edits) = edits else { return };
-            let bext = filled(edits.bext.iter().chain([&edits.start, &edits.coding_history]));
-            section(ui, "Broadcast WAV", bext, |ui| {
-                for (i, (label, bytes)) in BEXT_FIELDS.iter().enumerate() {
-                    row(ui, label, |ui| {
-                        field(ui, &mut edits.bext[i], Some(bytes.len()), i == 0, locked)
-                    });
-                }
-                row(ui, "Start", |ui| {
-                    let edit = TextEdit::singleline(&mut edits.start)
-                        .hint_text("hh:mm:ss.sss")
-                        .desired_width(f32::INFINITY);
-                    ui.add_enabled(!locked, edit).on_hover_text(
-                        "Time of day at the first sample, which the timeline shows under elapsed time",
-                    );
-                });
-                row(ui, "Coding history", |ui| {
-                    field(ui, &mut edits.coding_history, None, true, locked)
-                });
-            });
-            let info = filled(edits.info.iter().map(|(_, v)| v));
-            section(ui, "RIFF INFO", info, |ui| {
-                for (id, value) in &mut edits.info {
-                    row(ui, &meta::info_name(id), |ui| {
-                        field(ui, value, None, false, locked)
-                    });
-                }
-            });
-            if !edits.ixml.is_empty() {
-                section(ui, "iXML", true, |ui| {
-                    for (label, value) in &mut edits.ixml {
-                        row(ui, label, |ui| field(ui, value, None, false, locked));
-                    }
-                });
+            if edits.wav {
+                wav_sections(ui, edits, locked);
+            }
+            for (i, block) in edits.tags.iter_mut().enumerate() {
+                tag_section(ui, block, i, locked);
             }
         });
+}
+
+/// A WAV file's own chunks: Broadcast WAV, RIFF INFO and iXML.
+fn wav_sections(ui: &mut Ui, edits: &mut Edits, locked: bool) {
+    let bext = filled(
+        edits
+            .bext
+            .iter()
+            .chain([&edits.start, &edits.coding_history]),
+    );
+    section(ui, "Broadcast WAV", bext, |ui| {
+        for (i, (label, bytes)) in BEXT_FIELDS.iter().enumerate() {
+            row(ui, label, |ui| {
+                field(ui, &mut edits.bext[i], Some(bytes.len()), i == 0, locked)
+            });
+        }
+        row(ui, "Start", |ui| {
+            let edit = TextEdit::singleline(&mut edits.start)
+                .hint_text("hh:mm:ss.sss")
+                .desired_width(f32::INFINITY);
+            ui.add_enabled(!locked, edit).on_hover_text(
+                "Time of day at the first sample, which the time axis shows under elapsed time",
+            );
+        });
+        row(ui, "Coding history", |ui| {
+            field(ui, &mut edits.coding_history, None, true, locked)
+        });
+    });
+    let info = filled(edits.info.iter().map(|(_, v)| v));
+    section(ui, "RIFF INFO", info, |ui| {
+        for (id, value) in &mut edits.info {
+            row(ui, &meta::info_name(id), |ui| {
+                field(ui, value, None, false, locked)
+            });
+        }
+    });
+    if !edits.ixml.is_empty() {
+        section(ui, "iXML", true, |ui| {
+            for (label, value) in &mut edits.ixml {
+                row(ui, label, |ui| field(ui, value, None, false, locked));
+            }
+        });
+    }
+}
+
+/// A tag's section: a row for each of its text fields, which × takes out,
+/// then what else it holds, which stays as it is, and a row for adding a
+/// field.
+fn tag_section(ui: &mut Ui, block: &mut Block, index: usize, locked: bool) {
+    let title = if block.read_only {
+        format!("{}, only read", block.title())
+    } else {
+        block.title()
+    };
+    let open = !block.fields.is_empty();
+    let locked = locked || block.read_only;
+    section(ui, &title, open, |ui| {
+        let kind = block.kind;
+        let mut gone = None;
+        for (i, f) in block.fields.iter_mut().enumerate() {
+            let label = kind.label(&f.key);
+            row_named(ui, &label, &f.key, |ui| {
+                let out = egui::Button::new("×").small();
+                if ui
+                    .add_enabled(!locked, out)
+                    .on_hover_text("Take this field out")
+                    .clicked()
+                {
+                    gone = Some(i);
+                }
+                field(ui, &mut f.value, None, long(kind, &f.key), locked);
+            });
+        }
+        if let Some(i) = gone {
+            block.fields.remove(i);
+        }
+        if !block.other.is_empty() {
+            let also = format!("Kept as it is: {}", block.other.join(", "));
+            ui.add(Label::new(RichText::new(also).weak()).wrap());
+        }
+        if !locked {
+            add_field(ui, block, index);
+        }
+    });
+}
+
+/// As [`row`], with `key`, the name the file stores the field under, on
+/// hover wherever the label is another.
+fn row_named(ui: &mut Ui, label: &str, key: &str, value: impl FnOnce(&mut Ui)) {
+    let width = (ui.available_width() * 0.38).clamp(80.0, 180.0);
+    ui.horizontal_top(|ui| {
+        ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::Min), |ui| {
+            ui.set_width(width);
+            let name = ui.add(Label::new(RichText::new(label).color(AXIS)).wrap());
+            if label != key {
+                name.on_hover_text(key);
+            }
+        });
+        value(ui);
+    });
+}
+
+/// Fields that tend to run to more than a line.
+fn long(kind: Kind, key: &str) -> bool {
+    let id = key.split(':').next().unwrap_or(key);
+    match kind {
+        Kind::Id3v2 => matches!(id, "COMM" | "USLT"),
+        Kind::Vorbis => matches!(
+            key.to_uppercase().as_str(),
+            "COMMENT" | "DESCRIPTION" | "LYRICS"
+        ),
+        Kind::Mp4 => matches!(key, "©cmt" | "desc" | "ldes" | "©lyr"),
+        Kind::Ape => key.eq_ignore_ascii_case("comment"),
+        Kind::AiffText => matches!(key, "ANNO" | "COMT"),
+        Kind::Guano => key == "Note",
+        Kind::Id3v1 => false,
+    }
+}
+
+/// The row for adding a field to `block`: any of those it usually has that
+/// it lacks, or, where the kind of tag takes any name, one typed in.
+fn add_field(ui: &mut Ui, block: &mut Block, index: usize) {
+    let kind = block.kind;
+    let id = ui.id().with(("add a field", index));
+    let (mut typed, mut error): (String, Option<String>) =
+        ui.data(|d| d.get_temp(id)).unwrap_or_default();
+    let taken = |key: &str| !kind.repeats(key) && block.fields.iter().any(|f| f.key == key);
+    let offered: Vec<&str> = kind
+        .suggestions()
+        .iter()
+        .copied()
+        .filter(|k| !k.is_empty() && !k.ends_with(':') && !taken(k))
+        .collect();
+    let custom = match kind {
+        Kind::Id3v2 => Some("a TXXX name"),
+        Kind::Vorbis => Some("a name"),
+        Kind::Mp4 => Some("an iTunes name"),
+        Kind::Ape | Kind::Guano => Some("a name"),
+        Kind::Id3v1 | Kind::AiffText => None,
+    };
+    let mut add = None;
+    ui.horizontal_wrapped(|ui| {
+        if !offered.is_empty() {
+            egui::ComboBox::from_id_salt(id.with("usual"))
+                .selected_text("Add a field")
+                .show_ui(ui, |ui| {
+                    for key in &offered {
+                        let label = kind.label(key);
+                        let text = if label == *key {
+                            label
+                        } else {
+                            format!("{label}   {key}")
+                        };
+                        if ui.selectable_label(false, text).clicked() {
+                            add = Some((*key).to_owned());
+                        }
+                    }
+                });
+        }
+        if let Some(hint) = custom {
+            let edit = TextEdit::singleline(&mut typed)
+                .hint_text(format!("or {hint}"))
+                .desired_width(130.0);
+            let entered =
+                ui.add(edit).lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Add").clicked() || entered) && !typed.trim().is_empty() {
+                add = Some(typed_key(kind, typed.trim()));
+            }
+        }
+    });
+    if let Some(key) = add {
+        match kind.check_key(&key) {
+            Ok(()) if taken(&key) => error = Some(format!("{} is here already", kind.label(&key))),
+            Ok(()) => {
+                block.fields.push(Field {
+                    key,
+                    value: String::new(),
+                    from: None,
+                });
+                typed.clear();
+                error = None;
+            }
+            Err(why) => error = Some(why),
+        }
+    }
+    if let Some(why) = &error {
+        ui.label(RichText::new(why).color(CURSOR));
+    }
+    ui.data_mut(|d| d.insert_temp(id, (typed, error)));
+}
+
+/// The name a field typed in goes under: a frame, atom or key where it is
+/// one, else the kind's field for names of one's own.
+fn typed_key(kind: Kind, typed: &str) -> String {
+    match kind {
+        Kind::Id3v2 if kind.check_key(typed).is_ok() => typed.to_owned(),
+        Kind::Id3v2 => format!("TXXX:{typed}"),
+        Kind::Mp4 if kind.check_key(typed).is_ok() => typed.to_owned(),
+        Kind::Mp4 => format!("----:com.apple.iTunes:{typed}"),
+        Kind::Vorbis => typed.to_uppercase(),
+        _ => typed.to_owned(),
+    }
 }
 
 pub enum MarkerAction {
@@ -1343,7 +1490,7 @@ pub fn clock_fine(seconds: f64) -> String {
     clock_with(seconds, 2)
 }
 
-fn clock_with(seconds: f64, decimals: usize) -> String {
+pub(crate) fn clock_with(seconds: f64, decimals: usize) -> String {
     let scale = 10u64.pow(decimals as u32);
     let ticks = (seconds.max(0.0) * scale as f64).round() as u64;
     let whole = ticks / scale;
@@ -1364,7 +1511,7 @@ pub fn wall(seconds: f64) -> String {
     wall_with(seconds, 0)
 }
 
-fn wall_with(seconds: f64, decimals: usize) -> String {
+pub(crate) fn wall_with(seconds: f64, decimals: usize) -> String {
     let scale = 10u64.pow(decimals as u32);
     let ticks = (seconds.rem_euclid(86_400.0) * scale as f64).round() as u64 % (86_400 * scale);
     let whole = ticks / scale;
@@ -1381,7 +1528,7 @@ fn wall_with(seconds: f64, decimals: usize) -> String {
 }
 
 /// The smallest tick spacing, in seconds, that leaves room for each label.
-fn time_step(seconds: f64, width: f32) -> f64 {
+pub(crate) fn time_step(seconds: f64, width: f32) -> f64 {
     const STEPS: [f64; 24] = [
         0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0,
         60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 14_400.0,
@@ -1394,7 +1541,7 @@ fn time_step(seconds: f64, width: f32) -> f64 {
 }
 
 /// Decimals a label needs to tell ticks `step` seconds apart.
-fn decimals(step: f64) -> usize {
+pub(crate) fn decimals(step: f64) -> usize {
     match step {
         s if s >= 1.0 => 0,
         s if s >= 0.1 => 1,
@@ -1417,7 +1564,7 @@ fn nice_step(raw: f32) -> f32 {
 
 /// Tick frequencies along an axis `length` long. A log axis gets 1, 2 and
 /// 5 per decade, or only the decades where `room` per label would not fit.
-fn freq_ticks(lo: f32, hi: f32, log: bool, length: f32, room: f32) -> Vec<f32> {
+pub(crate) fn freq_ticks(lo: f32, hi: f32, log: bool, length: f32, room: f32) -> Vec<f32> {
     if !log {
         let step = nice_step((hi - lo) / (length / 55.0).max(2.0));
         let mut ticks = Vec::new();

@@ -7,10 +7,13 @@ description = "Fast spectrogram and spectrum viewer for field recordings"
 publish = false
 
 [dependencies]
+ab_glyph = "0.2.32"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 colorous = "1.0.16"
 cpal = "0.18.2"
 eframe = { version = "0.36.2", features = ["persistence"] }
+lofty = "0.25.4"
+png = "0.18.1"
 rayon = "1.12.0"
 realfft = "3.5.0"
 regex = { version = "1.13.1", default-features = false, features = ["std", "unicode"] }

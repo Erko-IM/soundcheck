@@ -6,6 +6,7 @@ mod app;
 mod audio;
 mod edit;
 mod explorer;
+mod export;
 mod finder;
 mod levels;
 mod meta;
@@ -15,6 +16,7 @@ mod rename;
 mod rename_ui;
 mod save;
 mod spectrogram;
+mod tags;
 mod views;
 mod wav;
 
