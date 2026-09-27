@@ -1,6 +1,6 @@
 [package]
 name = "soundcheck"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Erko-IM"]
 edition = "2024"
 description = "Fast spectrogram and spectrum viewer for field recordings"
