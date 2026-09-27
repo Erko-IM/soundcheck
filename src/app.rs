@@ -125,6 +125,9 @@ struct Settings {
     /// With a channel muted, the rest play in both speakers rather than on
     /// their own side.
     both_sides: bool,
+    /// What the spectrogram only just shows fades into the sound rather than
+    /// cutting in, with only what it shows heard.
+    soft_edge: bool,
     tools: Tools,
     /// Semitones the sound, and the frequencies shown, move with the pitch
     /// shift on.
@@ -141,6 +144,8 @@ struct Tools {
     pitch: bool,
     expansion: bool,
     slow: bool,
+    /// Only what the spectrogram shows is heard.
+    shown: bool,
 }
 
 impl Default for Settings {
@@ -161,6 +166,7 @@ impl Default for Settings {
             speed_slider: false,
             gain: 0.0,
             both_sides: true,
+            soft_edge: true,
             tools: Tools::default(),
             pitch: 0.0,
             expansion: 1.0,
@@ -697,11 +703,16 @@ impl App {
                 Speed::new(
                     set.value()
                         .max(playback::slowest(rate))
-                        .min(playback::fastest(&c.source, rate, !self.regions.is_empty())),
+                        .min(playback::fastest(&c.source, rate, self.shaped())),
                 )
             }
             None => set,
         }
+    }
+
+    /// Playback goes through areas, or plays only what is shown.
+    fn shaped(&self) -> bool {
+        !self.regions.is_empty() || self.settings.tools.shown
     }
 
     /// Each channel's share of the left and the right, with the mutes.
@@ -789,6 +800,22 @@ impl App {
             Target::Mix => "Mix".to_owned(),
             Target::Channel(c) => self.channel_name(c),
         }
+    }
+
+    /// What the spectrogram shows, while only that is heard.
+    fn shown(&self) -> Option<playback::Shown> {
+        let current = self
+            .current
+            .as_ref()
+            .filter(|_| self.settings.tools.shown)?;
+        let view = self.look().view;
+        Some(playback::Shown {
+            floor: -(view.brightness + view.contrast),
+            band: spectrogram::band(&view, current.info.sample_rate, self.settings.fft),
+            soft: self.settings.soft_edge,
+            fft: self.settings.fft,
+            apart: self.settings.channels != Channels::Mix,
+        })
     }
 
     fn look(&self) -> Look {
@@ -1347,6 +1374,7 @@ impl App {
         ) {
             Ok(player) => {
                 player.set_gain(self.settings.gain);
+                player.set_shown(self.shown());
                 if let Some(range) = &self.selection {
                     player.set_loop(Some(range.clone()));
                 } else if !self.regions.is_empty() {
@@ -1411,6 +1439,7 @@ impl App {
     fn tune_player(&self) {
         let Some(player) = &self.player else { return };
         player.set_mix(self.heard());
+        player.set_shown(self.shown());
         if player.speed() != self.speed() {
             player.set_speed(self.speed());
         }
@@ -1751,17 +1780,31 @@ impl App {
             {
                 self.rename_window = !self.rename_window;
             }
-            ui.separator();
             let tools = &mut self.settings.tools;
-            ui.checkbox(&mut tools.pitch, "Pitch shift").on_hover_text(
-                "A slider that moves the sound up or down without changing its speed, and the frequencies shown with it",
-            );
-            ui.checkbox(&mut tools.expansion, "Time expansion").on_hover_text(
-                "For recordings from time-expansion bat detectors: frequencies and times shown as they were",
-            );
-            ui.checkbox(&mut tools.slow, "Slow speeds").on_hover_text(
-                "Speeds down to a tenth, which bring bat calls down into hearing",
-            );
+            // Together: where the rest of the line is too short for them,
+            // as wide as they were last drawn, they all go onto the next.
+            let id = ui.id().with("tools");
+            let wide = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+            if ui.available_size_before_wrap().x < wide {
+                ui.end_row();
+            }
+            let drawn = ui.horizontal(|ui| {
+                ui.separator();
+                ui.checkbox(&mut tools.pitch, "Pitch shift").on_hover_text(
+                    "A slider that moves the sound up or down without changing its speed, and the frequencies shown with it",
+                );
+                ui.checkbox(&mut tools.expansion, "Time expansion").on_hover_text(
+                    "For recordings from time-expansion bat detectors: frequencies and times shown as they were",
+                );
+                ui.checkbox(&mut tools.slow, "Slow speeds").on_hover_text(
+                    "Speeds down to a tenth, which bring bat calls down into hearing",
+                );
+                ui.checkbox(&mut tools.shown, "Hear what's shown").on_hover_text(
+                    "Only what the spectrogram shows is played: brightness and contrast set how faint a sound can be and still be heard, and Min and Max which frequencies",
+                );
+            });
+            let width = drawn.response.rect.width();
+            ui.data_mut(|d| d.insert_temp(id, width));
         });
         if !self.settings.speed_slider && !self.settings.tools.slow && self.settings.speed < 1.0 {
             self.settings.speed = 1.0;
@@ -2162,6 +2205,11 @@ impl App {
                 .response
                 .rect;
             self.mark_control(Control::Contrast, group);
+            if self.settings.tools.shown {
+                ui.checkbox(&mut self.settings.soft_edge, "Soft edge").on_hover_text(
+                    "Sounds the spectrogram only just shows fade in rather than cut in, which leaves less warble behind",
+                );
+            }
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Frequency");

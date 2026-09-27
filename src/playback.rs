@@ -6,7 +6,7 @@
 //! paused player costs nothing.
 
 use std::cell::{Cell, RefCell};
-use std::f32::consts::TAU;
+use std::f32::consts::{PI, TAU};
 use std::ops::{Range, RangeInclusive};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
@@ -104,13 +104,14 @@ pub fn slowest(sample_rate: u32) -> f64 {
     (FLOOR / f64::from(sample_rate)).max(Speed::SLOWEST)
 }
 
-/// The fastest `source` plays, with `regions` or without: any faster and
-/// reading and filtering it would fall behind the sound going out.
-pub fn fastest(source: &Source, sample_rate: u32, regions: bool) -> f64 {
+/// The fastest `source` plays, `shaped` by regions or what is shown or
+/// not: any faster and reading and filtering it would fall behind the
+/// sound going out.
+pub fn fastest(source: &Source, sample_rate: u32, shaped: bool) -> f64 {
     // Frames a second the feeder keeps up with: plain samples read and
-    // filter far faster than a codec decodes, and taking regions' bands out
-    // of them is slower than either.
-    let budget = match (source, regions) {
+    // filter far faster than a codec decodes, and shaping them in a
+    // short-time transform is slower than either.
+    let budget = match (source, shaped) {
         (_, true) => 5e6,
         (Source::Pcm { .. }, false) => 5e7,
         (Source::Coded(_), false) => 1e7,
@@ -127,17 +128,45 @@ pub struct Region {
     pub band: (f32, f32),
 }
 
+/// What the spectrogram shows, for playing only that: nothing quieter than
+/// `floor`, and nothing outside `band`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shown {
+    /// The level at and below which the spectrogram shows nothing, in dB
+    /// as it measures them.
+    pub floor: f32,
+    /// The frequencies drawn, in the file's own Hz.
+    pub band: (f32, f32),
+    /// Fades in over the few dB above the floor rather than cutting at it.
+    pub soft: bool,
+    /// The spectrogram's transform size, so levels are measured as it
+    /// measures them.
+    pub fft: usize,
+    /// Each side by its own level, as with the channels drawn apart,
+    /// rather than both by their mix.
+    pub apart: bool,
+}
+
+/// How far above the floor a soft edge takes to fade in.
+const SOFT_DB: f32 = 6.0;
+
 /// Frames in each step of the transform regions play through: about 40 ms,
 /// fine enough in frequency to cut close to a band's edges.
 fn region_frame(sample_rate: u32) -> usize {
     (sample_rate as usize / 24).next_power_of_two().max(256)
 }
 
+/// Frames in each step of the transform playback is shaped in: the
+/// spectrogram's own while what it shows is played, so levels match.
+fn shaping_frame(sample_rate: u32, shown: Option<Shown>) -> usize {
+    shown.map_or_else(|| region_frame(sample_rate), |s| s.fft)
+}
+
 /// Where playback goes with `regions`: each one's stretch with the half
-/// step of the transform either side that fades it in and out, those that
-/// meet joined, in order.
-pub fn segments(regions: &[Region], sample_rate: u32, frames: usize) -> Vec<Range<usize>> {
-    let fade = region_frame(sample_rate) / 2;
+/// step of the transform, `size` frames, either side that fades it in and
+/// out, those that meet joined, in order.
+pub fn segments(regions: &[Region], size: usize, frames: usize) -> Vec<Range<usize>> {
+    let fade = size / 2;
     let mut spans: Vec<Range<usize>> = regions
         .iter()
         .map(|r| r.frames.start.saturating_sub(fade)..(r.frames.end + fade).min(frames))
@@ -200,6 +229,9 @@ const CHUNK: usize = 1024;
 /// How often the feeder tops the ring up while playing. The ring holds a
 /// second, so a slow card reader has plenty of slack.
 const TOP_UP: Duration = Duration::from_millis(100);
+/// How often it tops up the shorter queue kept while the sound follows the
+/// picture: well inside it, so the ring never runs dry.
+const SHAPED_TOP_UP: Duration = Duration::from_millis(25);
 /// Positions are packed with the number of the seek they belong to.
 const FRAME_BITS: u32 = 48;
 const FINISHED: u32 = 1 << 16;
@@ -213,6 +245,9 @@ struct Shared {
     /// Linear gain as `f32` bits, applied on the way out so a change is
     /// heard at once rather than after the second of audio already queued.
     gain: AtomicU32,
+    /// What the spectrogram shows while only that is played, taken up by
+    /// the feeder block by block so a slider moved is heard within moments.
+    shown: Mutex<Option<Shown>>,
     failure: Mutex<Option<String>>,
 }
 
@@ -330,6 +365,7 @@ impl Player {
             position: AtomicU64::new(pack(0, start as f64)),
             finished: AtomicU32::new(0),
             gain: AtomicU32::new(1.0f32.to_bits()),
+            shown: Mutex::new(None),
             failure: Mutex::new(None),
         });
         // A second of stereo.
@@ -489,10 +525,42 @@ impl Player {
     /// where they overlap, round and round. None plays the file through
     /// again.
     pub fn set_regions(&self, regions: Vec<Region>, from: usize) {
-        self.looping
-            .replace(segments(&regions, self.sample_rate, self.frames));
+        let size = shaping_frame(self.sample_rate, self.shown());
+        self.looping.replace(segments(&regions, size, self.frames));
         self.regions.replace(regions);
         self.seek(from);
+    }
+
+    fn shown(&self) -> Option<Shown> {
+        *self
+            .shared
+            .shown
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Plays only what the spectrogram shows, or everything again. A change
+    /// in what is shown is heard with the next block; switching it on or
+    /// off, or to another transform size, starts again from here.
+    pub fn set_shown(&self, shown: Option<Shown>) {
+        let was = self.shown();
+        if was == shown {
+            return;
+        }
+        *self
+            .shared
+            .shown
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = shown;
+        let size = |s| shaping_frame(self.sample_rate, s);
+        if was.is_some() != shown.is_some() || size(was) != size(shown) {
+            let regions = self.regions.borrow().clone();
+            if !regions.is_empty() {
+                self.looping
+                    .replace(segments(&regions, size(shown), self.frames));
+            }
+            self.restart(self.position());
+        }
     }
 
     fn restart(&self, frame: usize) {
@@ -648,7 +716,16 @@ fn feed(
             (seek, drained) = (number, false);
         }
 
-        if !drained && ring.slots() >= renderer.block_capacity() {
+        renderer.set_shown(*shared.shown.lock().unwrap_or_else(PoisonError::into_inner));
+        // Only a moment queued while the sound follows the picture, so what
+        // a slider does is heard at once rather than a second later.
+        let (ahead, nap) = if renderer.shaped() {
+            (2 * renderer.device_rate as usize * 3 / 20, SHAPED_TOP_UP)
+        } else {
+            (ring.buffer().capacity(), TOP_UP)
+        };
+        let queued = ring.buffer().capacity() - ring.slots();
+        if !drained && ring.slots() >= renderer.block_capacity() && queued < ahead {
             match renderer.render() {
                 Ok(Some(block)) => {
                     if let Ok(chunk) = ring.write_chunk_uninit(block.len()) {
@@ -670,7 +747,7 @@ fn feed(
         }
         // Nothing to do until the callback frees room or a command arrives.
         let next = if shared.playing.load(Ordering::Acquire) {
-            inbox.recv_timeout(TOP_UP)
+            inbox.recv_timeout(nap)
         } else {
             inbox
                 .recv()
@@ -706,8 +783,12 @@ struct Renderer {
     /// to the start of the next, and never finishing. None plays the file
     /// through to its end.
     looping: Vec<Range<usize>>,
-    /// Takes the regions' bands out of what is read, while they play.
-    regions: Option<Regions>,
+    /// The areas playing, and what the spectrogram shows while only that
+    /// plays.
+    regions: Vec<Region>,
+    shown: Option<Shown>,
+    /// Shapes what is read by both, while either is set.
+    filter: Option<Filter>,
     block: Vec<[f32; 2]>,
     thinned: Vec<[f32; 2]>,
     output: Vec<f32>,
@@ -798,7 +879,9 @@ impl Renderer {
             next: start,
             heard: start as f64,
             looping: Vec::new(),
-            regions: None,
+            regions: Vec::new(),
+            shown: None,
+            filter: None,
             block: Vec::new(),
             thinned: Vec::new(),
         };
@@ -830,10 +913,9 @@ impl Renderer {
         mix: &[[f32; 2]],
     ) -> Result<(), String> {
         self.input.set_mix(mix);
-        if regions.is_empty() {
-            self.regions = None;
-        } else if self.regions.as_ref().is_none_or(|r| r.regions != regions) {
-            self.regions = Some(Regions::new(regions, self.sample_rate));
+        if regions != self.regions {
+            self.regions = regions;
+            self.refilter();
         }
         if speed != self.speed || pitch != self.pitch {
             self.chain = Chain::new(self.sample_rate, self.device_rate, speed, pitch)?;
@@ -847,6 +929,38 @@ impl Renderer {
         self.heard = frame as f64;
         self.looping = looping;
         Ok(())
+    }
+
+    /// Plays only what `shown` says the spectrogram shows from the next
+    /// block on, or everything.
+    fn set_shown(&mut self, shown: Option<Shown>) {
+        if shown != self.shown {
+            self.shown = shown;
+            self.refilter();
+        }
+    }
+
+    /// The sound follows what the spectrogram shows.
+    fn shaped(&self) -> bool {
+        self.shown.is_some()
+    }
+
+    /// The filter the areas and what is shown need, kept while its size
+    /// stays the same.
+    fn refilter(&mut self) {
+        if self.regions.is_empty() && self.shown.is_none() {
+            self.filter = None;
+            return;
+        }
+        let size = shaping_frame(self.sample_rate, self.shown);
+        match &mut self.filter {
+            Some(filter) if filter.size == size => filter.update(&self.regions, self.shown),
+            _ => {
+                let mut filter = Filter::new(size, self.sample_rate);
+                filter.update(&self.regions, self.shown);
+                self.filter = Some(filter);
+            }
+        }
     }
 
     /// The next block of interleaved stereo, or `None` once all of the
@@ -868,7 +982,11 @@ impl Renderer {
         if self.looping.is_empty() {
             let available = self.frames.saturating_sub(self.next).min(count);
             if available > 0 {
-                self.input.read(self.next, &mut self.block[..available])?;
+                let out = &mut self.block[..available];
+                match &mut self.filter {
+                    Some(filter) => filter.read(&mut *self.input, self.frames, self.next, out)?,
+                    None => self.input.read(self.next, out)?,
+                }
             }
             self.next += count;
         } else {
@@ -883,8 +1001,8 @@ impl Renderer {
                 self.next = stretch;
                 let n = (end - self.next).min(count - filled);
                 let out = &mut self.block[filled..filled + n];
-                match &mut self.regions {
-                    Some(regions) => regions.read(&mut *self.input, self.frames, self.next, out)?,
+                match &mut self.filter {
+                    Some(filter) => filter.read(&mut *self.input, self.frames, self.next, out)?,
                     None => self.input.read(self.next, out)?,
                 }
                 filled += n;
@@ -1230,8 +1348,7 @@ trait Frames {
     fn set_mix(&mut self, _mix: &[[f32; 2]]) {}
 }
 
-/// The first two channels of a file: mono is doubled, and channels past
-/// the second are left out.
+/// A file's channels mixed down to the left and the right.
 struct Stereo {
     reader: Reader,
     channels: usize,
@@ -1260,53 +1377,81 @@ impl Frames for Stereo {
     }
 }
 
-/// Only the regions of what is read: step by step of a short-time
-/// transform, each step keeping the bands of the regions whose stretch
-/// holds its middle, and nothing where none does. The steps sit on a grid
-/// fixed to the file, so reads in any pieces add up to the same sound.
-struct Regions {
+/// Shapes what is read, step by step of a short-time transform: keeps the
+/// bands of the areas whose stretch holds a step's middle (every band with
+/// no areas, nothing where areas are set but none reaches), and of that
+/// only what the spectrogram shows. The steps sit on a grid fixed to the
+/// file, so reads in any pieces add up to the same sound.
+struct Filter {
     regions: Vec<Region>,
+    shown: Option<Shown>,
     size: usize,
     hop: usize,
     /// The square root of a Hann window, on the way in and again on the way
     /// out, so the steps add back up to what went in.
     window: Vec<f32>,
+    /// Turns a bin's squared magnitude into the power the spectrogram gives
+    /// it, where a full-scale sine reads 0 dB.
+    norm: f32,
     bin_hz: f32,
     forward: Arc<dyn RealToComplex<f32>>,
     inverse: Arc<dyn ComplexToReal<f32>>,
     input: Vec<[f32; 2]>,
     frame: Vec<f32>,
-    spectrum: Vec<Complex<f32>>,
-    /// How much of each bin the regions around the last step keep, and
-    /// which regions those were.
+    spectra: [Vec<Complex<f32>>; 2],
+    /// How much of each bin the areas around the last step keep, and which
+    /// areas those were.
     mask: Vec<f32>,
-    masked: Vec<usize>,
+    masked: Option<Vec<usize>>,
+    /// How much of each bin the band on screen keeps, and which band.
+    band: Vec<f32>,
+    banded: Option<(f32, f32)>,
+    /// Each side's gain for each bin at the step at hand.
+    gains: [Vec<f32>; 2],
 }
 
-impl Regions {
-    fn new(regions: Vec<Region>, sample_rate: u32) -> Self {
-        let size = region_frame(sample_rate);
+impl Filter {
+    fn new(size: usize, sample_rate: u32) -> Self {
+        let window: Vec<f32> = (0..size)
+            .map(|i| (PI * i as f32 / size as f32).sin())
+            .collect();
+        let amplitude = 2.0 / window.iter().sum::<f32>();
+        let bins = size / 2 + 1;
         let mut planner = RealFftPlanner::<f32>::new();
         Self {
-            regions,
+            regions: Vec::new(),
+            shown: None,
             size,
             hop: size / 4,
-            window: (0..size)
-                .map(|i| (std::f32::consts::PI * i as f32 / size as f32).sin())
-                .collect(),
+            window,
+            norm: amplitude * amplitude,
             bin_hz: sample_rate as f32 / size as f32,
             forward: planner.plan_fft_forward(size),
             inverse: planner.plan_fft_inverse(size),
             input: Vec::new(),
             frame: vec![0.0; size],
-            spectrum: vec![Complex::default(); size / 2 + 1],
-            mask: vec![0.0; size / 2 + 1],
-            masked: Vec::new(),
+            spectra: [
+                vec![Complex::default(); bins],
+                vec![Complex::default(); bins],
+            ],
+            mask: vec![0.0; bins],
+            masked: None,
+            band: vec![0.0; bins],
+            banded: None,
+            gains: [vec![0.0; bins], vec![0.0; bins]],
         }
     }
 
-    /// Sets the mask for the regions around frame `middle`, or finds there
-    /// are none.
+    fn update(&mut self, regions: &[Region], shown: Option<Shown>) {
+        if self.regions != regions {
+            self.regions = regions.to_vec();
+            self.masked = None;
+        }
+        self.shown = shown;
+    }
+
+    /// Sets the mask for the areas around frame `middle`: every bin whole
+    /// with no areas. False where areas are set but none reaches.
     fn mask_at(&mut self, middle: i64) -> bool {
         let around: Vec<usize> = (0..self.regions.len())
             .filter(|&i| {
@@ -1314,25 +1459,79 @@ impl Regions {
                 (r.start as i64..r.end as i64).contains(&middle)
             })
             .collect();
-        if around != self.masked {
+        if self.masked.as_ref() != Some(&around) {
             let bin_hz = self.bin_hz;
-            self.mask.fill(0.0);
-            for &i in &around {
-                let (lo, hi) = self.regions[i].band;
-                for (bin, keep) in self.mask.iter_mut().enumerate() {
-                    let f = bin as f32 * bin_hz;
-                    // Two bins of fall either side, so the edges do not ring.
-                    let past = ((lo - f).max(f - hi) / (2.0 * bin_hz)).clamp(0.0, 1.0);
-                    *keep = keep.max(0.5 + 0.5 * (std::f32::consts::PI * past).cos());
+            if self.regions.is_empty() {
+                self.mask.fill(1.0);
+            } else {
+                self.mask.fill(0.0);
+                for &i in &around {
+                    let band = self.regions[i].band;
+                    for (bin, keep) in self.mask.iter_mut().enumerate() {
+                        *keep = keep.max(band_keep(bin as f32 * bin_hz, band, bin_hz));
+                    }
                 }
             }
-            self.masked = around;
+            self.masked = Some(around);
         }
-        !self.masked.is_empty()
+        self.regions.is_empty() || self.masked.as_ref().is_some_and(|m| !m.is_empty())
     }
 
-    /// `out` from frame `first` of `inner`, `frames` long, through the
-    /// regions.
+    /// Each side's gain at this step: the areas' mask, and of it only what
+    /// the spectrogram shows, bin by bin as loud as it is there.
+    fn weigh(&mut self) {
+        let Some(shown) = self.shown else {
+            for gains in &mut self.gains {
+                gains.copy_from_slice(&self.mask);
+            }
+            return;
+        };
+        if self.banded != Some(shown.band) {
+            let bin_hz = self.bin_hz;
+            for (bin, keep) in self.band.iter_mut().enumerate() {
+                *keep = band_keep(bin as f32 * bin_hz, shown.band, bin_hz);
+            }
+            self.banded = Some(shown.band);
+        }
+        // Squared magnitudes at the floor, and where a soft edge is all in.
+        let floor = 10f32.powf(shown.floor / 10.0) / self.norm;
+        let full = floor * 10f32.powf(SOFT_DB / 10.0);
+        let sides = if shown.apart { 2 } else { 1 };
+        for side in 0..sides {
+            for bin in 0..self.mask.len() {
+                let x = if shown.apart {
+                    self.spectra[side][bin]
+                } else {
+                    (self.spectra[0][bin] + self.spectra[1][bin]) * 0.5
+                };
+                let power = x.norm_sqr();
+                self.gains[side][bin] = if power <= floor {
+                    0.0
+                } else if !shown.soft || power >= full {
+                    1.0
+                } else {
+                    let t = 10.0 * (power / floor).log10() / SOFT_DB;
+                    t * t * (3.0 - 2.0 * t)
+                };
+            }
+            if shown.soft {
+                // Across neighbouring bins a little too, against the warble
+                // of lone bins flickering over the floor.
+                smooth(&mut self.gains[side]);
+            }
+        }
+        if !shown.apart {
+            let [left, right] = &mut self.gains;
+            right.copy_from_slice(left);
+        }
+        for gains in &mut self.gains {
+            for ((g, keep), band) in gains.iter_mut().zip(&self.mask).zip(&self.band) {
+                *g *= keep * band;
+            }
+        }
+    }
+
+    /// `out` from frame `first` of `inner`, `frames` long, shaped.
     fn read(
         &mut self,
         inner: &mut dyn Frames,
@@ -1367,7 +1566,6 @@ impl Regions {
                 continue;
             }
             let base = (k * hop - from) as usize;
-            let inside = ((start - k * hop).max(0) as usize)..((end - k * hop).min(size) as usize);
             for channel in 0..2 {
                 let taken = &self.input[base..base + self.size];
                 for ((f, x), w) in self.frame.iter_mut().zip(taken).zip(&self.window) {
@@ -1375,14 +1573,21 @@ impl Regions {
                 }
                 // The buffers are the sizes the plans were made for, so
                 // neither transform can fail.
-                let _ = self.forward.process(&mut self.frame, &mut self.spectrum);
-                for (s, keep) in self.spectrum.iter_mut().zip(&self.mask) {
-                    *s *= *keep;
+                let _ = self
+                    .forward
+                    .process(&mut self.frame, &mut self.spectra[channel]);
+            }
+            self.weigh();
+            let inside = ((start - k * hop).max(0) as usize)..((end - k * hop).min(size) as usize);
+            let sides = self.spectra.iter_mut().zip(&self.gains).enumerate();
+            for (channel, (spectrum, gains)) in sides {
+                for (s, g) in spectrum.iter_mut().zip(gains) {
+                    *s *= *g;
                 }
-                let last = self.spectrum.len() - 1;
-                self.spectrum[0].im = 0.0;
-                self.spectrum[last].im = 0.0;
-                let _ = self.inverse.process(&mut self.spectrum, &mut self.frame);
+                let last = spectrum.len() - 1;
+                spectrum[0].im = 0.0;
+                spectrum[last].im = 0.0;
+                let _ = self.inverse.process(spectrum, &mut self.frame);
                 for i in inside.clone() {
                     let t = (k * hop + i as i64 - start) as usize;
                     out[t][channel] += self.frame[i] * self.window[i] * scale;
@@ -1390,6 +1595,25 @@ impl Regions {
             }
         }
         Ok(())
+    }
+}
+
+/// How much of frequency `f` the band from `lo` to `hi` keeps: all of it
+/// inside, falling to nothing over two bins outside so the edges do not
+/// ring.
+fn band_keep(f: f32, (lo, hi): (f32, f32), bin_hz: f32) -> f32 {
+    let past = ((lo - f).max(f - hi) / (2.0 * bin_hz)).clamp(0.0, 1.0);
+    0.5 + 0.5 * (PI * past).cos()
+}
+
+/// `gains` each averaged a little with its neighbours.
+fn smooth(gains: &mut [f32]) {
+    let mut before = gains.first().copied().unwrap_or(0.0);
+    for i in 0..gains.len() {
+        let here = gains[i];
+        let after = gains.get(i + 1).copied().unwrap_or(here);
+        gains[i] = 0.25 * before + 0.5 * here + 0.25 * after;
+        before = here;
     }
 }
 
@@ -1879,7 +2103,7 @@ mod tests {
         }
         let mut renderer = shifted(samples, 48_000, 48_000, Speed::NORMAL, 0.0);
         let regions = vec![region(0.5, 1.5, (4_000.0, 8_000.0))];
-        let stretches = segments(&regions, 48_000, 96_000);
+        let stretches = segments(&regions, 2048, 96_000);
         assert_eq!((stretches.len(), &stretches[0]), (1, &(22_976..73_024)));
         renderer
             .restart(24_000, Speed::NORMAL, 0.0, stretches, regions, &[])
@@ -1905,7 +2129,7 @@ mod tests {
             region(0.6, 1.4, (500.0, 2_000.0)),
             region(2.2, 2.6, (4_000.0, 8_000.0)),
         ];
-        let stretches = segments(&regions, 48_000, 144_000);
+        let stretches = segments(&regions, 2048, 144_000);
         assert_eq!(stretches, [8_576..68_224, 104_576..125_824]);
         let mut renderer = shifted(samples, 48_000, 48_000, Speed::NORMAL, 0.0);
         renderer
@@ -1927,6 +2151,135 @@ mod tests {
             high > -6.5 && low < -70.0,
             "second: 6 kHz {high}, 1 kHz {low} dBFS"
         );
+    }
+
+    fn shown(floor: f32, band: (f32, f32), soft: bool) -> Shown {
+        Shown {
+            floor,
+            band,
+            soft,
+            fft: 2048,
+            apart: false,
+        }
+    }
+
+    /// Exactly on a bin of a 2048-point transform at 48 kHz.
+    const ON_BIN: f64 = 43.0 * 48_000.0 / 2048.0;
+
+    /// A tone at -6 dBFS over white noise at -60.
+    fn tone_over_noise(seconds: f64) -> Vec<f32> {
+        let mut state = 12_345u32;
+        tone(ON_BIN, 48_000, seconds)
+            .into_iter()
+            .map(|t| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (state >> 8) as f32 / (1 << 24) as f32 - 0.5;
+                0.5 * t + 0.0035 * noise
+            })
+            .collect()
+    }
+
+    fn played(samples: Vec<f32>, shown: Option<Shown>) -> Vec<f32> {
+        let mut renderer = shifted(samples, 48_000, 48_000, Speed::NORMAL, 0.0);
+        renderer.set_shown(shown);
+        render_left(renderer, 48_000)
+    }
+
+    #[test]
+    fn only_what_the_spectrogram_shows_is_heard() {
+        let shown = Some(shown(-50.0, (0.0, 24_000.0), false));
+        // Faint noise alone shows nothing, so plays nothing.
+        let noise: Vec<f32> = tone_over_noise(1.0)
+            .iter()
+            .zip(tone(ON_BIN, 48_000, 1.0))
+            .map(|(s, t)| s - 0.5 * t)
+            .collect();
+        let hush = middle_rms(&played(noise, shown));
+        // A tone over it stays as it was, and the noise away from it goes.
+        let far = |signal: &[f32]| {
+            let spectrum = spectrum_around(signal, signal.len() / 2, 8192);
+            let high = &spectrum[8192 * 5_000 / 48_000..8192 * 20_000 / 48_000];
+            high.iter().sum::<f32>() / high.len() as f32
+        };
+        let before = far(&played(tone_over_noise(1.0), None));
+        let out = played(tone_over_noise(1.0), shown);
+        let (level, _) = fit(&out, 48_000, ON_BIN);
+        let after = far(&out);
+        assert!(hush < 1e-6, "noise alone at rms {hush}");
+        assert!((level + 6.02).abs() < 0.3, "the tone at {level} dBFS");
+        assert!(
+            after < before - 30.0,
+            "noise from 5 to 20 kHz at {after} dB, {before} before"
+        );
+    }
+
+    #[test]
+    fn nothing_outside_the_band_on_screen_is_heard() {
+        let mut samples = tone(1_000.0, 48_000, 1.0);
+        for (s, t) in samples.iter_mut().zip(tone(6_000.0, 48_000, 1.0)) {
+            *s = 0.5 * (*s + t);
+        }
+        let out = played(samples, Some(shown(-200.0, (4_000.0, 8_000.0), false)));
+        let (kept, _) = fit(&out, 48_000, 6_000.0);
+        let (gone, _) = fit(&out, 48_000, 1_000.0);
+        assert!(
+            (kept + 6.02).abs() < 0.2 && gone < -70.0,
+            "6 kHz {kept}, 1 kHz {gone} dBFS"
+        );
+    }
+
+    #[test]
+    fn a_soft_edge_fades_in_what_is_barely_shown() {
+        let level = |floor, soft| {
+            let samples = tone(ON_BIN, 48_000, 1.0)
+                .into_iter()
+                .map(|s| 0.5 * s)
+                .collect();
+            fit(
+                &played(samples, Some(shown(floor, (0.0, 24_000.0), soft))),
+                48_000,
+                ON_BIN,
+            )
+            .0
+        };
+        // Well over the floor, either edge leaves the tone as it was.
+        for soft in [false, true] {
+            let clear = level(-40.0, soft);
+            assert!((clear + 6.02).abs() < 0.3, "soft {soft}: {clear} dBFS");
+        }
+        // Its peak 3 dB over the floor: the soft edge only half lets it in.
+        let (hard, soft) = (level(-9.0, false), level(-9.0, true));
+        assert!(
+            soft < hard - 3.0 && soft > -40.0,
+            "soft {soft}, hard {hard} dBFS"
+        );
+    }
+
+    #[test]
+    fn a_change_in_what_is_shown_is_heard_from_the_next_block() {
+        let mut renderer = shifted(
+            tone(ON_BIN, 48_000, 2.0),
+            48_000,
+            48_000,
+            Speed::NORMAL,
+            0.0,
+        );
+        renderer.set_shown(Some(shown(-200.0, (0.0, 24_000.0), false)));
+        let take = |renderer: &mut Renderer| {
+            let mut left = Vec::new();
+            while left.len() < 24_000 {
+                let block = renderer.render().unwrap().unwrap();
+                left.extend(block.as_chunks::<2>().0.iter().map(|pair| pair[0]));
+            }
+            left
+        };
+        let loud = middle_rms(&take(&mut renderer));
+        // No level reaches a floor over full scale.
+        renderer.set_shown(Some(shown(10.0, (0.0, 24_000.0), false)));
+        let after = take(&mut renderer);
+        // Past the resampler's delay and the step fading out, silence.
+        let quiet = middle_rms(&after[4_096..]);
+        assert!(loud > 0.5 && quiet < 1e-4, "before {loud}, after {quiet}");
     }
 
     #[test]

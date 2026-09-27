@@ -18,10 +18,17 @@ SIGN ?=
 CARGO_BIN := $(or $(CARGO_HOME),$(HOME)/.cargo)/bin
 export PATH := $(CARGO_BIN):$(PATH)
 
-.PHONY: install dmg check packager rust
+.PHONY: app install dmg check packager rust
 
-install: packager
+# Signed ad hoc, which seals the whole app: without it a downloaded copy is
+# "damaged". Here rather than by cargo-packager, which then warns on every
+# build that it could not notarize the app, and never will.
+app: packager
 	$(CARGO_BIN)/cargo packager --release --formats app
+	xattr -cr target/packages/soundcheck.app
+	codesign --force --sign - --options runtime target/packages/soundcheck.app
+
+install: app
 	rm -rf "$(APPS)/soundcheck.app"
 	ditto target/packages/soundcheck.app "$(APPS)/soundcheck.app"
 	$(if $(SIGN),codesign --force --sign "$(SIGN)" "$(APPS)/soundcheck.app")
@@ -29,15 +36,19 @@ install: packager
 
 # A plain image around the signed app. cargo-packager's dmg format signs the
 # image as well, and macOS blocks a downloaded image with an ad-hoc signature
-# outright; unsigned, it opens and macOS checks only the app. hdiutil, not
-# diskutil image, because that only exists from macOS 26.
-dmg: packager
-	$(CARGO_BIN)/cargo packager --release --formats app
+# outright; unsigned, it opens and macOS checks only the app. diskutil image
+# from macOS 26 on, which deprecates hdiutil; hdiutil before that, as on the
+# Release workflow's runner.
+dmg: app
 	rm -rf target/dmg
 	mkdir target/dmg
 	ditto target/packages/soundcheck.app target/dmg/soundcheck.app
 	ln -s /Applications target/dmg/Applications
-	hdiutil create -volname soundcheck -srcfolder target/dmg -fs HFS+ -format UDZO -ov soundcheck.dmg
+	if /usr/sbin/diskutil image create --help >/dev/null 2>&1; then \
+		/usr/sbin/diskutil image create from --format UDZO --volumeName soundcheck target/dmg soundcheck.dmg; \
+	else \
+		hdiutil create -volname soundcheck -srcfolder target/dmg -fs HFS+ -format UDZO -ov soundcheck.dmg; \
+	fi
 	@echo "built $(CURDIR)/soundcheck.dmg"
 
 check: rust
