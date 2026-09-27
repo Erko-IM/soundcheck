@@ -3,9 +3,10 @@
 # linux` build the packages to hand to someone else in the repo root,
 # replacing the ones before: soundcheck.dmg, soundcheck-setup.exe, and
 # soundcheck.deb plus soundcheck.AppImage; `make packages` builds all four on
-# a Mac, and `make release` publishes them as a GitHub release. They first
-# install anything they need that's missing: rustup (except on Windows), the
-# Rust version rust-toolchain.toml names, and cargo-packager.
+# a Mac, and `make release` raises the version, builds them and publishes
+# them as a GitHub release. They first install anything they need that's
+# missing: rustup (except on Windows), the Rust version rust-toolchain.toml
+# names, and cargo-packager.
 #
 # The dmg needs a Mac. The exe builds on Windows, Linux or a Mac, and the
 # Linux packages on Linux or a Mac. A Mac builds those two in a Linux
@@ -100,23 +101,48 @@ builder:
 
 packages: dmg exe linux
 
-# Publishes the four packages as a GitHub release, which install.sh and
-# install.ps1 download from, named after the version in Cargo.toml: bump
-# that for each one. The release tags the commit it's built from, so only
-# once everything is committed and pushed. Its notes open with
-# packaging/release-notes.md, ahead of GitHub's list of changes. Needs the
-# GitHub CLI, gh, logged in.
-VERSION = $(shell sed -n 's/^version = "\(.*\)"$$/\1/p' Cargo.toml | head -n 1)
+# Builds the four packages and publishes them as a GitHub release, which
+# install.sh and install.ps1 download from, named after the version in
+# Cargo.toml. Once that version is out, it goes up first: the middle number
+# by default, 0.2.0 to 0.3.0; BUMP=patch raises the last, to 0.2.1, and
+# BUMP=major the first, to 1.0.0. VERSION=1.2.3 sets it, out or not. The new
+# version is committed and pushed on its own, as the release tags the commit
+# it's built from. One that isn't out yet, set by hand or left by a release
+# that stopped partway, goes out as it is. Only from a clean branch that's
+# pushed. The notes open with packaging/release-notes.md, ahead of GitHub's
+# list of changes. Needs the GitHub CLI, gh, logged in.
+BUMP ?= minor
 release: rust
 	@$(CARGO_BIN)cargo metadata --format-version 1 >/dev/null
 	@test -z "$$(git status --porcelain)" \
-		|| { echo "commit your changes first, Cargo.lock too after a version bump" >&2; exit 1; }
+		|| { echo "commit your changes first, Cargo.lock too" >&2; exit 1; }
 	@test -n "$$(git branch -r --contains HEAD)" || { echo "push first" >&2; exit 1; }
-	@! git ls-remote --exit-code --tags origin v$(VERSION) >/dev/null \
-		|| { echo "v$(VERSION) is out already: bump the version in Cargo.toml" >&2; exit 1; }
+	@case "$(BUMP)" in major|minor|patch) ;; *) echo "BUMP is major, minor or patch" >&2; exit 1;; esac; \
+	test -z "$(VERSION)" || echo "$(VERSION)" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+		|| { echo "VERSION is a version like 1.2.3" >&2; exit 1; }; \
+	current=$$(sed -n 's/^version = "\(.*\)"$$/\1/p' Cargo.toml | head -n 1); \
+	git ls-remote --exit-code --tags origin "v$$current" >/dev/null; \
+	case $$? in 0) out=yes;; 2) out=;; *) echo "cannot see the releases on origin" >&2; exit 1;; esac; \
+	next="$(VERSION)"; \
+	if test -z "$$out" && { test -z "$$next" || test "$$next" = "$$current"; }; then \
+		echo "v$$current isn't out yet, so it goes out as it is"; \
+		test "$(origin BUMP)" != "command line" \
+			|| echo "BUMP raises only a version that's out, and VERSION=1.2.3 sets one"; \
+		exit 0; \
+	fi; \
+	test -n "$$next" || next=$$(echo "$$current" | awk -F. -v bump="$(BUMP)" \
+		'bump == "major" { print $$1 + 1 ".0.0" } bump == "minor" { print $$1 "." $$2 + 1 ".0" } bump == "patch" { print $$1 "." $$2 "." $$3 + 1 }'); \
+	! git ls-remote --exit-code --tags origin "v$$next" >/dev/null \
+		|| { echo "v$$next is out already" >&2; exit 1; }; \
+	echo "v$$current becomes v$$next"; \
+	sed -i '' "1,/^version = /s/^version = \".*\"/version = \"$$next\"/" Cargo.toml \
+		&& $(CARGO_BIN)cargo metadata --format-version 1 >/dev/null \
+		&& git commit --quiet -m "v$$next" Cargo.toml Cargo.lock \
+		&& git push --quiet
 	$(MAKE) packages
-	gh release create v$(VERSION) soundcheck.dmg soundcheck-setup.exe soundcheck.deb soundcheck.AppImage \
-		--target $$(git rev-parse HEAD) --title v$(VERSION) --notes-file packaging/release-notes.md --generate-notes
+	@version=$$(sed -n 's/^version = "\(.*\)"$$/\1/p' Cargo.toml | head -n 1); \
+	gh release create "v$$version" soundcheck.dmg soundcheck-setup.exe soundcheck.deb soundcheck.AppImage \
+		--target "$$(git rev-parse HEAD)" --title "v$$version" --notes-file packaging/release-notes.md --generate-notes
 endif
 
 ifeq ($(SYSTEM),Windows)
