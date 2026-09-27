@@ -1,9 +1,11 @@
 name: Release
 
-# Builds the installable packages on each platform's own runner: a .dmg for
-# Apple silicon Macs, an NSIS installer .exe for Windows, and a .deb plus an
-# AppImage for Linux. Pushing a v* tag also publishes them as a GitHub
-# release; running it by hand just leaves them as downloadable artifacts.
+# Builds the installable packages on each platform's own runner, with the
+# same make targets as a build at home: a .dmg for Apple silicon Macs, an
+# NSIS installer .exe for Windows, and a .deb plus an AppImage for Linux.
+# Pushing a v* tag also publishes them as a GitHub release, where
+# install.sh and install.ps1 fetch them from; running it by hand just
+# leaves them as downloadable artifacts.
 #
 # No build cache on purpose: anything able to write a cache entry would get
 # to shape the binaries people download.
@@ -22,24 +24,26 @@ jobs:
       matrix:
         include:
           - runner: macos-15
+            target: dmg
             output: soundcheck.dmg
           - runner: windows-2025
-            formats: nsis
-            output: target/packages/*.exe
+            target: exe
+            output: soundcheck-setup.exe
           # The oldest supported Ubuntu, so the AppImage runs on older distros.
           - runner: ubuntu-22.04
-            formats: deb,appimage
+            target: linux
             output: |
-              target/packages/*.deb
-              target/packages/*.AppImage
+              soundcheck.deb
+              soundcheck.AppImage
     runs-on: ${{ matrix.runner }}
-    # Windows runs steps in PowerShell by default, which reads $FORMATS as
-    # one of its own variables rather than from the environment.
+    # Windows runs steps in PowerShell by default, which reads $TARGET as
+    # one of its own variables rather than from the environment. make's
+    # recipes need Git Bash there anyway.
     defaults:
       run:
         shell: bash
     env:
-      FORMATS: ${{ matrix.formats }}
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,20 +55,15 @@ jobs:
 
       - name: Linux build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libfuse2
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
-      - name: Install cargo-packager
-        run: cargo install cargo-packager --locked --version 0.11.8
+      - name: Install make
+        if: runner.os == 'Windows'
+        run: choco install make --no-progress -y
 
+      # make installs cargo-packager itself, the version its Makefile names.
       - name: Package
-        if: runner.os != 'macOS'
-        run: cargo packager --release --formats "$FORMATS"
-
-      # make builds the image around the signed app itself; its dmg target
-      # says why.
-      - name: Package
-        if: runner.os == 'macOS'
-        run: make dmg
+        run: make "$TARGET"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

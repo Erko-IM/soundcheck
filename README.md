@@ -4,7 +4,21 @@ The point of this is to have a fast sound check tool to quickly check your sound
 
 It was inspired by https://github.com/mrkva/sound-explorer/tree/main - but rewritten in Rust, and made multiple useability improvements for myself and a friend of mine. Functionally it is a completely separate program, but it is very much inspired by this, but since I really... really don't like Javascript, then instead of forking and modifying, and having to use Javascript when I don't absolutely have to, a rewrite in Rust seemed like a better idea, because why not.
 
-Makefile contains commands to generate your own installer for macos - only ARM based. But repo root also contains install file itself. 
+Easiest way to install it is from a terminal. On a Mac (Apple silicon) or Linux (x86_64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Erko-IM/soundcheck/main/install.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Erko-IM/soundcheck/main/install.ps1 | iex
+```
+
+Same command again updates it. It downloads the latest release and installs it: into /Applications on a Mac, into AppData\Local\soundcheck with a Start menu shortcut on Windows (Settings, Apps removes it), and into ~/.local/share/soundcheck on Linux, with an entry among your apps (deleting that folder, ~/.local/bin/soundcheck and ~/.local/share/applications/soundcheck.desktop removes it). Installed this way, macos and Windows don't complain about the app not being signed, because only what a browser or the like downloads gets marked as coming from the internet.
+
+The installers are also on the releases page: a dmg for Macs, an exe for Windows, and a deb and an AppImage for Linux. Repo root also contains the Mac one.
 
 The first time you open the dmg file after downloading, macos says it cannot verify soundcheck, this is because the app is not signed with a paid Apple developer account. It most likely never will be. Click Done, then open System Settings, go to Privacy & Security, scroll down to the message about soundcheck and click Open Anyway. After that it opens like any other app. 
 
@@ -12,9 +26,9 @@ From a terminal, this does the same if you don't want to bother with UI:
 
 `xattr -dr com.apple.quarantine /Applications/soundcheck.app`
 
-Other option is to clone repo to your machine, and run "make dmg" from repo root from terminal. It will install all the necessary dependencies on your mac as well. Check Makefile contents to see what it is actually doing, in case you are worried.
+Windows complains the same way about a downloaded exe: when it says "Windows protected your PC", click More info, then Run anyway.
 
-Will add the same for Linux and Windows later on.
+Other option is to clone repo to your machine, and run "make install" from repo root from terminal. It builds soundcheck, installs it, and installs all the necessary dependencies as well, except for a few things Windows and Linux need set up first, which the top of the Makefile lists. "make dmg", "make exe" and "make linux" build the installers themselves. Check Makefile contents to see what it is actually doing, in case you are worried.
 
 This project is open-source - no catch, nothing proprietary, just seems like a useful tool to have, and thus... if you find it useful, feel free to use, fork, do whatever you want, but you cannot fork it to make it proprietary.
 
