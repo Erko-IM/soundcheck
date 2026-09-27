@@ -507,17 +507,30 @@ pub fn spectrum_around(signal: &[f32], centre: usize, fft: usize) -> Vec<f32> {
         .collect()
 }
 
-/// The frequency band actually drawn: never past what the file can hold,
-/// and never down to 0 Hz on a log axis.
+/// The highest the band can be set to, for seeing that a file holds
+/// nothing past half its sample rate.
+pub const HIGHEST_HZ: f32 = 1_000_000.0;
+
+/// The frequency band drawn: as far up as asked, past what the file can
+/// hold too, and never down to 0 Hz on a log axis.
 pub fn band(view: &View, sample_rate: u32, fft: usize) -> (f32, f32) {
     let nyquist = sample_rate as f32 / 2.0;
     let bin_hz = sample_rate as f32 / fft as f32;
-    let hi = view.f_max.clamp(bin_hz * 2.0, nyquist);
+    let hi = view.f_max.clamp(bin_hz * 2.0, HIGHEST_HZ.max(nyquist));
     let floor = if view.log { bin_hz } else { 0.0 };
     (view.f_min.max(floor).min(hi - bin_hz), hi)
 }
 
-/// One plane of `a` as an image `rows` tall, top row the highest frequency.
+/// The part of [`band`] the file holds: up to half its sample rate, and
+/// nothing when the band starts above that.
+pub fn held(view: &View, sample_rate: u32, fft: usize) -> Option<(f32, f32)> {
+    let (lo, hi) = band(view, sample_rate, fft);
+    let nyquist = sample_rate as f32 / 2.0;
+    (lo < nyquist).then(|| (lo, hi.min(nyquist)))
+}
+
+/// One plane of `a` as an image `rows` tall, top row the highest frequency
+/// the file holds within the band.
 pub fn colorize(
     a: &Analysis,
     plane: usize,
@@ -526,7 +539,9 @@ pub fn colorize(
     gradient: colorous::Gradient,
     rows: usize,
 ) -> ColorImage {
-    let (lo, hi) = band(view, sample_rate, a.spec.fft);
+    let Some((lo, hi)) = held(view, sample_rate, a.spec.fft) else {
+        return ColorImage::new([1, 1], vec![Color32::BLACK]);
+    };
     let bin_hz = sample_rate as f32 / a.spec.fft as f32;
     let freq = |t: f32| {
         if view.log {
@@ -707,8 +722,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn band_is_capped_at_nyquist_and_positive_on_log() {
-        let view = View {
+    fn the_band_goes_past_what_the_file_holds_and_what_it_holds_stops_there() {
+        let mut view = View {
             brightness: 0.0,
             contrast: 90.0,
             f_min: 0.0,
@@ -716,7 +731,30 @@ pub(crate) mod tests {
             log: true,
         };
         let (lo, hi) = band(&view, 384_000, 2048);
-        assert_eq!(hi, 192_000.0);
+        assert_eq!(hi, HIGHEST_HZ);
         assert!(lo > 0.0);
+        assert_eq!(held(&view, 384_000, 2048), Some((lo, 192_000.0)));
+        view.f_max = 60_000.0;
+        assert_eq!(band(&view, 48_000, 2048).1, 60_000.0);
+        assert_eq!(held(&view, 48_000, 2048).map(|b| b.1), Some(24_000.0));
+        view.f_min = 30_000.0;
+        assert_eq!(held(&view, 48_000, 2048), None);
+    }
+
+    #[test]
+    fn past_what_the_file_holds_nothing_takes_up_rows() {
+        let signal = sine(6_000.0, 48_000.0, 0.5);
+        let a = analyse(&signal, 1, mix(1024), 0..signal.len(), 100_000);
+        let view = |f_max| View {
+            brightness: 0.0,
+            contrast: 90.0,
+            f_min: 0.0,
+            f_max,
+            log: false,
+        };
+        let at_limit = colorize(&a, 0, 48_000, &view(24_000.0), colorous::VIRIDIS, 400);
+        let past = colorize(&a, 0, 48_000, &view(96_000.0), colorous::VIRIDIS, 400);
+        assert_eq!(at_limit.size, [a.columns, 400]);
+        assert!(at_limit.pixels == past.pixels);
     }
 }

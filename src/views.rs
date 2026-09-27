@@ -26,11 +26,13 @@ const ELAPSED: Color32 = Color32::from_gray(220);
 const WALL_CLOCK: Color32 = Color32::from_gray(115);
 /// Orange, like a control picked for the keys: what is chosen.
 const SELECTION: Color32 = Color32::from_rgba_unmultiplied_const(255, 140, 50, 45);
-const REGION: Color32 = Color32::from_rgba_unmultiplied_const(255, 45, 45, 45);
-const REGION_EDGE: Color32 = Color32::from_rgb(255, 45, 45);
-/// Under an area's edge, so the red stands out on the reds of the colour
-/// maps too.
+/// Under an area's edge, so it stands out on the light colours of the
+/// colour maps too.
 const REGION_RIM: Color32 = Color32::from_black_alpha(200);
+/// Past what the file holds: dark, hatched, and a line at the limit.
+const BEYOND: Color32 = Color32::from_gray(14);
+const BEYOND_HATCH: Color32 = Color32::from_gray(46);
+pub const LIMIT: Color32 = Color32::from_gray(130);
 /// A mute button while its channel plays, and once muted.
 const LIVE: Color32 = Color32::from_rgb(240, 200, 60);
 const MUTED: Color32 = Color32::from_rgb(215, 55, 50);
@@ -132,9 +134,26 @@ pub fn place(painter: &Painter, lane: Rect, span: Span, texture: TextureId, rang
     painter.image(texture, rect, uv, Color32::WHITE);
 }
 
+/// How the areas picked to play are drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AreaStyle {
+    pub edge: Color32,
+    pub width: f32,
+    /// A dark line under the edge.
+    pub rim: bool,
+    pub fill: Color32,
+}
+
 /// An area picked to play: its stretch across `lane`, and its band, `rows`,
 /// up it.
-pub fn region(painter: &Painter, lane: Rect, span: Span, frames: &Range<f64>, rows: egui::Rangef) {
+pub fn region(
+    painter: &Painter,
+    lane: Rect,
+    span: Span,
+    frames: &Range<f64>,
+    rows: egui::Rangef,
+    style: AreaStyle,
+) {
     let (left, right) = (
         span.x(frames.start).max(lane.left()),
         span.x(frames.end).min(lane.right()),
@@ -143,9 +162,43 @@ pub fn region(painter: &Painter, lane: Rect, span: Span, frames: &Range<f64>, ro
         return;
     }
     let rect = Rect::from_x_y_ranges(left..=right, rows);
-    painter.rect_filled(rect, 0.0, REGION);
-    painter.rect_stroke(rect, 0.0, Stroke::new(6.0, REGION_RIM), StrokeKind::Middle);
-    painter.rect_stroke(rect, 0.0, Stroke::new(3.0, REGION_EDGE), StrokeKind::Middle);
+    painter.rect_filled(rect, 0.0, style.fill);
+    if style.rim {
+        let rim = Stroke::new(style.width + 3.0, REGION_RIM);
+        painter.rect_stroke(rect, 0.0, rim, StrokeKind::Middle);
+    }
+    let edge = Stroke::new(style.width, style.edge);
+    painter.rect_stroke(rect, 0.0, edge, StrokeKind::Middle);
+}
+
+/// Where the band shown runs past what the file holds: hatched, and where
+/// it fits, `note` in the middle saying why nothing is there. The line at
+/// the limit is the caller's, as it runs across a spectrogram and up a
+/// spectrum.
+pub fn beyond(painter: &Painter, rect: Rect, note: &str) {
+    if rect.width() < 1.0 || rect.height() < 1.0 {
+        return;
+    }
+    painter.rect_filled(rect, 0.0, BEYOND);
+    let hatch = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+    let mut x = rect.left() - rect.height();
+    while x < rect.right() {
+        hatch.line_segment(
+            [
+                Pos2::new(x, rect.bottom()),
+                Pos2::new(x + rect.height(), rect.top()),
+            ],
+            Stroke::new(1.0, BEYOND_HATCH),
+        );
+        x += 9.0;
+    }
+    let galley = painter.layout_no_wrap(note.to_owned(), FontId::proportional(12.0), AXIS);
+    let room = galley.size() + Vec2::new(10.0, 4.0);
+    if room.x <= rect.width() && room.y <= rect.height() {
+        let back = Rect::from_center_size(rect.center(), room);
+        painter.rect_filled(back, 3.0, Color32::from_black_alpha(210));
+        painter.galley(back.min + Vec2::new(5.0, 2.0), galley, AXIS);
+    }
 }
 
 pub fn selection(painter: &Painter, plot: Rect, span: Span, range: &Range<f64>) {
@@ -899,7 +952,8 @@ pub struct Axes {
 
 /// Level against frequency, with a legend once there is more than one
 /// curve, and where the pointer is, the frequency under it and each curve's
-/// level there.
+/// level there. Past `nyquist`, where the file holds nothing, the plot is
+/// hatched with `note` saying so.
 pub fn spectrum(
     painter: &Painter,
     plot: Rect,
@@ -907,6 +961,7 @@ pub fn spectrum(
     nyquist: f32,
     axes: &Axes,
     pointer: Option<Pos2>,
+    note: &str,
 ) {
     let Axes {
         lo,
@@ -948,7 +1003,17 @@ pub fn spectrum(
         );
         db -= 20.0;
     }
-    for curve in curves.iter().filter(|c| c.levels.len() > 1) {
+    if hi > nyquist {
+        let x = x_of(nyquist.max(lo));
+        beyond(
+            painter,
+            Rect::from_x_y_ranges(x..=plot.right(), plot.y_range()),
+            note,
+        );
+        painter.vline(x, plot.y_range(), Stroke::new(1.0, LIMIT));
+    }
+    let end = hi.min(nyquist);
+    for curve in curves.iter().filter(|c| c.levels.len() > 1 && lo < end) {
         let bin_hz = nyquist / (curve.levels.len() - 1) as f32;
         // From edge to edge, whether or not a bin falls on either.
         let inside = curve
@@ -956,10 +1021,10 @@ pub fn spectrum(
             .iter()
             .enumerate()
             .map(|(k, &level)| (k as f32 * bin_hz, level))
-            .filter(|(f, _)| *f > lo && *f < hi);
+            .filter(|(f, _)| *f > lo && *f < end);
         let points: Vec<Pos2> = std::iter::once((lo, level_at(curve.levels, bin_hz, lo)))
             .chain(inside)
-            .chain(std::iter::once((hi, level_at(curve.levels, bin_hz, hi))))
+            .chain(std::iter::once((end, level_at(curve.levels, bin_hz, end))))
             .map(|(f, level)| Pos2::new(x_of(f), y_of(level)))
             .collect();
         painter.add(Shape::line(points, Stroke::new(1.2, curve.color)));
@@ -1012,8 +1077,13 @@ fn readout(
         axes.hi,
         axes.log,
     );
+    let past = pointed > nyquist;
     let bin = ((pointed / bin_hz).round() as usize).min(bins - 1);
-    let f = (bin as f32 * bin_hz).clamp(axes.lo, axes.hi);
+    let f = if past {
+        pointed
+    } else {
+        (bin as f32 * bin_hz).clamp(axes.lo, axes.hi)
+    };
     let x = plot.left() + freq_t(f, axes.lo, axes.hi, axes.log) * plot.width();
     let y_of = |db: f32| {
         plot.top() + ((axes.top - db) / (axes.top - axes.bottom)).clamp(0.0, 1.0) * plot.height()
@@ -1024,7 +1094,10 @@ fn readout(
         Stroke::new(0.5, Color32::from_white_alpha(90)),
     );
     let mut lines = vec![(hz_exact(f * axes.scale), Color32::WHITE)];
-    for curve in curves.iter().filter(|c| c.levels.len() == bins) {
+    if past {
+        lines.push(("nothing: past what the file holds".to_owned(), AXIS));
+    }
+    for curve in curves.iter().filter(|c| c.levels.len() == bins && !past) {
         let level = curve.levels[bin];
         painter.circle_filled(Pos2::new(x, y_of(level)), 3.0, curve.color);
         let level = if level <= SILENCE_DB + 1.0 {
@@ -1401,6 +1474,10 @@ pub fn hz(f: f32) -> String {
     if f < 1000.0 {
         return format!("{f:.0}");
     }
+    if f >= 1_000_000.0 {
+        let m = format!("{:.2}", f / 1_000_000.0);
+        return format!("{}M", m.trim_end_matches('0').trim_end_matches('.'));
+    }
     let k = f / 1000.0;
     if (k - k.round()).abs() < 0.05 {
         format!("{k:.0}k")
@@ -1460,7 +1537,10 @@ pub fn hz_exact(f: f32) -> String {
 
 /// A frequency as a slider shows it.
 pub fn hz_field(f: f64) -> String {
-    if f >= 10_000.0 {
+    if f >= 1_000_000.0 {
+        let m = format!("{:.3}", f / 1_000_000.0);
+        format!("{} MHz", m.trim_end_matches('0').trim_end_matches('.'))
+    } else if f >= 10_000.0 {
         format!("{:.1} kHz", f / 1000.0)
     } else if f >= 1000.0 {
         format!("{:.2} kHz", f / 1000.0)
@@ -1469,13 +1549,17 @@ pub fn hz_field(f: f64) -> String {
     }
 }
 
-/// A frequency as typed: `12000`, `12k`, `12.5 kHz`, `440 Hz`, `1,5k`.
+/// A frequency as typed: `12000`, `12k`, `12.5 kHz`, `440 Hz`, `1,5k`,
+/// `1 MHz`.
 pub fn parse_hz(text: &str) -> Option<f64> {
     let text = text.trim().to_lowercase().replace(',', ".");
     let text = text.strip_suffix("hz").unwrap_or(&text).trim_end();
-    let (number, scale) = match text.strip_suffix('k') {
-        Some(number) => (number, 1000.0),
-        None => (text, 1.0),
+    let (number, scale) = if let Some(number) = text.strip_suffix('k') {
+        (number, 1000.0)
+    } else if let Some(number) = text.strip_suffix('m') {
+        (number, 1_000_000.0)
+    } else {
+        (text, 1.0)
     };
     let value: f64 = number.trim().parse().ok()?;
     (value.is_finite() && value >= 0.0).then_some(value * scale)
@@ -1673,8 +1757,13 @@ mod tests {
         assert_eq!(hz(440.0), "440");
         assert_eq!(hz(2_500.0), "2.5k");
         assert_eq!(hz(192_000.0), "192k");
+        assert_eq!(
+            (hz(1_000_000.0), hz(1_250_000.0)),
+            ("1M".into(), "1.25M".into())
+        );
         assert_eq!(hz_field(12_345.0), "12.3 kHz");
         assert_eq!(hz_field(440.0), "440 Hz");
+        assert_eq!(hz_field(1_000_000.0), "1 MHz");
     }
 
     #[test]
@@ -1684,6 +1773,8 @@ mod tests {
         assert_eq!(parse_hz(" 12.5 kHz "), Some(12_500.0));
         assert_eq!(parse_hz("440 Hz"), Some(440.0));
         assert_eq!(parse_hz("1,5k"), Some(1_500.0));
+        assert_eq!(parse_hz("1 MHz"), Some(1_000_000.0));
+        assert_eq!(parse_hz("0.5m"), Some(500_000.0));
         assert_eq!(parse_hz("loud"), None);
         assert_eq!(parse_hz("-3"), None);
     }

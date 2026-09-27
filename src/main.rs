@@ -15,6 +15,7 @@ mod probe;
 mod rename;
 mod rename_ui;
 mod save;
+mod search;
 mod spectrogram;
 mod tags;
 mod views;

@@ -18,8 +18,11 @@ use crate::views;
 /// a long stretch comes out coarser rather than too big to open.
 const MOST_COLUMNS: usize = 16_384;
 const MOST_PIXELS: usize = 64_000_000;
-/// The fewest rows a lane gets, so a narrow band still reads.
+/// The fewest rows the part of a lane the file holds gets, so a narrow band
+/// still reads, and the most a lane gets, so a band set far past what the
+/// file holds does not make a picture mostly of nothing.
 const FEWEST_ROWS: usize = 512;
+const MOST_ROWS: usize = 8192;
 /// Room around the lanes for the title and the labels, and between lanes.
 const LEFT: usize = 76;
 const RIGHT: usize = 24;
@@ -33,6 +36,10 @@ const AXIS: Rgb = [150, 150, 150];
 const ELAPSED: Rgb = [220, 220, 220];
 const WALL_CLOCK: Rgb = [115, 115, 115];
 const TITLE: Rgb = [235, 235, 235];
+/// Past what the file holds, as on screen.
+const BEYOND: Rgb = [14, 14, 14];
+const BEYOND_HATCH: Rgb = [46, 46, 46];
+const LIMIT: Rgb = [130, 130, 130];
 
 /// What to export, copied out of the window for the thread that does it.
 pub struct Request {
@@ -49,6 +56,8 @@ pub struct Request {
     /// Time of day at the first sample, when the recording says.
     pub wall_start: Option<f64>,
     pub title: String,
+    /// Said where the band runs past what the file holds.
+    pub beyond: String,
     pub to: PathBuf,
 }
 
@@ -67,11 +76,18 @@ pub fn path_for(path: &Path, range: &Range<usize>, rate: f64) -> PathBuf {
     to
 }
 
-/// Columns across and rows up each of `lanes` lanes for `len` frames and a
-/// band `bins` bins tall: a column a quarter window along, and at least as
-/// many as the screen shows; a row a bin, and at least [`FEWEST_ROWS`].
-fn size(len: usize, fft: usize, bins: usize, lanes: usize) -> (usize, usize) {
-    let rows = bins.max(FEWEST_ROWS);
+/// Columns across and rows up each of `lanes` lanes for `len` frames, the
+/// file holding a band `bins` bins tall in `share` of each lane from the
+/// bottom: a column a quarter window along, and at least as many as the
+/// screen shows; a row a bin there, and at least [`FEWEST_ROWS`], with the
+/// rest of the lane in proportion up to [`MOST_ROWS`].
+fn size(len: usize, fft: usize, bins: usize, share: f32, lanes: usize) -> (usize, usize) {
+    let held = bins.max(FEWEST_ROWS);
+    let rows = if share > 0.0 {
+        ((held as f32 / share).ceil() as usize).clamp(held.min(MOST_ROWS), MOST_ROWS)
+    } else {
+        FEWEST_ROWS
+    };
     let columns = len
         .div_ceil((fft / 4).max(1))
         .max(len.min(MAX_COLUMNS))
@@ -89,9 +105,15 @@ pub fn export(
 ) -> Result<Option<PathBuf>, String> {
     let rate = r.info.sample_rate;
     let (lo, hi) = spectrogram::band(&r.view, rate, r.spec.fft);
-    let bins = ((hi - lo) / (rate as f32 / r.spec.fft as f32)).ceil() as usize;
+    let held = spectrogram::held(&r.view, rate, r.spec.fft);
+    let bins = held.map_or(0, |(from, top)| {
+        ((top - from) / (rate as f32 / r.spec.fft as f32)).ceil() as usize
+    });
+    let share = held.map_or(0.0, |(_, top)| {
+        views::freq_t(top, lo, hi, r.view.log).clamp(0.0, 1.0)
+    });
     let lanes = r.lanes.len().max(1);
-    let (columns, rows) = size(r.range.len(), r.spec.fft, bins, lanes);
+    let (columns, rows) = size(r.range.len(), r.spec.fft, bins, share, lanes);
     let analysis = audio::analyse_columns(
         &r.source,
         &r.info,
@@ -110,10 +132,28 @@ pub fn export(
         LEFT + analysis.columns + RIGHT,
         TOP + lanes * rows + (lanes - 1) * GAP + BOTTOM,
     );
+    // The rows the file holds, from the bottom of each lane, and above them
+    // the rows past its limit.
+    let held_rows = (rows as f32 * share).round() as usize;
+    let past = rows - held_rows;
     for plane in 0..analysis.planes.len() {
         let top = TOP + plane * (rows + GAP);
-        let image = spectrogram::colorize(&analysis, plane, rate, &r.view, r.gradient, rows);
-        canvas.image(LEFT, top, &image);
+        if held_rows > 0 {
+            let image =
+                spectrogram::colorize(&analysis, plane, rate, &r.view, r.gradient, held_rows);
+            canvas.image(LEFT, top + past, &image);
+        }
+        if past > 0 {
+            let across = LEFT..LEFT + analysis.columns;
+            canvas.hatch(across.clone(), top..top + past);
+            canvas.hline(across, top + past - 1, LIMIT);
+            canvas.note(
+                &fonts.proportional,
+                (LEFT, top),
+                (analysis.columns, past),
+                &r.beyond,
+            );
+        }
         freq_axis(&mut canvas, &fonts, top, rows, (lo, hi), r);
         if let Some(name) = r.lanes.get(plane).filter(|_| lanes > 1) {
             canvas.text(
@@ -298,6 +338,50 @@ impl Canvas {
         }
     }
 
+    /// Past what the file holds, as on screen: dark, with lines rising to
+    /// the right across it.
+    fn hatch(&mut self, x: Range<usize>, y: Range<usize>) {
+        for py in y {
+            for px in x.clone() {
+                let color = if (px + py) % 9 == 0 {
+                    BEYOND_HATCH
+                } else {
+                    BEYOND
+                };
+                self.blend(px as i64, py as i64, color, 1.0);
+            }
+        }
+    }
+
+    /// `text` on a dark ground in the middle of the stretch `size` across
+    /// from `(x, y)`, where it fits.
+    fn note(
+        &mut self,
+        font: &FontRef<'_>,
+        (x, y): (usize, usize),
+        (width, height): (usize, usize),
+        text: &str,
+    ) {
+        let size = 13.0;
+        let scaled = font.as_scaled(PxScale::from(size));
+        let wide: f32 = text
+            .chars()
+            .map(|c| scaled.h_advance(scaled.glyph_id(c)))
+            .sum();
+        let tall = scaled.ascent() - scaled.descent();
+        let (w, h) = (wide.ceil() as usize + 12, tall.ceil() as usize + 6);
+        if w > width || h > height {
+            return;
+        }
+        let (left, top) = (x + (width - w) / 2, y + (height - h) / 2);
+        for py in top..top + h {
+            for px in left..left + w {
+                self.blend(px as i64, py as i64, [0, 0, 0], 0.82);
+            }
+        }
+        self.text(font, size, (left + 6, top + 3), Align::TopLeft, text, AXIS);
+    }
+
     fn text(
         &mut self,
         font: &FontRef<'_>,
@@ -379,17 +463,25 @@ mod tests {
 
     #[test]
     fn a_short_view_keeps_the_screen_s_detail_and_a_long_one_gets_a_column_a_step() {
-        assert_eq!(size(4_000, 2048, 1025, 1), (2048, 1025));
-        assert_eq!(size(10 * 48_000, 2048, 1025, 1), (2048, 1025));
-        assert_eq!(size(60 * 48_000, 2048, 1025, 1), (5625, 1025));
-        assert_eq!(size(3600 * 48_000, 2048, 1025, 1).0, MOST_COLUMNS);
+        assert_eq!(size(4_000, 2048, 1025, 1.0, 1), (2048, 1025));
+        assert_eq!(size(10 * 48_000, 2048, 1025, 1.0, 1), (2048, 1025));
+        assert_eq!(size(60 * 48_000, 2048, 1025, 1.0, 1), (5625, 1025));
+        assert_eq!(size(3600 * 48_000, 2048, 1025, 1.0, 1).0, MOST_COLUMNS);
     }
 
     #[test]
     fn a_narrow_band_still_gets_rows_and_many_lanes_stay_within_the_pixels() {
-        assert_eq!(size(60 * 48_000, 2048, 90, 1).1, FEWEST_ROWS);
-        let (columns, rows) = size(3600 * 48_000, 8192, 4097, 8);
+        assert_eq!(size(60 * 48_000, 2048, 90, 1.0, 1).1, FEWEST_ROWS);
+        let (columns, rows) = size(3600 * 48_000, 8192, 4097, 1.0, 8);
         assert!(columns * rows * 8 <= MOST_PIXELS && columns > 1000);
+    }
+
+    #[test]
+    fn a_band_past_what_the_file_holds_gets_rows_in_proportion_up_to_a_limit() {
+        // Up to 96 kHz on a 48 kHz file: the file fills a quarter of the lane.
+        assert_eq!(size(48_000, 2048, 1025, 0.25, 1).1, 4100);
+        assert_eq!(size(48_000, 2048, 1025, 0.001, 1).1, MOST_ROWS);
+        assert_eq!(size(48_000, 2048, 0, 0.0, 1).1, FEWEST_ROWS);
     }
 
     #[test]
@@ -436,6 +528,7 @@ mod tests {
             lanes: vec!["Mix".into()],
             wall_start: Some(3600.0),
             title: "export.wav  0:00.25 to 0:00.75".into(),
+            beyond: "Nothing past 24.0 kHz".into(),
             to: to.clone(),
         };
         let (cancel, progress) = idle();
@@ -443,13 +536,38 @@ mod tests {
             export(&request, &cancel, &progress).unwrap(),
             Some(to.clone())
         );
-        let decoder = png::Decoder::new(std::io::BufReader::new(File::open(&to).unwrap()));
-        let info = decoder.read_info().unwrap().info().clone();
+        let read = |to: &Path| {
+            let decoder = png::Decoder::new(std::io::BufReader::new(File::open(to).unwrap()));
+            let mut reader = decoder.read_info().unwrap();
+            let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+            let info = reader.next_frame(&mut pixels).unwrap();
+            (info.width as usize, info.height as usize, pixels)
+        };
+        let (width, height, _) = read(&to);
         // 24 000 frames at a column every 256, and at least the screen's.
         assert_eq!(
-            (info.width as usize, info.height as usize),
+            (width, height),
             (LEFT + 2048 + RIGHT, TOP + FEWEST_ROWS + BOTTOM)
         );
+        fs::remove_file(&to).unwrap();
+
+        // Up to 96 kHz: the file's 24 kHz fills the bottom quarter, and the
+        // rest is hatched, the same rows a bin as before.
+        let past = Request {
+            view: View {
+                f_max: 96_000.0,
+                ..request.view
+            },
+            ..request
+        };
+        export(&past, &cancel, &progress).unwrap();
+        let (width, height, pixels) = read(&to);
+        assert_eq!(height, TOP + 4 * FEWEST_ROWS + BOTTOM);
+        let at = |x: usize, y: usize| &pixels[(y * width + x) * 3..][..3];
+        let hatched = (0..9).any(|dx| at(LEFT + 100 + dx, TOP + 10) == BEYOND_HATCH)
+            && (0..9).any(|dx| at(LEFT + 100 + dx, TOP + 10) == BEYOND);
+        assert!(hatched, "{:?}", at(LEFT + 100, TOP + 10));
+        assert_eq!(at(LEFT + 100, TOP + 3 * FEWEST_ROWS - 1), LIMIT);
         fs::remove_file(&to).unwrap();
         fs::remove_file(&path).unwrap();
     }

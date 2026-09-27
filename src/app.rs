@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::{self, Loaded};
 use crate::edit::Edits;
-use crate::explorer::Explorer;
+use crate::explorer::{Explorer, Parts, Shortcut};
 use crate::export;
 use crate::finder::Inbox;
 use crate::levels::{FLOOR_DB, Level};
@@ -26,8 +26,8 @@ use crate::probe::{self, Probe};
 use crate::rename;
 use crate::rename_ui::{self, Renamer, Request};
 use crate::save;
-use crate::spectrogram::{self, Analysis, Channels, Spec, Target, View};
-use crate::views::{self, MarkerAction, Meters, Span};
+use crate::spectrogram::{self, Analysis, Channels, HIGHEST_HZ, Spec, Target, View};
+use crate::views::{self, AreaStyle, MarkerAction, Meters, Span};
 use crate::wav::Marker;
 
 const BRIGHTNESS: RangeInclusive<f32> = -20.0..=80.0;
@@ -35,6 +35,9 @@ const CONTRAST: RangeInclusive<f32> = 20.0..=160.0;
 const GAIN: RangeInclusive<f32> = -60.0..=60.0;
 /// Semitones: four octaves either way.
 const PITCH: RangeInclusive<f32> = -48.0..=48.0;
+/// An area's edge, in points, and how much of its colour fills it.
+const AREA_WIDTH: RangeInclusive<f32> = 1.0..=8.0;
+const AREA_FILL: RangeInclusive<f32> = 0.0..=0.6;
 /// The lowest a frequency slider or arrow key goes above zero.
 const LOWEST_HZ: f32 = 10.0;
 /// Room around a plot for its labels, which also keeps the plot's own
@@ -111,9 +114,9 @@ struct Settings {
     colormap: Colormap,
     brightness: f32,
     contrast: f32,
-    /// The band as last set by hand, applied to every file within its
-    /// reach: a raised low end stays raised, and a top left at the Nyquist
-    /// limit follows each file's own.
+    /// The band as last set by hand, applied to every file: a raised low
+    /// end stays raised, a top typed in past what a file holds stays there,
+    /// and a top left at the Nyquist limit follows each file's own.
     band_low: f32,
     band_high: Option<f32>,
     log: bool,
@@ -133,12 +136,44 @@ struct Settings {
     /// A new area picked on the spectrogram joins those picked before,
     /// rather than taking their place.
     multiple_areas: bool,
+    areas: AreaLook,
     /// The menu under the gear button at the top is open.
     menu: bool,
     tools: Tools,
     /// Semitones the sound, and the frequencies shown, move with the pitch
     /// shift on.
     pitch: f32,
+    /// Folders and files kept at the top of the explorer.
+    shortcuts: Vec<Shortcut>,
+}
+
+/// How the areas picked on the spectrogram are drawn, as the window the
+/// gear's menu opens sets it.
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct AreaLook {
+    /// The edge's colour with one area at a time, and with Multiple areas.
+    one: [u8; 3],
+    several: [u8; 3],
+    /// The edge's width, in points.
+    width: f32,
+    /// A dark line under the edge, so it shows on the light colours of the
+    /// colour maps too.
+    rim: bool,
+    /// How much of the edge's colour fills the area.
+    fill: f32,
+}
+
+impl Default for AreaLook {
+    fn default() -> Self {
+        Self {
+            one: [255; 3],
+            several: [255; 3],
+            width: 3.0,
+            rim: true,
+            fill: 0.18,
+        }
+    }
 }
 
 /// The listening tools switched on, at the top of the window.
@@ -171,9 +206,11 @@ impl Default for Settings {
             both_sides: true,
             soft_edge: true,
             multiple_areas: false,
+            areas: AreaLook::default(),
             menu: false,
             tools: Tools::default(),
             pitch: 0.0,
+            shortcuts: Vec::new(),
         }
     }
 }
@@ -204,8 +241,14 @@ impl Settings {
         self.contrast = within(self.contrast, CONTRAST, 90.0);
         self.gain = within(self.gain, GAIN, 0.0);
         self.pitch = within(self.pitch, PITCH, 0.0).round();
-        self.band_low = within(self.band_low, 0.0..=f32::MAX, 0.0);
-        self.band_high = self.band_high.filter(|f| f.is_finite() && *f > 0.0);
+        self.band_low = within(self.band_low, 0.0..=HIGHEST_HZ, 0.0);
+        self.band_high = self
+            .band_high
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .map(|f| f.min(HIGHEST_HZ));
+        let areas = &mut self.areas;
+        areas.width = within(areas.width, AREA_WIDTH, 3.0);
+        areas.fill = within(areas.fill, AREA_FILL, 0.18);
         self
     }
 }
@@ -221,6 +264,9 @@ struct Views {
     meters: bool,
     /// The short form for renaming the files in the explorer's folder.
     rename: bool,
+    /// The explorer's search, and its shortcuts.
+    search: bool,
+    shortcuts: bool,
 }
 
 impl Default for Views {
@@ -233,6 +279,8 @@ impl Default for Views {
             metadata: false,
             meters: true,
             rename: false,
+            search: true,
+            shortcuts: true,
         }
     }
 }
@@ -428,6 +476,10 @@ pub struct App {
     detail_due: Option<Instant>,
     /// Frames in view.
     view: Range<f64>,
+    /// When the view was last moved by hand, if it has been since the
+    /// playhead was last put anywhere: playback leaves it where it is put,
+    /// and once it rests goes on from it rather than pulling it back.
+    moved_at: Option<Instant>,
     selection: Option<Range<usize>>,
     /// A selection being dragged out: where the drag started, and where the
     /// pointer is now.
@@ -479,6 +531,8 @@ pub struct App {
     renamer: Renamer,
     /// The window with every rename rule is open.
     rename_window: bool,
+    /// The window setting how areas look is open.
+    area_window: bool,
     /// Channels muted in playback, to hear the others alone. Kept from file
     /// to file, not from one run to the next.
     mute: Vec<bool>,
@@ -557,6 +611,7 @@ impl App {
             detail_job: None,
             detail_due: None,
             view: 0.0..0.0,
+            moved_at: None,
             selection: None,
             selecting: None,
             cursor: None,
@@ -589,6 +644,7 @@ impl App {
             name_next: None,
             renamer: Renamer::default(),
             rename_window: false,
+            area_window: false,
             mute: Vec::new(),
             regions: Vec::new(),
             drawing: None,
@@ -654,6 +710,7 @@ impl App {
         self.detail_job = None;
         self.detail_due = None;
         self.view = 0.0..0.0;
+        self.moved_at = None;
         self.selection = None;
         self.selecting = None;
         self.regions.clear();
@@ -819,7 +876,7 @@ impl App {
 
     fn look(&self) -> Look {
         let nyquist = self.current.as_ref().map_or(f32::MAX, |c| c.info.nyquist());
-        let f_max = self.settings.band_high.map_or(nyquist, |f| f.min(nyquist));
+        let f_max = self.settings.band_high.unwrap_or(nyquist);
         Look {
             view: View {
                 brightness: self.settings.brightness,
@@ -829,6 +886,36 @@ impl App {
                 log: self.settings.log,
             },
             colormap: self.settings.colormap,
+        }
+    }
+
+    /// Said where the band runs past what the file holds.
+    fn limit_note(&self) -> String {
+        let Some(current) = &self.current else {
+            return String::new();
+        };
+        let scale = self.hz_scale();
+        let limit = views::hz_field(f64::from(current.info.nyquist() * scale));
+        if scale == 1.0 {
+            let rate = views::hz_field(f64::from(current.info.sample_rate));
+            format!("Nothing past {limit}: the most a {rate} recording holds")
+        } else {
+            format!("Nothing past {limit}: the most this recording holds, moved by the pitch shift")
+        }
+    }
+
+    fn area_style(&self) -> AreaStyle {
+        let look = &self.settings.areas;
+        let [r, g, b] = if self.settings.multiple_areas {
+            look.several
+        } else {
+            look.one
+        };
+        AreaStyle {
+            edge: Color32::from_rgb(r, g, b),
+            width: look.width,
+            rim: look.rim,
+            fill: Color32::from_rgba_unmultiplied(r, g, b, (look.fill * 255.0).round() as u8),
         }
     }
 
@@ -926,7 +1013,10 @@ impl App {
                 Job::Saved { generation, result } if generation == self.generation => {
                     self.saving = None;
                     match result {
-                        Ok(()) => self.reread(),
+                        Ok(()) => {
+                            self.reread();
+                            self.explorer.changed();
+                        }
                         Err(e) => {
                             self.save_error = Some(format!("Not saved: {e}"));
                             self.then = None;
@@ -1026,6 +1116,7 @@ impl App {
             lanes,
             wall_start: current.meta.start.as_ref().map(|s| s.seconds),
             title,
+            beyond: self.limit_note(),
         };
         self.jobs += 1;
         let (running, cancel, progress) = Running::new(self.jobs);
@@ -1290,17 +1381,26 @@ impl App {
         (self.rate() / 1000.0).max(64.0).min(self.frames() as f64)
     }
 
-    /// Shows `len` frames from `start`, kept within the file.
+    /// Shows `len` frames from `start`, kept within the file, as moved by
+    /// hand.
     fn set_view(&mut self, start: f64, len: f64) {
+        if self.show(start, len) {
+            self.moved_at = Some(Instant::now());
+        }
+    }
+
+    /// Shows `len` frames from `start`, kept within the file, and says
+    /// whether that moved the view.
+    fn show(&mut self, start: f64, len: f64) -> bool {
         let frames = self.frames() as f64;
         if frames <= 0.0 {
-            return;
+            return false;
         }
         let len = len.clamp(self.shortest_view(), frames);
         let start = start.clamp(0.0, frames - len);
         let view = start..start + len;
         if view == self.view {
-            return;
+            return false;
         }
         self.view = view;
         if self.zoomed() {
@@ -1310,6 +1410,7 @@ impl App {
             self.detail_job = None;
             self.detail_due = None;
         }
+        true
     }
 
     fn set_view_range(&mut self, start: f64, end: f64) {
@@ -1318,6 +1419,12 @@ impl App {
 
     fn view_len(&self) -> f64 {
         self.view.end - self.view.start
+    }
+
+    /// The first whole frame in view: a playhead put there is in it, where
+    /// one a fraction before it would page the view back.
+    fn view_start(&self) -> usize {
+        self.view.start.ceil() as usize
     }
 
     fn pan(&mut self, frames: f64) {
@@ -1364,7 +1471,21 @@ impl App {
         let len = self.view_len();
         let past = frame > self.view.start + 0.9 * len && self.view.end < self.frames() as f64;
         if past || frame < self.view.start {
-            self.set_view(frame - 0.1 * len, len);
+            self.show(frame - 0.1 * len, len);
+        }
+    }
+
+    /// A stretch picked on the whole file's waveform: the playhead goes to
+    /// its start, and playing, plays on from there. A selection outside it
+    /// is let go; one still in view keeps repeating.
+    fn play_from_view(&mut self) {
+        let (start, end) = (self.view.start, self.view.end);
+        let outside = |s: &Range<usize>| s.end as f64 <= start || s.start as f64 >= end;
+        if self.selection.as_ref().is_some_and(outside) {
+            self.select(None);
+        }
+        if self.selection.is_none() {
+            self.seek(self.view_start());
         }
     }
 
@@ -1382,6 +1503,7 @@ impl App {
     fn seek(&mut self, frame: usize) {
         let frame = frame.min(self.frames());
         self.cursor = Some(frame);
+        self.moved_at = None;
         if let Some(player) = &self.player {
             player.seek(frame);
         }
@@ -1401,6 +1523,7 @@ impl App {
         match selection {
             Some(range) => {
                 self.cursor = Some(range.start);
+                self.moved_at = None;
                 if self.ensure_player(range.start)
                     && let Some(player) = &self.player
                 {
@@ -1462,8 +1585,15 @@ impl App {
         if frames == 0 {
             return;
         }
-        // From the cursor, or from the start when it sits at the end.
-        let start = self.cursor.filter(|&c| c < frames).unwrap_or(0);
+        // From the cursor, or from what is in view once the view has been
+        // moved away from it by hand; without one, or with it at the end,
+        // from the start of the view.
+        let away = self.moved_at.is_some() && self.selection.is_none();
+        let start = match self.cursor.filter(|&c| c < frames) {
+            Some(c) if away && !self.view.contains(&(c as f64)) => self.view_start(),
+            Some(c) => c,
+            None => self.view_start(),
+        };
         if !self.ensure_player(start) {
             return;
         }
@@ -1472,6 +1602,11 @@ impl App {
             player.pause();
             self.cursor = Some(player.position());
         } else {
+            if player.position() != start {
+                player.seek(start);
+            }
+            self.cursor = Some(start);
+            self.moved_at = None;
             player.play();
         }
     }
@@ -1491,6 +1626,7 @@ impl App {
         }
         if self.current.is_some() {
             self.cursor = Some(home);
+            self.moved_at = None;
         }
     }
 
@@ -1525,9 +1661,25 @@ impl App {
         }
         let at = player.position();
         self.cursor = Some(at);
-        if self.selection.is_none() {
-            self.keep_in_view(at as f64);
+        // A selection repeats wherever the view is.
+        if self.selection.is_some() {
+            return;
         }
+        // While the view is moved by hand, or something on it dragged, it
+        // stays where it is. Once it rests, playback goes on from its start
+        // if it left the playhead behind, rather than pulling it back.
+        let in_hand = self.grab.is_some()
+            || self.selecting.is_some()
+            || self.drawing.is_some()
+            || self.marker_grab.is_some();
+        if in_hand || self.moved_at.is_some_and(|t| t.elapsed() < SETTLE) {
+            return;
+        }
+        if self.moved_at.take().is_some() && !self.view.contains(&(at as f64)) {
+            self.seek(self.view_start());
+            return;
+        }
+        self.keep_in_view(at as f64);
     }
 
     /// Moves the picked slider one step: a dB for the levels, a semitone
@@ -1564,9 +1716,16 @@ impl App {
                 if control == Control::Low {
                     self.settings.band_low = step(f_min).min(f_max / 1.06) / scale;
                 } else {
-                    let high = step(f_max).clamp((f_min * 1.06).max(LOWEST_HZ), nyquist);
+                    // Up to what the file holds, or once typed in past it,
+                    // as far as the band goes.
+                    let top = if f_max > nyquist + 0.5 * scale {
+                        HIGHEST_HZ * scale
+                    } else {
+                        nyquist
+                    };
+                    let high = step(f_max).clamp((f_min * 1.06).max(LOWEST_HZ), top);
                     self.settings.band_high =
-                        (high < nyquist - 0.5 * scale).then_some(high / scale);
+                        ((high - nyquist).abs() >= 0.5 * scale).then_some(high / scale);
                 }
             }
             Control::Pitch => {
@@ -1953,6 +2112,12 @@ impl App {
                 ui.label(RichText::new("Show").color(views::AXIS));
                 ui.checkbox(&mut self.settings.explorer, "Files")
                     .on_hover_text("⌘B");
+                ui.checkbox(&mut views.search, "Search").on_hover_text(
+                    "In the files, a search through every recording under the folder shown: names, metadata and tags, with the format, a date and the length to narrow it",
+                );
+                ui.checkbox(&mut views.shortcuts, "Shortcuts").on_hover_text(
+                    "In the files, folders and recordings kept at the top: right-click one to add it",
+                );
                 ui.checkbox(&mut views.spectrogram, "Spectrogram");
                 ui.checkbox(&mut views.waveform, "Waveform")
                     .on_hover_text("Under the spectrogram, the whole file: drag across it to pick the part the spectrogram shows");
@@ -1986,8 +2151,83 @@ impl App {
                 ui.checkbox(&mut self.settings.multiple_areas, "Multiple areas").on_hover_text(
                     "A new area picked with Shift-drag on the spectrogram joins those picked before, rather than taking their place",
                 );
+                if ui
+                    .selectable_label(self.area_window, "Area boxes")
+                    .on_hover_text("How the areas picked with Shift-drag look: the colour and width of their edges, and their fill")
+                    .clicked()
+                {
+                    self.area_window = !self.area_window;
+                }
             });
         });
+    }
+
+    /// The small window setting how areas look.
+    fn area_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.area_window;
+        // Under the gear that opens it, clear of the files on the left.
+        let corner = ctx.content_rect().right_top() + Vec2::new(-16.0, 110.0);
+        egui::Window::new("Area boxes")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .pivot(Align2::RIGHT_TOP)
+            .default_pos(corner)
+            .show(ctx, |ui| {
+                let look = &mut self.settings.areas;
+                egui::Grid::new("area look")
+                    .num_columns(2)
+                    .spacing([14.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("One area").on_hover_text(
+                            "The edge of the area picked, with Multiple areas off",
+                        );
+                        ui.color_edit_button_srgb(&mut look.one);
+                        ui.end_row();
+                        ui.label("Several areas")
+                            .on_hover_text("The edges of the areas, with Multiple areas on");
+                        ui.color_edit_button_srgb(&mut look.several);
+                        ui.end_row();
+                        ui.label("Edge width");
+                        ui.add(
+                            egui::Slider::new(&mut look.width, AREA_WIDTH)
+                                .step_by(0.5)
+                                .fixed_decimals(1)
+                                .suffix(" px"),
+                        );
+                        ui.end_row();
+                        ui.label("Dark rim");
+                        ui.checkbox(&mut look.rim, "").on_hover_text(
+                            "A dark line under the edge, so it shows on the light colours of a colour map too",
+                        );
+                        ui.end_row();
+                        ui.label("Fill");
+                        let mut percent = look.fill * 100.0;
+                        let fill = egui::Slider::new(
+                            &mut percent,
+                            AREA_FILL.start() * 100.0..=AREA_FILL.end() * 100.0,
+                        )
+                        .step_by(1.0)
+                        .fixed_decimals(0)
+                        .suffix(" %");
+                        if ui
+                            .add(fill)
+                            .on_hover_text("How much of the edge's colour fills the area")
+                            .changed()
+                        {
+                            look.fill = percent / 100.0;
+                        }
+                        ui.end_row();
+                    });
+                ui.add_space(4.0);
+                if ui
+                    .add_enabled(*look != AreaLook::default(), egui::Button::new("Defaults"))
+                    .clicked()
+                {
+                    *look = AreaLook::default();
+                }
+            });
+        self.area_window = open;
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
@@ -2317,20 +2557,24 @@ impl App {
             self.mark_control(Control::Low, group);
             let group = ui
                 .scope(|ui| {
-                    ui.label("Max").on_hover_text(&typed);
                     let limit = views::hz_field(f64::from(nyquist * scale));
-                    let top = if scale == 1.0 {
-                        format!(
-                            "Up to {limit}: half the {rate} Hz sample rate, the highest frequency the file can hold"
-                        )
+                    let moved = if scale == 1.0 {
+                        ""
                     } else {
-                        format!(
-                            "Up to {limit}: the highest frequency the file can hold, half its {rate} Hz sample rate, moved by the pitch shift"
-                        )
+                        ", moved by the pitch shift"
                     };
-                    let range = lo.max(f64::from(LOWEST_HZ))..=f64::from(nyquist * scale);
+                    let top = format!(
+                        "The file holds frequencies up to {limit}, half its {rate} Hz sample rate{moved}: a wave takes at least two samples, one up and one down, so none faster is recorded. Drag up to there, or type a higher number, up to {}, to see that nothing is past it.",
+                        views::hz_field(f64::from(HIGHEST_HZ * scale))
+                    );
+                    ui.label("Max").on_hover_text(format!("{top}\n\n{typed}"));
+                    let file = f64::from(nyquist * scale);
+                    let floor = lo.max(f64::from(LOWEST_HZ));
                     max_changed = ui
-                        .add(frequency_slider(&mut hi, range))
+                        .add(
+                            frequency_slider(&mut hi, floor..=file.max(floor))
+                                .clamping(egui::SliderClamping::Never),
+                        )
                         .on_hover_text(top)
                         .changed();
                     self.listeners
@@ -2345,18 +2589,19 @@ impl App {
                 .rect;
             self.mark_control(Control::High, group);
             if (min_changed || max_changed) && reset.is_none() {
+                let floor = lo.max(f64::from(LOWEST_HZ));
+                let hi = hi.clamp(floor, f64::from(HIGHEST_HZ * scale));
                 let (lo, hi) = (lo as f32 / scale, hi as f32 / scale);
                 self.settings.band_low = lo;
-                self.settings.band_high = (hi < nyquist - 0.5).then_some(hi);
+                self.settings.band_high = ((hi - nyquist).abs() >= 0.5).then_some(hi);
             }
             if ui.button("Full").clicked() {
                 self.settings.band_low = 0.0;
                 self.settings.band_high = None;
             }
             ui.checkbox(&mut self.settings.log, "Log");
-        });
-        if self.settings.tools.pitch {
-            ui.horizontal_wrapped(|ui| {
+            if self.settings.tools.pitch {
+                ui.separator();
                 let group = ui
                     .scope(|ui| {
                         ui.label("Pitch").on_hover_text(format!(
@@ -2374,8 +2619,8 @@ impl App {
                     .response
                     .rect;
                 self.mark_control(Control::Pitch, group);
-            });
-        }
+            }
+        });
         if let Some(control) = reset {
             self.reset(control);
         }
@@ -2539,14 +2784,28 @@ impl App {
         let lanes = views::lanes(plot, targets.len());
         let view = self.look().view;
         let (lo, hi) = spectrogram::band(&view, current.info.sample_rate, self.settings.fft);
+        let held = spectrogram::held(&view, current.info.sample_rate, self.settings.fft);
+        let note = self.limit_note();
         for (i, (lane, target)) in lanes.iter().zip(&targets).enumerate() {
             painter.rect_filled(*lane, 0.0, Color32::BLACK);
+            let height_of = |f: f32| {
+                lane.bottom() - views::freq_t(f, lo, hi, view.log).clamp(0.0, 1.0) * lane.height()
+            };
+            // What the file holds from the bottom up, and past it, nothing.
+            let limit = held.map_or(lane.bottom(), |(_, top)| height_of(top));
+            let rows = Rect::from_x_y_ranges(lane.x_range(), limit..=lane.bottom());
             for shown in [&self.whole, &self.detail].into_iter().flatten() {
-                if shown.analysis.targets == targets
+                if held.is_some()
+                    && shown.analysis.targets == targets
                     && let Some(texture) = shown.textures.get(i)
                 {
-                    views::place(&painter, *lane, span, texture.id(), &shown.analysis.range);
+                    views::place(&painter, rows, span, texture.id(), &shown.analysis.range);
                 }
+            }
+            if hi > current.info.nyquist() {
+                let past = Rect::from_x_y_ranges(lane.x_range(), lane.top()..=limit);
+                views::beyond(&painter, past, &note);
+                painter.hline(lane.x_range(), limit, Stroke::new(1.0, views::LIMIT));
             }
             views::freq_axis(&painter, *lane, lo, hi, view.log, scale);
             if current.info.channels > 1 {
@@ -2569,16 +2828,12 @@ impl App {
             hi,
             log: view.log,
         };
+        let style = self.area_style();
         for region in self.regions.iter().chain(&self.drawn()) {
             let frames = region.frames.start as f64..region.frames.end as f64;
             for lane in &lanes {
-                views::region(
-                    &painter,
-                    *lane,
-                    span,
-                    &frames,
-                    axis.rows(*lane, region.band),
-                );
+                let rows = axis.rows(*lane, region.band);
+                views::region(&painter, *lane, span, &frames, rows, style);
             }
         }
         let tabs = views::markers_on(&painter, plot, span, self.markers(), true);
@@ -2661,10 +2916,11 @@ impl App {
             );
         }
         self.overlays(&painter, plot, span);
+        let style = self.area_style();
         for region in self.regions.iter().chain(&self.drawn()) {
             let frames = region.frames.start as f64..region.frames.end as f64;
             for lane in views::lanes(plot, channels) {
-                views::region(&painter, lane, span, &frames, lane.y_range());
+                views::region(&painter, lane, span, &frames, lane.y_range(), style);
             }
         }
         // The tabs go on whichever of the two is on top.
@@ -2831,9 +3087,11 @@ impl App {
             let drawn = self.drawn();
             if let (Some(d), Some(mut region)) = (self.drawing.take(), drawn) {
                 region.frames.end = region.frames.end.min(frames);
-                // Too short or too flat to be meant.
+                // Too short or too flat to be meant, or all of it past what
+                // the file holds.
                 let tall = d.lane.is_none() || (d.from.2 - d.to.2).abs() >= 3.0;
-                if region.frames.len() as f64 >= 0.05 * rate && tall {
+                let held = region.band.1 > region.band.0;
+                if region.frames.len() as f64 >= 0.05 * rate && tall && held {
                     self.add_region(region);
                 }
             }
@@ -2865,14 +3123,16 @@ impl App {
     }
 
     /// The area being drawn, as it would be added: on the waveform, with
-    /// every frequency.
+    /// every frequency, and on the spectrogram only up to what the file
+    /// holds.
     fn drawn(&self) -> Option<Region> {
         let d = self.drawing.as_ref()?;
         let nyquist = self.current.as_ref().map_or(0.0, |c| c.info.nyquist());
+        let (lo, hi) = (d.from.1.min(d.to.1), d.from.1.max(d.to.1));
         Some(Region {
             frames: d.from.0.min(d.to.0) as usize..d.from.0.max(d.to.0) as usize,
             band: match d.lane {
-                Some(_) => (d.from.1.min(d.to.1), d.from.1.max(d.to.1)),
+                Some(_) => (lo.min(nyquist), hi.min(nyquist)),
                 None => (0.0, nyquist),
             },
         })
@@ -2928,10 +3188,11 @@ impl App {
     /// The whole file under the spectrogram: each channel's waveform, and
     /// the part the spectrogram shows. Dragging an end of that part moves
     /// the end, dragging the part itself moves it along, and dragging
-    /// anywhere else shows the stretch dragged over; a click shows the
-    /// moment clicked and moves the playhead there; a right-drag or a
-    /// sideways scroll moves the part along, and a pinch or ⌘/Ctrl-scroll
-    /// sizes it. Picked, the arrows move and size it.
+    /// anywhere else shows the stretch dragged over, the last two taking
+    /// the playhead, and playback, to its start; a click shows the moment
+    /// clicked and moves the playhead there; a right-drag or a sideways
+    /// scroll moves the part along, and a pinch or ⌘/Ctrl-scroll sizes it.
+    /// Picked, the arrows move and size it.
     fn overview_view(&mut self, ui: &mut egui::Ui) {
         let (area, plot) = Self::plot_rect(ui, true);
         if plot.width() < 20.0 || plot.height() < 20.0 {
@@ -2960,10 +3221,11 @@ impl App {
         let start = current.meta.start.as_ref().map(|s| s.seconds);
         views::time_axis(&painter, plot, span, self.rate(), start);
         views::markers_on(&painter, plot, span, self.markers(), false);
+        let style = self.area_style();
         for region in &self.regions {
             let frames = region.frames.start as f64..region.frames.end as f64;
             for lane in &lanes {
-                views::region(&painter, *lane, span, &frames, lane.y_range());
+                views::region(&painter, *lane, span, &frames, lane.y_range(), style);
             }
         }
         if let Some(s) = &self.selection {
@@ -3044,6 +3306,12 @@ impl App {
             }
         }
         if response.drag_stopped() {
+            // A new stretch, or the part in view moved to another, is where
+            // playback goes; sizing it only moves the playhead once it is
+            // left out.
+            if matches!(self.grab, Some(Grab::Span(_) | Grab::Move(_))) {
+                self.play_from_view();
+            }
             self.grab = None;
         }
         if response.dragged_by(PointerButton::Secondary) {
@@ -3169,6 +3437,7 @@ impl App {
             nyquist,
             &axes,
             response.hover_pos(),
+            &self.limit_note(),
         );
     }
 
@@ -3333,7 +3602,12 @@ impl eframe::App for App {
             .min_size(140.0)
             .max_size(widest)
             .show_collapsible(ui, &mut self.settings.explorer, |ui| {
-                clicked = self.explorer.ui(ui)
+                let views = self.settings.views;
+                let parts = Parts {
+                    shortcuts: views.shortcuts.then_some(&mut self.settings.shortcuts),
+                    search: views.search,
+                };
+                clicked = self.explorer.ui(ui, parts)
             });
         if let Some(explorer) = explorer {
             self.mark_control(Control::Explorer, explorer.response.rect.shrink(5.0));
@@ -3386,6 +3660,9 @@ impl eframe::App for App {
         }
         if self.rename_window {
             self.rename_window(&ctx);
+        }
+        if self.area_window {
+            self.area_window(&ctx);
         }
         self.ask(&ctx);
     }

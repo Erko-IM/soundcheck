@@ -1,18 +1,27 @@
-//! The folder tree on the left. Folders are read on a background thread,
-//! and only the rows in view are drawn, so neither a slow card reader nor a
-//! folder of a hundred thousand recordings holds up the window.
+//! The folder tree on the left, with the shortcuts kept above it and the
+//! search that can show in its place. Folders are read on a background
+//! thread, and only the rows in view are drawn, so neither a slow card
+//! reader nor a folder of a hundred thousand recordings holds up the window.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Color32, Label, Pos2, Rect, RichText, Sense, Shape, Stroke, TextStyle, TextWrapMode,
     Vec2, WidgetInfo, WidgetText, WidgetType,
 };
+use serde::{Deserialize, Serialize};
 
-const AUDIO_EXTENSIONS: &[&str] = &[
+use crate::search::{Found, Search};
+use crate::views;
+
+/// How often the shortcuts are looked for again, for a card put back in.
+const LOOK_AGAIN: Duration = Duration::from_secs(5);
+
+pub(crate) const AUDIO_EXTENSIONS: &[&str] = &[
     "wav", "wave", "bwf", "rf64", "flac", "mp3", "m4a", "aac", "ogg", "oga", "aif", "aiff", "aifc",
     "caf", "mka", "webm",
 ];
@@ -128,6 +137,24 @@ enum Action {
     Open(PathBuf),
     Toggle(PathBuf),
     Root(Option<PathBuf>),
+    /// Kept among the shortcuts, or taken out once it is.
+    Shortcut(Shortcut),
+    /// A recording among the shortcuts: shown in its folder, and opened.
+    Reveal(PathBuf),
+}
+
+/// A folder or a recording kept at the top of the explorer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shortcut {
+    pub path: PathBuf,
+    pub folder: bool,
+}
+
+/// What the explorer shows besides the tree: the shortcuts, which it adds
+/// to and takes from, and the search.
+pub struct Parts<'a> {
+    pub shortcuts: Option<&'a mut Vec<Shortcut>>,
+    pub search: bool,
 }
 
 pub struct Explorer {
@@ -147,11 +174,22 @@ pub struct Explorer {
     scrolled: (f32, f32),
     tx: mpsc::Sender<(PathBuf, Vec<Entry>)>,
     rx: mpsc::Receiver<(PathBuf, Vec<Entry>)>,
+    search: Search,
+    /// The search's matches show in place of the tree.
+    searching: bool,
+    /// Whether each shortcut was there when last looked for, when that was,
+    /// and whether a look is under way.
+    there: HashMap<PathBuf, bool>,
+    looked: Option<Instant>,
+    looking: bool,
+    there_tx: mpsc::Sender<Vec<(PathBuf, bool)>>,
+    there_rx: mpsc::Receiver<Vec<(PathBuf, bool)>>,
 }
 
 impl Default for Explorer {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
+        let (there_tx, there_rx) = mpsc::channel();
         Self {
             root: None,
             listings: HashMap::new(),
@@ -162,6 +200,13 @@ impl Default for Explorer {
             scrolled: (0.0, 0.0),
             tx,
             rx,
+            search: Search::default(),
+            searching: false,
+            there: HashMap::new(),
+            looked: None,
+            looking: false,
+            there_tx,
+            there_rx,
         }
     }
 }
@@ -181,6 +226,12 @@ impl Explorer {
     /// Reads `dir` again, to show a file renamed in it.
     pub fn forget(&mut self, dir: &Path) {
         self.listings.remove(dir);
+        self.search.refresh();
+    }
+
+    /// A file was written to, so the search reads it again.
+    pub fn changed(&mut self) {
+        self.search.refresh();
     }
 
     /// Roots the tree at `file`'s folder with `file` selected and in view.
@@ -227,8 +278,13 @@ impl Explorer {
 
     /// Moves the selection a row down or up, as the arrow keys do. A folder
     /// it lands on is selected; a file is returned instead, for the caller
-    /// to open, which selects it.
+    /// to open, which selects it. With the search's matches showing, it
+    /// moves through them.
     pub fn step(&mut self, down: bool) -> Option<PathBuf> {
+        if self.searching {
+            self.follow = true;
+            return self.search.step(self.selected.as_deref(), down);
+        }
         let drives = drives();
         let (rows, _) = self.listed(&drives);
         let entries: Vec<&Entry> = rows
@@ -292,14 +348,21 @@ impl Explorer {
         });
     }
 
-    /// Draws the tree and returns the audio file clicked this frame, if any.
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
+    /// Draws the shortcuts, the search and the tree or what the search
+    /// found, as `parts` asks, and returns the audio file clicked this
+    /// frame, if any.
+    pub fn ui(&mut self, ui: &mut egui::Ui, parts: Parts<'_>) -> Option<PathBuf> {
         for (dir, entries) in self.rx.try_iter() {
             // A folder closed while it was being read no longer wants it.
             if let Some(slot @ None) = self.listings.get_mut(&dir) {
                 *slot = Some(entries);
             }
         }
+        let Parts {
+            mut shortcuts,
+            search,
+        } = parts;
+        let kept: Option<&[Shortcut]> = shortcuts.as_deref().map(Vec::as_slice);
 
         let mut action = None;
         ui.add_space(6.0);
@@ -312,8 +375,27 @@ impl Explorer {
                     action = Some(Action::Root(up));
                 }
             }
-            if ui.small_button("🔄").on_hover_text("Reload").clicked() {
+            if ui
+                .small_button("🔄")
+                .on_hover_text("Reload, and look for the shortcuts again")
+                .clicked()
+            {
                 self.listings.clear();
+                self.search.refresh();
+                self.looked = None;
+            }
+            if let (Some(list), Some(root)) = (kept, &self.root) {
+                let (star, hint) = if list.iter().any(|s| &s.path == root) {
+                    ("★", "Take this folder out of the shortcuts")
+                } else {
+                    ("☆", "Keep this folder in the shortcuts")
+                };
+                if ui.small_button(star).on_hover_text(hint).clicked() {
+                    action = Some(Action::Shortcut(Shortcut {
+                        path: root.clone(),
+                        folder: true,
+                    }));
+                }
             }
             let title = self.root.as_ref().map_or("Drives".into(), |r| {
                 r.file_name().map_or_else(
@@ -323,8 +405,205 @@ impl Explorer {
             });
             ui.add(Label::new(RichText::new(title).strong()).truncate());
         });
+        if let Some(list) = kept {
+            self.shortcuts_ui(ui, list, &mut action);
+        }
         ui.separator();
+        self.searching = false;
+        if search {
+            self.search.bar(ui);
+            self.search.update(self.root.as_deref(), ui.ctx());
+            self.searching = self.search.asks();
+        }
+        if self.searching {
+            self.results_ui(ui, kept, &mut action);
+        } else {
+            self.tree_ui(ui, kept, &mut action);
+        }
+        match action? {
+            Action::Open(file) => return Some(file),
+            Action::Reveal(file) => {
+                self.reveal(&file);
+                return Some(file);
+            }
+            Action::Toggle(dir) => {
+                if !self.open.remove(&dir) {
+                    self.open.insert(dir.clone());
+                }
+                // Read again on every open, so recordings copied in since
+                // the last look show up.
+                self.listings.retain(|path, _| !path.starts_with(&dir));
+            }
+            Action::Root(Some(dir)) => self.set_root(&dir),
+            Action::Root(None) => self.root = None,
+            Action::Shortcut(shortcut) => {
+                if let Some(list) = shortcuts.as_mut() {
+                    match list.iter().position(|s| s.path == shortcut.path) {
+                        Some(i) => {
+                            list.remove(i);
+                        }
+                        None => list.push(shortcut),
+                    }
+                }
+                self.looked = None;
+            }
+        }
+        None
+    }
 
+    /// The shortcuts, each a click from its folder or its recording, and
+    /// dimmed while it is not there, as on a card taken out.
+    fn shortcuts_ui(&mut self, ui: &mut egui::Ui, list: &[Shortcut], action: &mut Option<Action>) {
+        self.look_for(list, ui.ctx());
+        if list.is_empty() {
+            let hint = RichText::new("Right-click a folder or a recording to keep it up here")
+                .weak()
+                .size(11.0);
+            ui.add(Label::new(hint).wrap());
+            return;
+        }
+        let height = ui.spacing().interact_size.y;
+        // However many there are, the tree keeps most of the room.
+        egui::ScrollArea::vertical()
+            .id_salt("shortcuts")
+            .max_height(ui.available_height() * 0.3)
+            .auto_shrink([false, true])
+            .show(ui, |ui| self.shortcut_rows(ui, list, height, action));
+    }
+
+    fn shortcut_rows(
+        &self,
+        ui: &mut egui::Ui,
+        list: &[Shortcut],
+        height: f32,
+        action: &mut Option<Action>,
+    ) {
+        for shortcut in list {
+            let path = &shortcut.path;
+            let there = self.there.get(path).copied().unwrap_or(true);
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let icon = if shortcut.folder { "📁" } else { "🎵" };
+            let chosen = if shortcut.folder {
+                self.root.as_ref() == Some(path)
+            } else {
+                self.selected.as_ref() == Some(path)
+            };
+            let (response, _) = draw_row(
+                ui,
+                0,
+                height,
+                &format!("{icon} {name}"),
+                None,
+                chosen,
+                !there,
+            );
+            let tip = if there {
+                path.display().to_string()
+            } else {
+                format!("Not there now: {}", path.display())
+            };
+            let response = response.on_hover_text(tip);
+            if response.clicked() && there {
+                *action = Some(if shortcut.folder {
+                    Action::Root(Some(path.clone()))
+                } else {
+                    Action::Reveal(path.clone())
+                });
+            }
+            response.context_menu(|ui| {
+                if ui.button("Take out of the shortcuts").clicked() {
+                    *action = Some(Action::Shortcut(shortcut.clone()));
+                    ui.close();
+                }
+            });
+        }
+    }
+
+    /// Looks again now and then whether each shortcut is there, on a thread
+    /// of its own, so a drive that has gone never holds up the window.
+    fn look_for(&mut self, list: &[Shortcut], ctx: &egui::Context) {
+        for looked in self.there_rx.try_iter() {
+            self.there.extend(looked);
+            self.looking = false;
+        }
+        if list.is_empty() || self.looking || self.looked.is_some_and(|t| t.elapsed() < LOOK_AGAIN)
+        {
+            return;
+        }
+        self.looked = Some(Instant::now());
+        self.looking = true;
+        let paths: Vec<PathBuf> = list.iter().map(|s| s.path.clone()).collect();
+        let (tx, ctx) = (self.there_tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let looked = paths
+                .into_iter()
+                .map(|p| {
+                    let there = p.try_exists().unwrap_or(false);
+                    (p, there)
+                })
+                .collect();
+            // The receiver only goes away with the window.
+            let _ = tx.send(looked);
+            ctx.request_repaint();
+        });
+    }
+
+    /// What the search found, a row each, with the folder each is in.
+    fn results_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        shortcuts: Option<&[Shortcut]>,
+        action: &mut Option<Action>,
+    ) {
+        ui.add(Label::new(RichText::new(self.search.status()).weak().size(11.0)).truncate());
+        let height = ui.spacing().interact_size.y;
+        let spacing = ui.spacing().item_spacing.y;
+        let selected = self.selected.clone();
+        let mut scroll = egui::ScrollArea::vertical()
+            .id_salt("search results")
+            .auto_shrink(false);
+        if self.follow
+            && let Some(index) = selected.as_deref().and_then(|s| self.search.position(s))
+        {
+            let (offset, shown) = self.scrolled;
+            let top = index as f32 * (height + spacing);
+            if top < offset {
+                scroll = scroll.vertical_scroll_offset(top);
+            } else if top + height > offset + shown {
+                scroll = scroll.vertical_scroll_offset(top + height - shown);
+            }
+        }
+        let search = &self.search;
+        let output = scroll.show_rows(ui, height, search.len(), |ui, range| {
+            for i in range {
+                let Some(found) = search.result(i) else {
+                    continue;
+                };
+                let path = &found.entry.path;
+                let chosen = selected.as_ref() == Some(path);
+                let response = result_row(ui, height, found, chosen)
+                    .on_hover_ui(|ui| found_details(ui, found, search));
+                if response.clicked() {
+                    *action = Some(Action::Open(path.clone()));
+                }
+                if let Some(list) = shortcuts {
+                    shortcut_menu(&response, list, path, false, action);
+                }
+            }
+        });
+        self.scrolled = (output.state.offset.y, output.inner_rect.height());
+        self.follow = false;
+    }
+
+    fn tree_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        shortcuts: Option<&[Shortcut]>,
+        action: &mut Option<Action>,
+    ) {
         if self.root.is_none() && cfg!(not(windows)) {
             ui.weak("Drop a folder or a file here");
         }
@@ -361,29 +640,38 @@ impl Explorer {
                 let (depth, entry, open) = match row {
                     Row::Entry { depth, entry, open } => (*depth, *entry, *open),
                     Row::Loading { depth } => {
-                        draw_row(ui, *depth, height, "Reading…", None, false);
+                        draw_row(ui, *depth, height, "Reading…", None, false, false);
                         continue;
                     }
                 };
                 let toggle = entry.is_dir.then_some(open);
                 let chosen = selected == Some(entry.path.as_path());
-                let response = draw_row(ui, depth, height, &entry.name, toggle, chosen);
+                let (response, elided) =
+                    draw_row(ui, depth, height, &entry.name, toggle, chosen, false);
+                let response = if elided {
+                    response.on_hover_text(&entry.name)
+                } else {
+                    response
+                };
                 // egui counts a click anywhere just before as the first of
                 // the run, and then the second click here as a third.
                 if entry.is_dir && (response.double_clicked() || response.triple_clicked()) {
-                    action = Some(Action::Root(Some(entry.path.clone())));
+                    *action = Some(Action::Root(Some(entry.path.clone())));
                 } else if response.clicked() {
-                    action = Some(if entry.is_dir {
+                    *action = Some(if entry.is_dir {
                         Action::Toggle(entry.path.clone())
                     } else {
                         Action::Open(entry.path.clone())
                     });
                 }
-                if entry.is_dir {
+                if entry.is_dir || shortcuts.is_some() {
                     response.context_menu(|ui| {
-                        if ui.button("Open as root").clicked() {
-                            action = Some(Action::Root(Some(entry.path.clone())));
+                        if entry.is_dir && ui.button("Open as root").clicked() {
+                            *action = Some(Action::Root(Some(entry.path.clone())));
                             ui.close();
+                        }
+                        if let Some(list) = shortcuts {
+                            shortcut_item(ui, list, &entry.path, entry.is_dir, action);
                         }
                     });
                 }
@@ -404,25 +692,118 @@ impl Explorer {
         for dir in unread {
             self.read(dir, ui.ctx());
         }
-        match action? {
-            Action::Open(file) => return Some(file),
-            Action::Toggle(dir) => {
-                if !self.open.remove(&dir) {
-                    self.open.insert(dir.clone());
-                }
-                // Read again on every open, so recordings copied in since
-                // the last look show up.
-                self.listings.retain(|path, _| !path.starts_with(&dir));
-            }
-            Action::Root(Some(dir)) => self.set_root(&dir),
-            Action::Root(None) => self.root = None,
-        }
-        None
+    }
+}
+
+/// A right-click menu on `response` with [`shortcut_item`] in it.
+fn shortcut_menu(
+    response: &egui::Response,
+    list: &[Shortcut],
+    path: &Path,
+    folder: bool,
+    action: &mut Option<Action>,
+) {
+    response.context_menu(|ui| shortcut_item(ui, list, path, folder, action));
+}
+
+/// The menu item that keeps `path` among the shortcuts, or takes it out.
+fn shortcut_item(
+    ui: &mut egui::Ui,
+    list: &[Shortcut],
+    path: &Path,
+    folder: bool,
+    action: &mut Option<Action>,
+) {
+    let kept = list.iter().any(|s| s.path == path);
+    let label = if kept {
+        "Take out of the shortcuts"
+    } else {
+        "Add to the shortcuts"
+    };
+    if ui.button(label).clicked() {
+        *action = Some(Action::Shortcut(Shortcut {
+            path: path.to_owned(),
+            folder,
+        }));
+        ui.close();
+    }
+}
+
+/// A recording the search found: its name, and after it the folder it is
+/// in, both cut short rather than widening the panel.
+fn result_row(ui: &mut egui::Ui, height: f32, found: &Found, selected: bool) -> egui::Response {
+    let name = &found.entry.name;
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
+    response
+        .widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, name));
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let visuals = ui.style().interact_selectable(&response, selected);
+    if selected || response.hovered() {
+        ui.painter()
+            .rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
+    }
+    let pad = ui.spacing().item_spacing.x / 2.0;
+    let width = rect.width() - 2.0 * pad;
+    let share = if found.folder.is_empty() { 1.0 } else { 0.65 };
+    let galley = WidgetText::from(name.as_str()).into_galley(
+        ui,
+        Some(TextWrapMode::Truncate),
+        (width * share).max(0.0),
+        TextStyle::Button,
+    );
+    let wide = galley.size().x;
+    let top = rect.center().y - galley.size().y / 2.0;
+    ui.painter().galley(
+        Pos2::new(rect.left() + pad, top),
+        galley,
+        visuals.text_color(),
+    );
+    let room = width - wide - 8.0;
+    if !found.folder.is_empty() && room > 16.0 {
+        let folder = WidgetText::from(RichText::new(&found.folder).weak()).into_galley(
+            ui,
+            Some(TextWrapMode::Truncate),
+            room,
+            TextStyle::Small,
+        );
+        let top = rect.center().y - folder.size().y / 2.0;
+        let left = rect.left() + pad + wide + 8.0;
+        ui.painter()
+            .galley(Pos2::new(left, top), folder, visuals.text_color());
+    }
+    response
+}
+
+/// What a recording the search found is, on hover: where it is, how long,
+/// when by the date searched, and which of its fields matched.
+fn found_details(ui: &mut egui::Ui, found: &Found, search: &Search) {
+    let entry = &found.entry;
+    ui.label(entry.path.display().to_string());
+    let mut facts = Vec::new();
+    if let Some(seconds) = entry.seconds {
+        facts.push(views::clock(seconds));
+    }
+    if let Some(stamp) = entry.date(search.date()) {
+        facts.push(format!("{} {}", search.date().name(), stamp.text()));
+    }
+    if !facts.is_empty() {
+        ui.label(RichText::new(facts.join("  ·  ")).weak());
+    }
+    let matched = found.matched_in(search.words());
+    if !matched.is_empty() {
+        ui.label(RichText::new(format!("Matched in {}", matched.join(", "))).weak());
+    }
+    if let Some(why) = &entry.error {
+        ui.label(RichText::new(format!("Not readable: {why}")).color(views::CURSOR));
     }
 }
 
 /// One row: indent, a triangle for folders, and the name cut short with an
-/// ellipsis rather than widening the panel; the full name shows on hover.
+/// ellipsis rather than widening the panel, `dim` while what it names is
+/// not there. Says whether the name was cut short.
 fn draw_row(
     ui: &mut egui::Ui,
     depth: usize,
@@ -430,13 +811,14 @@ fn draw_row(
     name: &str,
     open: Option<bool>,
     selected: bool,
-) -> egui::Response {
+    dim: bool,
+) -> (egui::Response, bool) {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     response
         .widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, name));
     if !ui.is_rect_visible(rect) {
-        return response;
+        return (response, false);
     }
     let visuals = ui.style().interact_selectable(&response, selected);
     if selected || response.hovered() {
@@ -460,13 +842,13 @@ fn draw_row(
     );
     let top = rect.center().y - galley.size().y / 2.0;
     let elided = galley.elided;
-    ui.painter()
-        .galley(Pos2::new(left, top), galley, visuals.text_color());
-    if elided {
-        response.on_hover_text(name)
+    let color = if dim {
+        ui.visuals().weak_text_color()
     } else {
-        response
-    }
+        visuals.text_color()
+    };
+    ui.painter().galley(Pos2::new(left, top), galley, color);
+    (response, elided)
 }
 
 fn paint_triangle(painter: &egui::Painter, rect: Rect, open: bool, color: Color32) {
