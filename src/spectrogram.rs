@@ -21,12 +21,6 @@ pub const MAX_COLUMNS: usize = 4096;
 /// a wide one of many channels at the largest FFT would pass.
 const MOST_LEVELS: usize = 1 << 26;
 pub const SILENCE_DB: f32 = -200.0;
-/// Frames a thread takes at a time when a target's signal is drawn out of
-/// the interleaved samples.
-const MIX_FRAMES: usize = 1 << 14;
-/// Pushes' worth of samples an analysis holds at most while its columns
-/// wait to be run together.
-const HELD_PUSHES: usize = 8;
 
 /// Which signals are analysed: the channels averaged, each channel on its
 /// own, or one channel.
@@ -204,33 +198,38 @@ fn to_db(power: f32) -> f32 {
     (10.0 * power.log10()).max(SILENCE_DB)
 }
 
-/// Builds an [`Analysis`] of `range` from the file's samples, fed in order
-/// through [`Analyzer::push`]. Only the samples still needed are kept.
-pub struct Analyzer {
+/// How an analysis of a range lays out, as [`Plan::new`] makes it: its
+/// columns, the windows each takes the loudest of, and the FFT. Threads
+/// work out a stretch of its columns each with [`Plan::work`].
+pub struct Plan {
     spec: Spec,
     range: Range<usize>,
-    /// Frames in the whole file; windows reaching past either end read
-    /// silence there.
-    frames: usize,
     channels: usize,
     targets: Vec<Target>,
     columns: usize,
     bins: usize,
-    /// Frames per column.
-    span: f64,
-    /// Windows per column, at most half a window apart.
-    windows: usize,
+    layout: Layout,
     kernel: Kernel,
-    /// Per target, the samples from `buffer_start` on.
-    buffers: Vec<Vec<f32>>,
-    buffer_start: usize,
-    next_column: usize,
-    planes: Vec<Vec<f32>>,
-    envelope: Vec<Vec<[f32; 2]>>,
 }
 
-/// Where one column's windows sit, copied out so worker threads need no
-/// borrow of the analyzer.
+/// Room for a thread to work out columns in, used again from part to part.
+pub struct Room {
+    signal: Vec<f32>,
+    scratch: Scratch,
+}
+
+/// Some of a stretch of columns, read and worked out at once, as
+/// [`Plan::parts`] makes it.
+pub struct Part {
+    /// Its windows, numbered through the whole analysis.
+    windows: Range<usize>,
+    /// The frames whose lowest and highest samples it finds.
+    pub own: Range<usize>,
+    /// The frames it reads: its own, and its windows'.
+    pub reads: Range<usize>,
+}
+
+/// Where each column's windows sit.
 #[derive(Clone, Copy)]
 struct Layout {
     start: usize,
@@ -247,14 +246,9 @@ impl Layout {
             as usize
     }
 
-    /// The first frame any window of `column` reads.
-    fn needs_from(self, column: usize) -> usize {
-        self.centre(column, 0).saturating_sub(self.half)
-    }
-
-    /// One past the last frame any window of `column` reads.
-    fn needs_to(self, column: usize) -> usize {
-        (self.centre(column, self.windows - 1) + self.half).min(self.frames)
+    /// The centre of window `window`, numbered through the whole analysis.
+    fn centre_of(self, window: usize) -> usize {
+        self.centre(window / self.windows, window % self.windows)
     }
 }
 
@@ -265,8 +259,10 @@ pub fn columns(spec: Spec, len: usize, channels: usize, wanted: usize) -> usize 
     wanted.min(MOST_LEVELS / levels).clamp(1, len.max(1))
 }
 
-impl Analyzer {
-    /// An analysis of `range` about `columns` wide, as [`columns`] allows.
+impl Plan {
+    /// An analysis of `range` about `columns` wide, as [`columns`] allows,
+    /// of a file `frames` long: windows reaching past either end of it read
+    /// silence there.
     pub fn new(
         spec: Spec,
         range: Range<usize>,
@@ -282,190 +278,154 @@ impl Analyzer {
         // loudest: on a long recording one column spans seconds, and
         // sampling or averaging it would hide a short call inside.
         let windows = ((2.0 * span / spec.fft as f64).ceil() as usize).max(1);
-        let bins = spec.fft / 2 + 1;
-        let targets = spec.channels.targets(channels);
-        let mut analyzer = Self {
+        Self {
             spec,
-            frames,
             channels,
             columns,
-            bins,
-            span,
-            windows,
+            bins: spec.fft / 2 + 1,
+            targets: spec.channels.targets(channels),
+            layout: Layout {
+                start: range.start,
+                span,
+                windows,
+                half: spec.fft / 2,
+                frames,
+            },
             kernel: Kernel::new(spec.fft),
-            buffers: vec![Vec::new(); targets.len()],
-            buffer_start: 0,
-            next_column: 0,
-            planes: vec![vec![SILENCE_DB; columns * bins]; targets.len()],
-            envelope: vec![vec![[f32::INFINITY, f32::NEG_INFINITY]; columns]; channels],
-            targets,
             range,
+        }
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    /// Frames of the range each column spans.
+    pub fn span(&self) -> f64 {
+        self.layout.span
+    }
+
+    /// Where the frames of column `column` start; the column past the last
+    /// starts where the range ends.
+    pub fn begins(&self, column: usize) -> usize {
+        let at = (self.range.start as f64 + column as f64 * self.layout.span).ceil() as usize;
+        at.min(self.range.end)
+    }
+
+    /// `columns` in parts of about `most` frames or fewer each, in order, so
+    /// what a thread holds at once stays the same however long a column is.
+    pub fn parts(&self, columns: Range<usize>, most: usize) -> impl Iterator<Item = Part> {
+        let layout = self.layout;
+        let (first, windows) = (
+            columns.start * layout.windows,
+            columns.len() * layout.windows,
+        );
+        let (from, to) = (self.begins(columns.start), self.begins(columns.end));
+        let count = (to - from).div_ceil(most.max(1)).clamp(1, windows);
+        let at = move |part: usize| first + windows * part / count;
+        // A part's own frames run from its first window's centre to the next
+        // part's.
+        let edge = move |part: usize| match part {
+            0 => from,
+            part if part == count => to,
+            part => layout.centre_of(at(part)).clamp(from, to),
         };
-        analyzer.buffer_start = analyzer.wanted().start;
-        analyzer
+        (0..count).map(move |part| {
+            let own = edge(part)..edge(part + 1);
+            let lowest = layout.centre_of(at(part)).saturating_sub(layout.half);
+            let highest = layout.centre_of(at(part + 1) - 1) + layout.half;
+            Part {
+                windows: at(part)..at(part + 1),
+                reads: own.start.min(lowest)..own.end.max(highest).min(layout.frames),
+                own,
+            }
+        })
     }
 
-    fn layout(&self) -> Layout {
-        Layout {
-            start: self.range.start,
-            span: self.span,
-            windows: self.windows,
-            half: self.spec.fft / 2,
-            frames: self.frames,
+    /// Room for parts that read up to `frames` frames.
+    pub fn room(&self, frames: usize) -> Room {
+        Room {
+            signal: Vec::with_capacity(frames),
+            scratch: self.kernel.scratch(),
         }
     }
 
-    /// The frames to push: the range, plus half a window either side.
-    pub fn wanted(&self) -> Range<usize> {
-        let half = self.spec.fft / 2;
-        self.range.start.saturating_sub(half)..(self.range.end + half).min(self.frames)
+    /// The analysis with every column silent, for [`Plan::work`] to fill in.
+    pub fn blank(&self) -> Analysis {
+        Analysis {
+            spec: self.spec,
+            range: self.range.clone(),
+            columns: self.columns,
+            bins: self.bins,
+            targets: self.targets.clone(),
+            planes: vec![vec![SILENCE_DB; self.columns * self.bins]; self.targets.len()],
+            envelope: vec![vec![[f32::INFINITY, f32::NEG_INFINITY]; self.columns]; self.channels],
+        }
     }
 
-    /// Interleaved frames starting at `first`, which must be where the last
-    /// push ended, or `wanted().start` for the first.
-    pub fn push(&mut self, first: usize, samples: &[f32]) {
-        let ch = self.channels;
-        for (target, buffer) in self.targets.iter().zip(&mut self.buffers) {
-            let start = buffer.len();
-            buffer.resize(start + samples.len() / ch, 0.0);
-            buffer[start..]
-                .par_chunks_mut(MIX_FRAMES)
-                .zip(samples.par_chunks(MIX_FRAMES * ch))
-                .for_each(|(out, frames)| target.fill(out, frames, ch));
+    /// Works out `part` of `columns`, in their order, from `samples`,
+    /// interleaved frames from `first` on holding what the part reads: in
+    /// each target's stretch of `planes`, each column the loudest of its
+    /// windows, in dBFS once they are all in; in each channel's stretch of
+    /// `envelope`, the lowest and highest sample of the part's own frames.
+    #[allow(clippy::too_many_arguments)]
+    pub fn work(
+        &self,
+        columns: Range<usize>,
+        part: &Part,
+        first: usize,
+        samples: &[f32],
+        planes: &mut [&mut [f32]],
+        envelope: &mut [&mut [[f32; 2]]],
+        room: &mut Room,
+    ) {
+        let (ch, bins, layout) = (self.channels, self.bins, self.layout);
+        let each = layout.windows;
+        room.signal.resize(samples.len() / ch, 0.0);
+        for (target, plane) in self.targets.iter().zip(planes.iter_mut()) {
+            target.fill(&mut room.signal, samples, ch);
+            for window in part.windows.clone() {
+                let (column, w) = (window / each, window % each);
+                let out = &mut plane[(column - columns.start) * bins..][..bins];
+                if w == 0 {
+                    out.fill(0.0);
+                }
+                let centre = layout.centre(column, w) - first;
+                self.kernel
+                    .power(&mut room.scratch, &room.signal, centre, out, keep_max);
+                if w + 1 == each {
+                    out.iter_mut().for_each(|v| *v = to_db(*v));
+                }
+            }
         }
-        self.add_envelope(first, samples);
-
-        let have = first + samples.len() / ch;
-        let layout = self.layout();
-        let ready = if have >= self.wanted().end {
-            self.columns
-        } else {
-            (self.next_column..self.columns)
-                .find(|&c| layout.needs_to(c) > have)
-                .unwrap_or(self.columns)
-        };
-        // Columns ready wait until there are enough to go round the threads,
-        // as a long file's come a few a push, or until the samples they hold
-        // grow to many pushes' worth.
-        let held = have - self.buffer_start;
-        let enough = ready - self.next_column >= rayon::current_num_threads()
-            || ready == self.columns
-            || held > HELD_PUSHES * (samples.len() / ch);
-        if ready > self.next_column && enough {
-            self.run(self.next_column..ready);
-            self.next_column = ready;
+        let (start, span) = (self.range.start, layout.span);
+        let to = part.own.end.min(first + samples.len() / ch);
+        let mut at = part.own.start.max(first);
+        while at < to {
+            let column =
+                (((at - start) as f64 / span) as usize).clamp(columns.start, columns.end - 1);
+            let next = (start as f64 + (column + 1) as f64 * span).ceil() as usize;
+            let end = next.max(at + 1).min(to);
+            let found = extremes(&samples[(at - first) * ch..(end - first) * ch], ch);
+            for (channel, e) in envelope.iter_mut().zip(found) {
+                let slot = &mut channel[column - columns.start];
+                *slot = [slot[0].min(e[0]), slot[1].max(e[1])];
+            }
+            at = end;
         }
-        let keep = if self.next_column < self.columns {
-            layout.needs_from(self.next_column)
-        } else {
-            have
-        };
-        let drop = keep
-            .saturating_sub(self.buffer_start)
-            .min(self.buffers[0].len());
-        for buffer in &mut self.buffers {
-            buffer.drain(..drop);
-        }
-        self.buffer_start += drop;
     }
+}
 
-    pub fn finish(mut self) -> Analysis {
-        if self.next_column < self.columns {
-            self.run(self.next_column..self.columns);
-        }
+impl Analysis {
+    /// Once every column is worked out: a column no frame fell in shows
+    /// nothing.
+    pub fn finish(mut self) -> Self {
         for column in self.envelope.iter_mut().flatten() {
             if column[0] > column[1] {
                 *column = [0.0, 0.0];
             }
         }
-        Analysis {
-            spec: self.spec,
-            range: self.range,
-            columns: self.columns,
-            bins: self.bins,
-            targets: self.targets,
-            planes: self.planes,
-            envelope: self.envelope,
-        }
-    }
-
-    fn run(&mut self, columns: Range<usize>) {
-        let (bins, layout, kernel) = (self.bins, self.layout(), &self.kernel);
-        let offset = self.buffer_start;
-        // Few, long columns (a long file) share out their windows instead.
-        let by_column = columns.len() >= rayon::current_num_threads();
-        for (plane, buffer) in self.planes.iter_mut().zip(&self.buffers) {
-            let column_spectrum = |scratch: &mut Scratch, column: usize, out: &mut [f32]| {
-                out.fill(0.0);
-                for w in 0..layout.windows {
-                    let centre = layout.centre(column, w) - offset;
-                    kernel.power(scratch, buffer, centre, out, keep_max);
-                }
-                out.iter_mut().for_each(|v| *v = to_db(*v));
-            };
-            let out = &mut plane[columns.start * bins..columns.end * bins];
-            if by_column {
-                out.par_chunks_mut(bins).enumerate().for_each_init(
-                    || kernel.scratch(),
-                    |scratch, (i, out)| column_spectrum(scratch, columns.start + i, out),
-                );
-                continue;
-            }
-            for (i, out) in out.chunks_mut(bins).enumerate() {
-                let column = columns.start + i;
-                let spectrum = (0..layout.windows)
-                    .into_par_iter()
-                    .fold(
-                        || (kernel.scratch(), vec![0.0f32; bins]),
-                        |(mut scratch, mut acc), w| {
-                            let centre = layout.centre(column, w) - offset;
-                            kernel.power(&mut scratch, buffer, centre, &mut acc, keep_max);
-                            (scratch, acc)
-                        },
-                    )
-                    .map(|(_, acc)| acc)
-                    .reduce(
-                        || vec![0.0; bins],
-                        |mut a, b| {
-                            a.iter_mut().zip(&b).for_each(|(x, y)| *x = x.max(*y));
-                            a
-                        },
-                    );
-                for (o, p) in out.iter_mut().zip(spectrum) {
-                    *o = to_db(p);
-                }
-            }
-        }
-    }
-
-    fn add_envelope(&mut self, first: usize, samples: &[f32]) {
-        let ch = self.channels;
-        let from = first.max(self.range.start);
-        let to = (first + samples.len() / ch).min(self.range.end);
-        let (start, span, columns) = (self.range.start, self.span, self.columns);
-        // Stretches that stay inside one column, so they fill in parallel.
-        let mut stretches = Vec::new();
-        let mut at = from;
-        while at < to {
-            let column = (((at - start) as f64 / span) as usize).min(columns - 1);
-            let next = (start as f64 + (column + 1) as f64 * span).ceil() as usize;
-            let end = next.max(at + 1).min(to).min(at + (1 << 16));
-            stretches.push((column, at..end));
-            at = end;
-        }
-        let found: Vec<(usize, Vec<[f32; 2]>)> = stretches
-            .into_par_iter()
-            .map(|(column, frames)| {
-                let part = &samples[(frames.start - first) * ch..(frames.end - first) * ch];
-                (column, extremes(part, ch))
-            })
-            .collect();
-        for (column, extremes) in found {
-            for (channel, e) in self.envelope.iter_mut().zip(extremes) {
-                let slot = &mut channel[column];
-                *slot = [slot[0].min(e[0]), slot[1].max(e[1])];
-            }
-        }
+        self
     }
 }
 
@@ -617,25 +577,68 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// `samples` (interleaved over `channels`) run through an analyzer in
-    /// pieces of `piece` frames, as a file read would.
+    /// `samples` (interleaved over `channels`) analysed about `columns` wide
+    /// in stretches of `per` columns, each in parts of about `most` frames
+    /// from only the frames the part reads, as threads do.
+    #[allow(clippy::too_many_arguments)]
+    pub fn analyse_in(
+        samples: &[f32],
+        channels: usize,
+        spec: Spec,
+        range: Range<usize>,
+        columns: usize,
+        per: usize,
+        most: usize,
+    ) -> Analysis {
+        let frames = samples.len() / channels;
+        let plan = Plan::new(spec, range, frames, channels, columns);
+        let mut analysis = plan.blank();
+        let (bins, mut room) = (analysis.bins, plan.room(0));
+        for first in (0..plan.columns()).step_by(per) {
+            let stretch = first..(first + per).min(plan.columns());
+            let mut planes: Vec<&mut [f32]> = analysis
+                .planes
+                .iter_mut()
+                .map(|p| &mut p[stretch.start * bins..stretch.end * bins])
+                .collect();
+            let mut envelope: Vec<&mut [[f32; 2]]> = analysis
+                .envelope
+                .iter_mut()
+                .map(|e| &mut e[stretch.clone()])
+                .collect();
+            for part in plan.parts(stretch.clone(), most) {
+                let reads = part.reads.clone();
+                let read = &samples[reads.start * channels..reads.end * channels];
+                plan.work(
+                    stretch.clone(),
+                    &part,
+                    reads.start,
+                    read,
+                    &mut planes,
+                    &mut envelope,
+                    &mut room,
+                );
+            }
+        }
+        analysis.finish()
+    }
+
     fn analyse(
         samples: &[f32],
         channels: usize,
         spec: Spec,
         range: Range<usize>,
-        piece: usize,
+        per: usize,
     ) -> Analysis {
-        let frames = samples.len() / channels;
-        let mut a = Analyzer::new(spec, range, frames, channels, DEFAULT_COLUMNS);
-        let wanted = a.wanted();
-        let mut at = wanted.start;
-        while at < wanted.end {
-            let end = at.saturating_add(piece).min(wanted.end);
-            a.push(at, &samples[at * channels..end * channels]);
-            at = end;
-        }
-        a.finish()
+        analyse_in(
+            samples,
+            channels,
+            spec,
+            range,
+            DEFAULT_COLUMNS,
+            per,
+            usize::MAX,
+        )
     }
 
     fn mix(fft: usize) -> Spec {
@@ -673,6 +676,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_column_of_many_windows_reads_its_loudest_in_dbfs() {
+        let (fft, rate, bin) = (1024, 48_000.0, 40);
+        let half: Vec<f32> = sine(bin as f64 * rate / fft as f64, rate, 1.0)
+            .iter()
+            .map(|s| s / 2.0)
+            .collect();
+        let a = analyse_in(&half, 1, mix(fft), 0..half.len(), 8, usize::MAX, usize::MAX);
+        for column in 0..8 {
+            let level = a.planes[0][column * a.bins + bin];
+            assert!(
+                (level + 6.02).abs() < 0.1,
+                "column {column} read {level} dBFS"
+            );
+        }
+    }
+
+    #[test]
     fn columns_follow_the_signal_in_time() {
         let mut signal = vec![0.0; 48_000];
         signal.extend(sine(1_000.0, 48_000.0, 1.0));
@@ -682,14 +702,42 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_result_does_not_depend_on_how_the_file_is_read() {
+    fn the_result_does_not_depend_on_how_the_columns_are_shared_out() {
         let signal: Vec<f32> = (0u64..300_000)
             .map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5)
             .collect();
-        let whole = analyse(&signal, 1, mix(2048), 0..signal.len(), usize::MAX);
-        let pieces = analyse(&signal, 1, mix(2048), 0..signal.len(), 777);
-        assert_eq!(whole.planes, pieces.planes);
-        assert_eq!(whole.envelope, pieces.envelope);
+        // Columns a window wide, and columns many windows wide.
+        for columns in [DEFAULT_COLUMNS, 16] {
+            let at_once =
+                |per, most| analyse_in(&signal, 1, mix(2048), 0..signal.len(), columns, per, most);
+            let whole = at_once(usize::MAX, usize::MAX);
+            for (per, most) in [
+                (1, usize::MAX),
+                (7, usize::MAX),
+                (500, 1000),
+                (3, 1),
+                (1, 5000),
+            ] {
+                let shared = at_once(per, most);
+                let how = format!("{columns} columns, {per} a stretch, {most} frames a part");
+                assert_eq!(whole.planes, shared.planes, "{how}");
+                assert_eq!(whole.envelope, shared.envelope, "{how}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_part_reads_about_as_much_as_it_is_given_however_long_a_column_is() {
+        let frames = 100_000_000;
+        let plan = Plan::new(mix(2048), 0..frames, frames, 2, 16);
+        let parts: Vec<Part> = plan.parts(3..5, 50_000).collect();
+        assert_eq!(parts[0].own.start, plan.begins(3));
+        assert_eq!(parts[parts.len() - 1].own.end, plan.begins(5));
+        for pair in parts.windows(2) {
+            assert_eq!(pair[0].own.end, pair[1].own.start);
+            assert_eq!(pair[0].windows.end, pair[1].windows.start);
+        }
+        assert!(parts.iter().all(|p| p.reads.len() < 50_000 + 2 * 2048));
     }
 
     #[test]

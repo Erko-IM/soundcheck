@@ -1,18 +1,22 @@
 //! Memory for the whole program on macOS: the system's, except that a block
-//! of a megabyte or more is mapped from the kernel when it is asked for and
-//! handed back when it is freed.
+//! of half a megabyte or more is mapped from the kernel when it is asked
+//! for and handed back when it is freed.
 //!
 //! macOS keeps the large blocks a program frees for it to use again, but
 //! uses one again only for a request of about the same size, and keeps
 //! them in the program's memory meanwhile. Buffers sized by the file being
 //! read and by the window, as a spectrogram's are, come in a new size each
 //! time, so it would hold on to every one: hundreds of megabytes after a
-//! few dozen files, and gigabytes after a while.
+//! few dozen files, and gigabytes after a while. The memory of smaller
+//! blocks it keeps too once they are freed: after an analysis, whose threads
+//! each hold a few buffers of some hundred kilobytes at once, over 20 MB
+//! stayed. Every frame the window draws makes and frees blocks of a few
+//! hundred kilobytes, too often to map each, so those are left to it.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 
 /// Blocks this big or bigger are mapped.
-const BIG: usize = 1 << 20;
+const BIG: usize = 1 << 19;
 
 pub struct Allocator;
 

@@ -8,6 +8,7 @@ mod edit;
 mod explorer;
 mod export;
 mod finder;
+mod flac;
 mod levels;
 #[cfg(target_os = "macos")]
 mod memory;

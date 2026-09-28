@@ -17,6 +17,30 @@ pub struct Levels {
     stats: Vec<[f32; 2]>,
 }
 
+/// Each channel's peak and mean square over `block`, interleaved frames of
+/// `ch` channels, into `stats`. The block is taken a row of whole frames at
+/// a time, a row wide enough that the compiler takes many samples at once,
+/// each place in it adding up on its own in `peak` and `energy`.
+fn measure(block: &[f32], ch: usize, peak: &mut [f32], energy: &mut [f32], stats: &mut [[f32; 2]]) {
+    let width = peak.len();
+    peak.fill(0.0);
+    energy.fill(0.0);
+    let rows = block.chunks_exact(width);
+    let rest = rows.remainder();
+    for row in rows.chain([rest]) {
+        for ((p, e), &x) in peak.iter_mut().zip(energy.iter_mut()).zip(row) {
+            *p = p.max(x.abs());
+            *e += x * x;
+        }
+    }
+    let frames = (block.len() / ch).max(1) as f32;
+    for (c, s) in stats.iter_mut().enumerate() {
+        let lanes = (c..width).step_by(ch);
+        let top = lanes.clone().map(|i| peak[i]).fold(0.0, f32::max);
+        *s = [top, lanes.map(|i| energy[i]).sum::<f32>() / frames];
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Level {
     pub rms_db: f32,
@@ -44,36 +68,63 @@ impl Levels {
         let start = self.stats.len();
         let blocks = samples.len().div_ceil(self.block * ch);
         self.stats.resize(start + blocks * ch, [0.0; 2]);
-        // A block is taken a row of whole frames at a time, a row wide
-        // enough that the compiler takes many samples at once, each place in
-        // it adding up on its own.
         let width = ch * LANES.div_ceil(ch);
         self.stats[start..]
             .par_chunks_mut(ch)
             .zip(samples.par_chunks(self.block * ch))
             .for_each_init(
                 || (vec![0.0f32; width], vec![0.0f32; width]),
-                |(peak, energy), (stats, block)| {
-                    peak.fill(0.0);
-                    energy.fill(0.0);
-                    let rows = block.chunks_exact(width);
-                    let rest = rows.remainder();
-                    for row in rows.chain([rest]) {
-                        for ((p, e), &x) in peak.iter_mut().zip(energy.iter_mut()).zip(row) {
-                            *p = p.max(x.abs());
-                            *e += x * x;
-                        }
-                    }
-                    let frames = (block.len() / ch).max(1) as f32;
-                    for (c, s) in stats.iter_mut().enumerate() {
-                        let lanes = (c..width).step_by(ch);
-                        let top = lanes.clone().map(|i| peak[i]).fold(0.0, f32::max);
-                        *s = [top, lanes.map(|i| energy[i]).sum::<f32>() / frames];
-                    }
-                },
+                |(peak, energy), (stats, block)| measure(block, ch, peak, energy, stats),
             );
     }
 
+    /// Room for every block of a file `frames` long, block after block and
+    /// channel after channel within a block, for [`Meter::measure`] to fill
+    /// a stretch at a time, and the meter to do it with.
+    pub fn blocks(&mut self, frames: usize) -> (Meter, &mut [[f32; 2]]) {
+        self.stats = vec![[0.0; 2]; frames.div_ceil(self.block) * self.channels];
+        let meter = Meter {
+            block: self.block,
+            channels: self.channels,
+        };
+        (meter, &mut self.stats)
+    }
+
+    /// Keeps only the blocks of the first `frames` frames: the meter, and
+    /// room for the last block again when `frames` cuts it short.
+    pub fn cut(&mut self, frames: usize) -> (Meter, &mut [[f32; 2]]) {
+        let whole = frames / self.block * self.channels;
+        self.stats
+            .truncate(frames.div_ceil(self.block) * self.channels);
+        let meter = Meter {
+            block: self.block,
+            channels: self.channels,
+        };
+        (meter, &mut self.stats[whole..])
+    }
+}
+
+/// Measures stretches of a file into [`Levels::blocks`], on any thread.
+#[derive(Clone, Copy)]
+pub struct Meter {
+    pub block: usize,
+    channels: usize,
+}
+
+impl Meter {
+    /// Measures `samples`, whole blocks from a block boundary on and maybe
+    /// the file's last short one, into their stretch of the blocks.
+    pub fn measure(&self, samples: &[f32], stats: &mut [[f32; 2]]) {
+        let ch = self.channels;
+        let width = ch * LANES.div_ceil(ch);
+        let (mut peak, mut energy) = (vec![0.0f32; width], vec![0.0f32; width]);
+        for (stats, block) in stats.chunks_mut(ch).zip(samples.chunks(self.block * ch)) {
+            measure(block, ch, &mut peak, &mut energy, stats);
+        }
+    }
+}
+
+impl Levels {
     /// Each channel's level over `span` frames ending at `frame`.
     pub fn at(&self, frame: usize, span: usize) -> Vec<Level> {
         let blocks = self.stats.len() / self.channels.max(1);

@@ -9,11 +9,12 @@ use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError, mpsc};
 
 use rayon::prelude::*;
-use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
+use symphonia::core::codecs::audio::well_known::CODEC_ID_AAC;
+use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as DecodeError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::well_known::FORMAT_ID_FLAC;
@@ -24,9 +25,10 @@ use symphonia::core::packet::Packet;
 use symphonia::core::units::Timestamp;
 
 use crate::edit::Edits;
+use crate::flac;
 use crate::levels::Levels;
 use crate::meta::{self, Details, Meta};
-use crate::spectrogram::{Analysis, Analyzer, Spec};
+use crate::spectrogram::{Analysis, Plan, Room, Spec};
 use crate::tags;
 use crate::wav::{self, SampleKind};
 
@@ -40,9 +42,10 @@ const PIECE_SAMPLES: usize = 1 << 21;
 /// by side: a thread's worth in hand stays a few MB, and the lead-in each
 /// piece needs costs a few percent.
 const CODED_PIECE_SAMPLES: usize = 1 << 19;
-/// Frames a compressed piece is decoded from before its start, and dropped:
-/// a codec whose frames overlap, as AAC, MP3 and Vorbis do, decodes a frame
-/// as reading from the top does only with the one before it in hand.
+/// Frames a file symphonia decodes is read from before where a read jumps
+/// to, and dropped: a codec whose frames overlap, as AAC, MP3 and Vorbis
+/// do, decodes a frame as reading from the top does only with the one
+/// before it in hand.
 const LEAD_IN: usize = 1 << 14;
 /// Frames over which a piece decoded on its own takes over from the one
 /// before. AAC's noise substitution draws on a generator that runs through
@@ -91,7 +94,7 @@ pub enum Source {
         data: Range<u64>,
         kind: SampleKind,
     },
-    /// Anything symphonia reads, decoded as it is read.
+    /// FLAC and anything else symphonia reads, decoded as it is read.
     Coded(PathBuf),
 }
 
@@ -236,52 +239,66 @@ pub fn load(
     } = open(path)?;
     let channels = usize::from(info.channels);
     let mut levels = Levels::new(info.sample_rate, channels);
-    // Compressed headers can be missing or wrong about the length: the
-    // analysis starts on trust, and a second pass redoes it if the file
-    // turns out different.
+    // With the header's length taken on trust, the spectrogram and the
+    // levels come from the one reading of the file. Compressed headers can
+    // be missing or wrong about the length: then the levels are made up to
+    // where the file ends, and the spectrogram is laid out again for it.
     let planned = info.frames;
-    let mut analyzer =
-        (planned > 0).then(|| Analyzer::new(spec, 0..planned, planned, channels, columns));
-    // Whole blocks of levels per read, so no block straddles two.
-    let piece = (piece_frames(&source, channels) / levels.block).max(1) * levels.block;
-    let mut at = 0;
-    // Past where the header says the file ends, pieces wait for reading to
-    // get there, so a right header costs no decoding past the end; without
-    // one, reading runs ahead as far as anywhere.
-    let likely = if planned > 0 { planned } else { usize::MAX };
-    let read = pieces(
-        &source,
-        channels,
-        0..usize::MAX,
-        likely,
-        piece,
-        cancel,
-        |first, part, got| {
-            let part = &part[..got * channels];
-            levels.push(part);
-            if let Some(analyzer) = &mut analyzer {
-                let wanted = analyzer.wanted().end;
-                if first < wanted {
-                    analyzer.push(first, &part[..(wanted - first).min(got) * channels]);
-                }
+    let mut trusted = None;
+    if planned > 0 {
+        let whole = 0..planned;
+        let Some(study) = study(
+            &source,
+            channels,
+            planned,
+            spec,
+            whole,
+            columns,
+            Some(&mut levels),
+            cancel,
+            progress,
+        )?
+        else {
+            return Err("cancelled".into());
+        };
+        info.frames = match study.ended {
+            Some(end) => {
+                // What the last block had before the end.
+                let (meter, last) = levels.cut(end);
+                let from = end / meter.block * meter.block;
+                let mut part = vec![0.0; (end - from) * channels];
+                Reader::open(&source, channels)?.read(from, &mut part)?;
+                meter.measure(&part, last);
+                end
             }
-            at = first + got;
-            if planned > 0 {
-                report(progress, at, planned);
+            None if runs_past(&source, channels, planned)? => {
+                let from = planned / levels.block * levels.block;
+                levels.cut(from);
+                measure(&source, channels, from, &mut levels, cancel)?
             }
-            got == piece
-        },
-    )?;
-    if !read {
-        return Err("cancelled".into());
+            None => {
+                trusted = Some(study.analysis);
+                planned
+            }
+        };
+    } else {
+        info.frames = measure(&source, channels, 0, &mut levels, cancel)?;
     }
-    if at == 0 {
+    if info.frames == 0 {
         return Err("the file holds no audio".into());
     }
-    info.frames = at;
-    let analysis = match analyzer {
-        Some(analyzer) if planned == at => analyzer.finish(),
-        _ => analyse(&source, &info, spec, 0..at, columns, cancel, progress)?.ok_or("cancelled")?,
+    let analysis = match trusted {
+        Some(analysis) => analysis,
+        None => analyse(
+            &source,
+            &info,
+            spec,
+            0..info.frames,
+            columns,
+            cancel,
+            progress,
+        )?
+        .ok_or("cancelled")?,
     };
     details
         .sections
@@ -311,38 +328,325 @@ pub fn analyse(
     progress: &AtomicU32,
 ) -> Result<Option<Analysis>, String> {
     let channels = usize::from(info.channels);
-    let analyzer = Analyzer::new(spec, range, info.frames, channels, columns);
-    run(source, info, analyzer, cancel, progress)
+    let study = study(
+        source,
+        channels,
+        info.frames,
+        spec,
+        range,
+        columns,
+        None,
+        cancel,
+        progress,
+    )?;
+    Ok(study.map(|study| study.analysis))
 }
 
-fn run(
+/// What [`study`] makes of a file.
+struct Study {
+    analysis: Analysis,
+    /// Where the file ended, when that was before the analysis had read all
+    /// it wanted.
+    ended: Option<usize>,
+}
+
+/// Frames a thread takes at a time when working out an analysis, about:
+/// enough that the work far outweighs sharing it out.
+const STRETCH_FRAMES: usize = 1 << 18;
+/// Stretches an analysis is cut into at least, however short its range:
+/// enough to go round the threads a few times. A number of its own rather
+/// than the threads', so where stretches start, and with them the noise an
+/// AAC decoder makes up, is the same wherever the analysis runs.
+const STRETCHES: usize = 64;
+/// Samples, all channels counted, a thread reads at once while working out
+/// an analysis: a stretch comes in parts this long however long its columns
+/// are.
+const PART_SAMPLES: usize = 1 << 18;
+
+/// The spectrogram of `range` of a file `frames` long, as [`analyse`] makes
+/// it, and with `levels` the levels of the whole file too. Every thread
+/// works out a stretch of columns at a time from the frames the stretch
+/// reads, with its levels, so no thread waits on another; a compressed file
+/// is decoded a stretch a thread.
+#[allow(clippy::too_many_arguments)]
+fn study(
     source: &Source,
-    info: &Info,
-    mut analyzer: Analyzer,
+    channels: usize,
+    frames: usize,
+    spec: Spec,
+    range: Range<usize>,
+    columns: usize,
+    levels: Option<&mut Levels>,
     cancel: &AtomicBool,
     progress: &AtomicU32,
-) -> Result<Option<Analysis>, String> {
-    let channels = usize::from(info.channels);
-    let wanted = analyzer.wanted();
-    let piece = piece_frames(source, channels).min(wanted.len().max(1));
+) -> Result<Option<Study>, String> {
+    let plan = Plan::new(spec, range.clone(), frames, channels, columns);
+    let mut analysis = plan.blank();
+    let (count, bins) = (plan.columns(), analysis.bins);
+    let per = ((STRETCH_FRAMES as f64 / plan.span()).ceil() as usize)
+        .min(count.div_ceil(STRETCHES))
+        .max(1);
+    let (meter, mut stats) = match levels {
+        Some(levels) => {
+            let (meter, stats) = levels.blocks(frames);
+            (Some(meter), stats)
+        }
+        None => (None, &mut [][..]),
+    };
+    let block = meter.map_or(1, |meter| meter.block);
+    let most = (PART_SAMPLES / channels.max(1)).max(1);
+    // What a part reads at most: its own frames, its windows past them, and
+    // the rest of the last block of levels it measures.
+    let room = most + 2 * spec.fft + block;
+    let mut planes: Vec<_> = analysis
+        .planes
+        .iter_mut()
+        .map(|p| p.chunks_mut(per * bins))
+        .collect();
+    let mut envelope: Vec<_> = analysis
+        .envelope
+        .iter_mut()
+        .map(|e| e.chunks_mut(per))
+        .collect();
+    let mut stretches = Vec::new();
+    for first in (0..count).step_by(per) {
+        let columns = first..(first + per).min(count);
+        let blocks = if meter.is_some() {
+            plan.begins(columns.start).div_ceil(block)..plan.begins(columns.end).div_ceil(block)
+        } else {
+            0..0
+        };
+        let (mine, rest) = std::mem::take(&mut stats).split_at_mut(blocks.len() * channels);
+        stats = rest;
+        stretches.push(Stretch {
+            planes: planes
+                .iter_mut()
+                .map(|p| p.next().expect("a stretch each"))
+                .collect(),
+            envelope: envelope
+                .iter_mut()
+                .map(|e| e.next().expect("a stretch each"))
+                .collect(),
+            columns,
+            blocks,
+            stats: mine,
+        });
+    }
+    let failed = Mutex::new(None);
+    let ended = AtomicUsize::new(usize::MAX);
+    let done = AtomicUsize::new(0);
+    let benches = Benches::default();
+    stretches.into_par_iter().for_each_init(
+        || benches.lend(),
+        |loan, mut stretch| {
+            for (i, part) in plan.parts(stretch.columns.clone(), most).enumerate() {
+                if cancel.load(Ordering::Relaxed)
+                    || failed
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .is_some()
+                {
+                    return;
+                }
+                let mut reads = part.reads.clone();
+                let blocks = match meter {
+                    Some(_) => part.own.start.div_ceil(block)..part.own.end.div_ceil(block),
+                    None => 0..0,
+                };
+                if !blocks.is_empty() {
+                    reads.end = reads.end.max((blocks.end * block).min(frames));
+                }
+                let (got, bench) =
+                    match loan.read(source, channels, &plan, room, reads.clone(), i == 0) {
+                        Ok(read) => read,
+                        Err(e) => {
+                            failed
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .get_or_insert(e);
+                            return;
+                        }
+                    };
+                if got < reads.len() {
+                    ended.fetch_min(reads.start + got, Ordering::Relaxed);
+                }
+                let samples = &bench.samples;
+                plan.work(
+                    stretch.columns.clone(),
+                    &part,
+                    reads.start,
+                    samples,
+                    &mut stretch.planes,
+                    &mut stretch.envelope,
+                    &mut bench.room,
+                );
+                if let Some(meter) = meter.filter(|_| !blocks.is_empty()) {
+                    let from = blocks.start * block - reads.start;
+                    let to = (blocks.end * block).min(frames) - reads.start;
+                    let stats = &mut stretch.stats
+                        [(blocks.start - stretch.blocks.start) * channels..]
+                        [..blocks.len() * channels];
+                    meter.measure(&samples[from * channels..to * channels], stats);
+                }
+                let done = done.fetch_add(reads.len(), Ordering::Relaxed) + reads.len();
+                report(progress, done, range.len());
+            }
+        },
+    );
+    if let Some(e) = failed.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        return Err(e);
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let ended = ended.into_inner();
+    Ok(Some(Study {
+        analysis: analysis.finish(),
+        ended: (ended < usize::MAX).then_some(ended),
+    }))
+}
+
+/// Readers threads borrow for stretches of a file and hand back, with the
+/// room each reads into and works in, so none is made again for every share
+/// of the work rayon hands out.
+#[derive(Default)]
+struct Benches(Mutex<Vec<Bench>>);
+
+/// A reader, and room for the frames it reads and for working them out.
+struct Bench {
+    reader: Reader,
+    samples: Vec<f32>,
+    room: Room,
+}
+
+impl Benches {
+    fn lend(&self) -> Loan<'_> {
+        Loan {
+            bench: None,
+            benches: self,
+        }
+    }
+}
+
+/// A bench a thread has from [`Benches`], or will set up.
+struct Loan<'a> {
+    bench: Option<Bench>,
+    benches: &'a Benches,
+}
+
+impl Loan<'_> {
+    /// Reads `frames` onto the bench, one set up for reads of up to `room`
+    /// frames if the thread has none, from a seek if `afresh`, as a stretch's
+    /// first read is, so a stretch reads the same whichever reader it gets:
+    /// how many frames the file had there, and the bench with them.
+    #[allow(clippy::too_many_arguments)]
+    fn read(
+        &mut self,
+        source: &Source,
+        channels: usize,
+        plan: &Plan,
+        room: usize,
+        frames: Range<usize>,
+        afresh: bool,
+    ) -> Result<(usize, &mut Bench), String> {
+        let bench = match self.bench.take() {
+            Some(bench) => Some(bench),
+            None => {
+                // The one that got furthest short of the frames, as a
+                // compressed file some kinds of which seek only by reading
+                // from the top or from where they are.
+                let mut spare = self
+                    .benches
+                    .0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let nearest = spare
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, bench)| bench.reader.next() <= frames.start)
+                    .max_by_key(|(_, bench)| bench.reader.next())
+                    .map(|(i, _)| i);
+                match nearest {
+                    Some(i) => Some(spare.swap_remove(i)),
+                    None => spare.pop(),
+                }
+            }
+        };
+        let mut bench = match bench {
+            Some(bench) => bench,
+            None => Bench {
+                reader: Reader::open(source, channels)?,
+                samples: Vec::with_capacity(room * channels),
+                room: plan.room(room),
+            },
+        };
+        bench.samples.resize(frames.len() * channels, 0.0);
+        if afresh {
+            bench.reader.afresh();
+        }
+        // A reader that failed is not handed on.
+        let got = bench.reader.read(frames.start, &mut bench.samples)?;
+        Ok((got, self.bench.insert(bench)))
+    }
+}
+
+impl Drop for Loan<'_> {
+    fn drop(&mut self) {
+        if let Some(bench) = self.bench.take() {
+            self.benches
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(bench);
+        }
+    }
+}
+
+/// A stretch of an analysis a thread works out, and what it fills in.
+struct Stretch<'a> {
+    columns: Range<usize>,
+    planes: Vec<&'a mut [f32]>,
+    envelope: Vec<&'a mut [[f32; 2]]>,
+    /// The blocks of levels whose first frame falls among the columns'.
+    blocks: Range<usize>,
+    stats: &'a mut [[f32; 2]],
+}
+
+/// Whether the file holds audio from frame `frames` on.
+fn runs_past(source: &Source, channels: usize, frames: usize) -> Result<bool, String> {
+    let mut frame = vec![0.0; channels];
+    Ok(Reader::open(source, channels)?.read(frames, &mut frame)? > 0)
+}
+
+/// Reads the file from `from`, a block boundary, to its end for the levels,
+/// and says where it ends: for a file whose header does not know its length.
+fn measure(
+    source: &Source,
+    channels: usize,
+    from: usize,
+    levels: &mut Levels,
+    cancel: &AtomicBool,
+) -> Result<usize, String> {
+    // Whole blocks of levels per read, so no block straddles two.
+    let piece = (piece_frames(source, channels) / levels.block).max(1) * levels.block;
+    let mut at = from;
     let read = pieces(
         source,
         channels,
-        wanted.clone(),
-        wanted.end,
+        from..usize::MAX,
+        usize::MAX,
         piece,
         cancel,
-        |first, part, _| {
-            analyzer.push(first, part);
-            report(
-                progress,
-                first + part.len() / channels - wanted.start,
-                wanted.len(),
-            );
-            true
+        |first, part, got| {
+            levels.push(&part[..got * channels]);
+            at = first + got;
+            got == piece
         },
     )?;
-    Ok(read.then(|| analyzer.finish()))
+    if !read {
+        return Err("cancelled".into());
+    }
+    Ok(at)
 }
 
 /// Reads `wanted` of `source` in pieces of `piece` frames and hands each to
@@ -550,16 +854,17 @@ impl Reader {
                 bytes: Vec::new(),
             }),
             Source::Coded(path) => Origin::Coded(Box::new(Decoded {
-                coded: Coded::open(path)?,
+                frames: Frames::open(path)?,
                 channels,
                 history: VecDeque::new(),
                 queue: VecDeque::new(),
                 from: 0,
                 ended: false,
+                afresh: false,
             })),
         };
         let forward = match &origin {
-            Origin::Coded(decoded) => FORWARD_SECONDS * decoded.coded.sample_rate as usize,
+            Origin::Coded(decoded) => FORWARD_SECONDS * decoded.frames.sample_rate() as usize,
             Origin::Pcm(_) => 0,
         };
         Ok(Self {
@@ -567,6 +872,23 @@ impl Reader {
             origin,
             forward,
         })
+    }
+
+    /// Makes the next read seek, for a file whose decoder remembers more of
+    /// what it decoded than a seek clears: then what is read from a place is
+    /// the same whatever this reader read before.
+    pub fn afresh(&mut self) {
+        if let Origin::Coded(decoded) = &mut self.origin {
+            decoded.afresh = matches!(&decoded.frames, Frames::Coded(coded) if coded.remembers());
+        }
+    }
+
+    /// Where a read goes on without a jump: past the last frame read.
+    fn next(&self) -> usize {
+        match &self.origin {
+            Origin::Pcm(_) => 0,
+            Origin::Coded(decoded) => decoded.from,
+        }
     }
 
     /// Fills `out` with the frames from `first` on and says how many the
@@ -655,7 +977,7 @@ fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
 /// A compressed file read by position: decoded forward while reads move
 /// forward, and seeking only for jumps back or far ahead.
 struct Decoded {
-    coded: Coded,
+    frames: Frames,
     channels: usize,
     /// The last frames read, interleaved, up to `from`.
     history: VecDeque<f32>,
@@ -665,19 +987,22 @@ struct Decoded {
     /// The file's frame at the front of `queue`.
     from: usize,
     ended: bool,
+    /// The next read seeks, however near it is: see [`Reader::afresh`].
+    afresh: bool,
 }
 
 impl Decoded {
     fn read(&mut self, first: usize, out: &mut [f32], forward: usize) -> Result<usize, String> {
         let ch = self.channels;
         let (kept, queued) = (self.history.len() / ch, self.queue.len() / ch);
-        if first.saturating_add(kept) < self.from
+        if std::mem::take(&mut self.afresh)
+            || first.saturating_add(kept) < self.from
             || first > (self.from + queued).saturating_add(forward)
         {
             // From a little before, so a codec whose frames overlap decodes
             // `first` as reading from the top does.
-            let from = first.saturating_sub(LEAD_IN);
-            self.coded.seek(from)?;
+            let from = first.saturating_sub(self.frames.lead_in());
+            self.frames.seek(from)?;
             self.history.clear();
             self.queue.clear();
             self.from = from;
@@ -720,9 +1045,9 @@ impl Decoded {
             }
             self.from += filled;
         }
-        let max_gap = MAX_GAP_SECONDS * self.coded.sample_rate as usize;
+        let max_gap = MAX_GAP_SECONDS * self.frames.sample_rate() as usize;
         while (self.from < first || filled < out.len() / ch) && !self.ended {
-            let Some(block) = self.coded.next()? else {
+            let Some(block) = self.frames.next()? else {
                 self.ended = true;
                 break;
             };
@@ -803,6 +1128,62 @@ impl Sink<'_> {
     }
 }
 
+/// Where a compressed file's frames come from: FLAC's through a decoder of
+/// our own, as [`flac`] tells why, and the rest through symphonia's.
+enum Frames {
+    Flac(flac::Reader),
+    Coded(Coded),
+}
+
+impl Frames {
+    fn open(path: &Path) -> Result<Self, String> {
+        match flac::Reader::open(path) {
+            Ok(Some(reader)) => Ok(Self::Flac(reader)),
+            // What ours does not take, symphonia still reads.
+            _ => Coded::open(path).map(Self::Coded),
+        }
+    }
+
+    fn sample_rate(&self) -> u32 {
+        match self {
+            Self::Flac(reader) => reader.stream().sample_rate,
+            Self::Coded(coded) => coded.sample_rate,
+        }
+    }
+
+    /// Frames read from before where a read jumps to: FLAC's stand alone.
+    fn lead_in(&self) -> usize {
+        match self {
+            Self::Flac(_) => 0,
+            Self::Coded(_) => LEAD_IN,
+        }
+    }
+
+    fn seek(&mut self, frame: usize) -> Result<(), String> {
+        match self {
+            Self::Flac(reader) => reader
+                .seek(frame as u64)
+                .map_err(|e| format!("cannot read: {e}")),
+            Self::Coded(coded) => coded.seek(frame),
+        }
+    }
+
+    fn next(&mut self) -> Result<Option<Block<'_>>, String> {
+        match self {
+            Self::Flac(reader) => {
+                let channels = reader.stream().channels;
+                let frame = reader.next().map_err(|e| format!("cannot read: {e}"))?;
+                Ok(frame.map(|(first, samples)| Block {
+                    at: usize::try_from(first).unwrap_or(usize::MAX),
+                    channels,
+                    samples,
+                }))
+            }
+            Self::Coded(coded) => coded.next(),
+        }
+    }
+}
+
 /// Decoded audio starting at frame `at` of the file's timeline.
 pub struct Block<'a> {
     pub at: usize,
@@ -832,10 +1213,18 @@ pub struct Coded {
     /// The packet a seek read to see where it landed.
     pending: Option<Packet>,
     decoded: Vec<f32>,
+    /// What the decoder was made from, to make it again.
+    params: AudioCodecParameters,
 }
 
 fn unsupported(e: DecodeError) -> String {
     format!("unsupported or damaged file: {e}")
+}
+
+fn decoder_for(params: &AudioCodecParameters) -> Result<Box<dyn AudioDecoder>, String> {
+    symphonia::default::get_codecs()
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
+        .map_err(unsupported)
 }
 
 impl Coded {
@@ -887,9 +1276,7 @@ impl Coded {
         // A track said to start before 0, as a Vorbis one does by its
         // encoder's delay, still sounds from 0: the decoder drops the delay.
         let (track, start) = (track.id, track.start_ts.get().max(0));
-        let decoder = symphonia::default::get_codecs()
-            .make_audio_decoder(&params, &AudioDecoderOptions::default())
-            .map_err(unsupported)?;
+        let decoder = decoder_for(&params)?;
         Ok(Self {
             path: path.to_owned(),
             format,
@@ -911,7 +1298,15 @@ impl Coded {
             next: Some(0),
             pending: None,
             decoded: Vec::new(),
+            params,
         })
+    }
+
+    /// Whether the decoder remembers more of what it decoded than a reset
+    /// clears: AAC's noise substitution draws on a generator that runs on
+    /// through the file, so its noise differs with all that came before.
+    fn remembers(&self) -> bool {
+        self.params.codec == CODEC_ID_AAC
     }
 
     /// The frame of the timeline `ts` falls on, negative before the start.
@@ -970,7 +1365,11 @@ impl Coded {
             if target == 0 || failed || self.format.format_info().format == FORMAT_ID_FLAC {
                 *self = Self::open(&self.path)?;
             } else {
-                self.decoder.reset();
+                if self.remembers() {
+                    self.decoder = decoder_for(&self.params)?;
+                } else {
+                    self.decoder.reset();
+                }
                 self.pending = None;
             }
             if target == 0 {
@@ -1048,7 +1447,7 @@ impl Coded {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::spectrogram::{Channels, DEFAULT_COLUMNS};
+    use crate::spectrogram::{self, Channels, DEFAULT_COLUMNS};
 
     /// A 16-bit mono AIFF: a format symphonia reads, so it goes through
     /// [`Coded`] rather than the WAV reader.
@@ -1194,6 +1593,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_load_worked_out_in_parts_on_threads_matches_the_file_worked_through_whole() {
+        let frames = 1_500_000;
+        let samples: Vec<i16> = (0..frames as u32 * 2)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 17) as i16 / 2)
+            .collect();
+        let path = temp_file(
+            "parts.wav",
+            &wav::tests::build_channels(false, 2, &[], &samples),
+        );
+        let signal: Vec<f32> = samples.iter().map(|&s| f32::from(s) / 32_768.0).collect();
+        let (cancel, progress) = idle();
+        // Columns longer than a part, and columns a few to a part.
+        for columns in [4, DEFAULT_COLUMNS] {
+            let (loaded, analysis) = load(&path, mix(), columns, &cancel, &progress).unwrap();
+            let whole = spectrogram::tests::analyse_in(
+                &signal,
+                2,
+                mix(),
+                0..frames,
+                columns,
+                usize::MAX,
+                usize::MAX,
+            );
+            assert!(analysis.planes == whole.planes, "{columns} columns");
+            assert!(analysis.envelope == whole.envelope, "{columns} columns");
+            let mut levels = Levels::new(loaded.info.sample_rate, 2);
+            levels.push(&signal);
+            for frame in (0..frames).step_by(levels.block) {
+                assert_eq!(
+                    loaded.levels.at(frame, levels.block),
+                    levels.at(frame, levels.block)
+                );
+            }
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn reads_that_step_back_a_little_or_a_long_way_get_the_frames_they_ask_for() {
         let samples: Vec<i16> = (0..200_000).map(|i| (i % 30_000) as i16).collect();
         let path = temp_file("steps.aiff", &aiff(&samples, 48_000));
@@ -1215,6 +1652,60 @@ pub(crate) mod tests {
             assert!(out[got..].iter().all(|&v| v == 0.0));
         }
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_read_afresh_gets_the_same_frames_whatever_the_reader_read_before() {
+        // AAC whose encoder put noise in place of some bands: the decoder
+        // draws that noise from a generator that runs on through the file.
+        let source =
+            Source::Coded(Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/noise.m4a"));
+        let read_after = |before: &[usize]| {
+            let mut reader = Reader::open(&source, 2).unwrap();
+            let mut out = vec![0.0; 8_192 * 2];
+            for &first in before {
+                reader.read(first, &mut out).unwrap();
+            }
+            reader.afresh();
+            assert_eq!(reader.read(90_000, &mut out).unwrap(), 8_192);
+            out
+        };
+        let first = read_after(&[]);
+        assert!(read_after(&[0, 30_000]) == first);
+        assert!(read_after(&[85_000]) == first);
+    }
+
+    #[test]
+    fn an_analysis_is_the_same_however_many_threads_share_it() {
+        // The noise of noise.m4a, as the test above has it, differs with
+        // what its reader decoded before.
+        let source =
+            Source::Coded(Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/noise.m4a"));
+        let Opened { info, .. } =
+            open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/noise.m4a")).unwrap();
+        let (cancel, progress) = idle();
+        let on = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                analyse(
+                    &source,
+                    &info,
+                    mix(),
+                    0..info.frames,
+                    DEFAULT_COLUMNS,
+                    &cancel,
+                    &progress,
+                )
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let one = on(1);
+        let four = on(4);
+        assert!(one.planes == four.planes && one.envelope == four.envelope);
     }
 
     #[test]
