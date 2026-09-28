@@ -5,6 +5,8 @@ use rayon::prelude::*;
 
 /// Levels below this read as silence.
 pub const FLOOR_DB: f32 = -100.0;
+/// About how many samples [`Levels::push`] takes at once.
+const LANES: usize = 64;
 
 pub struct Levels {
     /// Frames per block.
@@ -42,20 +44,34 @@ impl Levels {
         let start = self.stats.len();
         let blocks = samples.len().div_ceil(self.block * ch);
         self.stats.resize(start + blocks * ch, [0.0; 2]);
+        // A block is taken a row of whole frames at a time, a row wide
+        // enough that the compiler takes many samples at once, each place in
+        // it adding up on its own.
+        let width = ch * LANES.div_ceil(ch);
         self.stats[start..]
             .par_chunks_mut(ch)
             .zip(samples.par_chunks(self.block * ch))
-            .for_each(|(stats, block)| {
-                for frame in block.chunks_exact(ch) {
-                    for (s, &x) in stats.iter_mut().zip(frame) {
-                        *s = [s[0].max(x.abs()), s[1] + x * x];
+            .for_each_init(
+                || (vec![0.0f32; width], vec![0.0f32; width]),
+                |(peak, energy), (stats, block)| {
+                    peak.fill(0.0);
+                    energy.fill(0.0);
+                    let rows = block.chunks_exact(width);
+                    let rest = rows.remainder();
+                    for row in rows.chain([rest]) {
+                        for ((p, e), &x) in peak.iter_mut().zip(energy.iter_mut()).zip(row) {
+                            *p = p.max(x.abs());
+                            *e += x * x;
+                        }
                     }
-                }
-                let frames = (block.len() / ch).max(1) as f32;
-                for s in stats {
-                    s[1] /= frames;
-                }
-            });
+                    let frames = (block.len() / ch).max(1) as f32;
+                    for (c, s) in stats.iter_mut().enumerate() {
+                        let lanes = (c..width).step_by(ch);
+                        let top = lanes.clone().map(|i| peak[i]).fold(0.0, f32::max);
+                        *s = [top, lanes.map(|i| energy[i]).sum::<f32>() / frames];
+                    }
+                },
+            );
     }
 
     /// Each channel's level over `span` frames ending at `frame`.

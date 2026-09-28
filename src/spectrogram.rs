@@ -24,6 +24,9 @@ pub const SILENCE_DB: f32 = -200.0;
 /// Frames a thread takes at a time when a target's signal is drawn out of
 /// the interleaved samples.
 const MIX_FRAMES: usize = 1 << 14;
+/// Pushes' worth of samples an analysis holds at most while its columns
+/// wait to be run together.
+const HELD_PUSHES: usize = 8;
 
 /// Which signals are analysed: the channels averaged, each channel on its
 /// own, or one channel.
@@ -341,7 +344,14 @@ impl Analyzer {
                 .find(|&c| layout.needs_to(c) > have)
                 .unwrap_or(self.columns)
         };
-        if ready > self.next_column {
+        // Columns ready wait until there are enough to go round the threads,
+        // as a long file's come a few a push, or until the samples they hold
+        // grow to many pushes' worth.
+        let held = have - self.buffer_start;
+        let enough = ready - self.next_column >= rayon::current_num_threads()
+            || ready == self.columns
+            || held > HELD_PUSHES * (samples.len() / ch);
+        if ready > self.next_column && enough {
             self.run(self.next_column..ready);
             self.next_column = ready;
         }

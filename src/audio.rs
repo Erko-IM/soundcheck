@@ -3,20 +3,24 @@
 //! memory; analysis, meters, the spectrum and playback all read the file as
 //! they go.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Mutex, PoisonError, mpsc};
 
 use rayon::prelude::*;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as DecodeError;
 use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::well_known::FORMAT_ID_FLAC;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, RawValue, StandardTag};
+use symphonia::core::packet::Packet;
 use symphonia::core::units::Timestamp;
 
 use crate::edit::Edits;
@@ -32,11 +36,30 @@ const MAX_GAP_SECONDS: usize = 10;
 /// a range of it: enough that the work on each read far outweighs sharing
 /// it out between threads, in the same memory whatever the channel count.
 const PIECE_SAMPLES: usize = 1 << 21;
+/// The same for a compressed file, whose pieces a thread each decodes side
+/// by side: a thread's worth in hand stays a few MB, and the lead-in each
+/// piece needs costs a few percent.
+const CODED_PIECE_SAMPLES: usize = 1 << 19;
+/// Frames a compressed piece is decoded from before its start, and dropped:
+/// a codec whose frames overlap, as AAC, MP3 and Vorbis do, decodes a frame
+/// as reading from the top does only with the one before it in hand.
+const LEAD_IN: usize = 1 << 14;
+/// Frames over which a piece decoded on its own takes over from the one
+/// before. AAC's noise substitution draws on a generator that runs through
+/// the whole file, so where it is used two decodes of the same frames
+/// differ, and a cut from one to the other would click.
+const JOIN: usize = 2048;
+/// How far back a failed seek is tried again from before the read fails.
+const MAX_BACK_SECONDS: usize = 64;
 /// PCM reads of more frames than this are split across threads.
 const PARALLEL_FRAMES: usize = 1 << 15;
 /// A compressed file is decoded forward over a jump this short, and seeks
-/// past a longer one.
-const FORWARD_SECONDS: usize = 20;
+/// past a longer one, which takes about as long as decoding a second.
+const FORWARD_SECONDS: usize = 1;
+/// Frames a compressed file keeps of what it last read, for a read that
+/// starts that far back: playback's band filter reads in steps that overlap
+/// by up to three quarters of 8192 frames.
+const HISTORY: usize = 1 << 15;
 
 #[derive(Clone)]
 pub struct Info {
@@ -212,7 +235,6 @@ pub fn load(
         edits,
     } = open(path)?;
     let channels = usize::from(info.channels);
-    let mut reader = Reader::open(&source, channels)?;
     let mut levels = Levels::new(info.sample_rate, channels);
     // Compressed headers can be missing or wrong about the length: the
     // analysis starts on trust, and a second pass redoes it if the file
@@ -221,29 +243,37 @@ pub fn load(
     let mut analyzer =
         (planned > 0).then(|| Analyzer::new(spec, 0..planned, planned, channels, columns));
     // Whole blocks of levels per read, so no block straddles two.
-    let piece = (piece_frames(channels) / levels.block).max(1) * levels.block;
-    let mut buffer = vec![0.0; piece * channels];
+    let piece = (piece_frames(&source, channels) / levels.block).max(1) * levels.block;
     let mut at = 0;
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".into());
-        }
-        let got = reader.read(at, &mut buffer)?;
-        let part = &buffer[..got * channels];
-        levels.push(part);
-        if let Some(analyzer) = &mut analyzer {
-            let wanted = analyzer.wanted().end;
-            if at < wanted {
-                analyzer.push(at, &part[..(wanted - at).min(got) * channels]);
+    // Past where the header says the file ends, pieces wait for reading to
+    // get there, so a right header costs no decoding past the end; without
+    // one, reading runs ahead as far as anywhere.
+    let likely = if planned > 0 { planned } else { usize::MAX };
+    let read = pieces(
+        &source,
+        channels,
+        0..usize::MAX,
+        likely,
+        piece,
+        cancel,
+        |first, part, got| {
+            let part = &part[..got * channels];
+            levels.push(part);
+            if let Some(analyzer) = &mut analyzer {
+                let wanted = analyzer.wanted().end;
+                if first < wanted {
+                    analyzer.push(first, &part[..(wanted - first).min(got) * channels]);
+                }
             }
-        }
-        at += got;
-        if planned > 0 {
-            report(progress, at, planned);
-        }
-        if got < piece {
-            break;
-        }
+            at = first + got;
+            if planned > 0 {
+                report(progress, at, planned);
+            }
+            got == piece
+        },
+    )?;
+    if !read {
+        return Err("cancelled".into());
     }
     if at == 0 {
         return Err("the file holds no audio".into());
@@ -293,28 +323,180 @@ fn run(
     progress: &AtomicU32,
 ) -> Result<Option<Analysis>, String> {
     let channels = usize::from(info.channels);
-    let mut reader = Reader::open(source, channels)?;
     let wanted = analyzer.wanted();
-    let piece = piece_frames(channels).min(wanted.len().max(1));
-    let mut buffer = vec![0.0; piece * channels];
-    let mut at = wanted.start;
-    while at < wanted.end {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(None);
-        }
-        let n = piece.min(wanted.end - at);
-        let part = &mut buffer[..n * channels];
-        reader.read(at, part)?;
-        analyzer.push(at, part);
-        at += n;
-        report(progress, at - wanted.start, wanted.len());
-    }
-    Ok(Some(analyzer.finish()))
+    let piece = piece_frames(source, channels).min(wanted.len().max(1));
+    let read = pieces(
+        source,
+        channels,
+        wanted.clone(),
+        wanted.end,
+        piece,
+        cancel,
+        |first, part, _| {
+            analyzer.push(first, part);
+            report(
+                progress,
+                first + part.len() / channels - wanted.start,
+                wanted.len(),
+            );
+            true
+        },
+    )?;
+    Ok(read.then(|| analyzer.finish()))
 }
 
-/// Frames of `channels` channels in one piece.
-fn piece_frames(channels: usize) -> usize {
-    (PIECE_SAMPLES / channels.max(1)).max(1)
+/// Reads `wanted` of `source` in pieces of `piece` frames and hands each to
+/// `take` in order: where it starts, its frames, silent past the end of the
+/// file, and how many of them the file had. Stops when `take` says to, and
+/// is false if `cancel` stopped it. A compressed file's pieces are decoded
+/// side by side, those from `likely` on, where the file likely ends, only
+/// once reading gets there.
+fn pieces(
+    source: &Source,
+    channels: usize,
+    wanted: Range<usize>,
+    likely: usize,
+    piece: usize,
+    cancel: &AtomicBool,
+    mut take: impl FnMut(usize, &[f32], usize) -> bool,
+) -> Result<bool, String> {
+    let count = wanted.len().div_ceil(piece);
+    let bounds = |k: usize| {
+        let start = wanted.start + k * piece;
+        start..(start + piece).min(wanted.end)
+    };
+    let mut from = 0;
+    if let Source::Coded(_) = source {
+        match side_by_side(source, channels, count, &bounds, likely, cancel, &mut take) {
+            Ok(read) => return Ok(read),
+            Err(failed) => from = failed,
+        }
+    }
+    let mut reader = Reader::open(source, channels)?;
+    // A compressed file that failed to read from some position is decoded
+    // from the top on instead, as one that cannot seek has to be.
+    reader.forward = usize::MAX;
+    let mut buffer = Vec::new();
+    for k in from..count {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let range = bounds(k);
+        buffer.resize(range.len() * channels, 0.0);
+        let got = reader.read(range.start, &mut buffer)?;
+        if !take(range.start, &buffer, got) {
+            break;
+        }
+    }
+    Ok(true)
+}
+
+/// Decodes the `count` pieces `bounds` gives on rayon's threads, and hands
+/// them to `take` in order, as [`pieces`] does. `Err` names the first piece
+/// that failed.
+fn side_by_side(
+    source: &Source,
+    channels: usize,
+    count: usize,
+    bounds: &(impl Fn(usize) -> Range<usize> + Sync),
+    likely: usize,
+    cancel: &AtomicBool,
+    take: &mut impl FnMut(usize, &[f32], usize) -> bool,
+) -> Result<bool, usize> {
+    let (done, decoded) = mpsc::channel();
+    // Readers left by finished pieces, so each is opened once.
+    let readers = Mutex::new(Vec::new());
+    rayon::in_place_scope(|scope| {
+        let start = |k: usize, mut buffer: Vec<f32>| {
+            let (done, readers) = (done.clone(), &readers);
+            scope.spawn(move |_| {
+                let range = bounds(k);
+                let join = if k + 1 < count { JOIN } else { 0 };
+                buffer.resize((range.len() + join) * channels, 0.0);
+                let reader = readers.lock().unwrap_or_else(PoisonError::into_inner).pop();
+                // A panic becomes a failed piece, which is read again on the
+                // way that raises it where it always did.
+                let got =
+                    std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<usize, String> {
+                        let mut reader = match reader {
+                            Some(reader) => reader,
+                            None => Reader::open(source, channels)?,
+                        };
+                        // Pieces are far apart, and seeking to each is quicker
+                        // than decoding the way there.
+                        reader.forward = 0;
+                        let got = reader.read(range.start, &mut buffer)?;
+                        readers
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(reader);
+                        Ok(got)
+                    }))
+                    .unwrap_or_else(|_| Err("panicked".into()));
+                let _ = done.send((k, got, buffer));
+            });
+        };
+        // Pieces decoded ahead of the one `take` is on, enough to keep every
+        // thread busy while it runs; past where the file likely ends, only
+        // the next one.
+        let early = |k: usize| k == 0 || bounds(k).start < likely;
+        let mut started = 0;
+        while started < count.min(rayon::current_num_threads() + 2) && early(started) {
+            start(started, Vec::new());
+            started += 1;
+        }
+        let mut ready = BTreeMap::new();
+        // The frames the piece before decoded past its end.
+        let mut before = Vec::new();
+        for k in 0..count {
+            let (got, mut buffer) = loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(false);
+                }
+                if let Some(piece) = ready.remove(&k) {
+                    break piece;
+                }
+                let Ok((j, got, buffer)) = decoded.recv() else {
+                    return Err(k);
+                };
+                ready.insert(j, (got, buffer));
+            };
+            let Ok(got) = got else { return Err(k) };
+            let range = bounds(k);
+            let (piece, after) = buffer.split_at_mut(range.len() * channels);
+            // Where the two decodes agree, which is everywhere but noise
+            // substituted bands, this leaves the frames as they are.
+            let steps = before.len() / channels + 1;
+            let joined = piece
+                .chunks_exact_mut(channels)
+                .zip(before.chunks_exact(channels));
+            for (i, (now, then)) in joined.enumerate() {
+                let weight = (i + 1) as f32 / steps as f32;
+                for (now, then) in now.iter_mut().zip(then) {
+                    *now = then + weight * (*now - then);
+                }
+            }
+            if !take(range.start, piece, got.min(range.len())) {
+                return Ok(true);
+            }
+            before.clear();
+            before.extend_from_slice(after);
+            if started < count && (early(started) || started == k + 1) {
+                start(started, buffer);
+                started += 1;
+            }
+        }
+        Ok(true)
+    })
+}
+
+/// Frames of `channels` channels in one piece of `source`.
+fn piece_frames(source: &Source, channels: usize) -> usize {
+    let samples = match source {
+        Source::Pcm { .. } => PIECE_SAMPLES,
+        Source::Coded(_) => CODED_PIECE_SAMPLES,
+    };
+    (samples / channels.max(1)).max(1)
 }
 
 fn report(progress: &AtomicU32, done: usize, total: usize) {
@@ -348,6 +530,8 @@ pub fn file_rows(path: &Path, info: &Info) -> Vec<(String, String)> {
 pub struct Reader {
     channels: usize,
     origin: Origin,
+    /// How far ahead a compressed file is decoded to, rather than seeking.
+    forward: usize,
 }
 
 enum Origin {
@@ -365,19 +549,24 @@ impl Reader {
                 channels,
                 bytes: Vec::new(),
             }),
-            Source::Coded(path) => {
-                let coded = Coded::open(path)?;
-                Origin::Coded(Box::new(Decoded {
-                    forward: FORWARD_SECONDS * coded.sample_rate as usize,
-                    coded,
-                    channels,
-                    queue: VecDeque::new(),
-                    from: 0,
-                    ended: false,
-                }))
-            }
+            Source::Coded(path) => Origin::Coded(Box::new(Decoded {
+                coded: Coded::open(path)?,
+                channels,
+                history: VecDeque::new(),
+                queue: VecDeque::new(),
+                from: 0,
+                ended: false,
+            })),
         };
-        Ok(Self { channels, origin })
+        let forward = match &origin {
+            Origin::Coded(decoded) => FORWARD_SECONDS * decoded.coded.sample_rate as usize,
+            Origin::Pcm(_) => 0,
+        };
+        Ok(Self {
+            channels,
+            origin,
+            forward,
+        })
     }
 
     /// Fills `out` with the frames from `first` on and says how many the
@@ -386,7 +575,7 @@ impl Reader {
         debug_assert_eq!(out.len() % self.channels, 0);
         match &mut self.origin {
             Origin::Pcm(pcm) => pcm.read(first, out),
-            Origin::Coded(decoded) => decoded.read(first, out),
+            Origin::Coded(decoded) => decoded.read(first, out, self.forward),
         }
     }
 }
@@ -468,68 +657,149 @@ fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
 struct Decoded {
     coded: Coded,
     channels: usize,
-    /// Decoded frames not yet read, interleaved.
+    /// The last frames read, interleaved, up to `from`.
+    history: VecDeque<f32>,
+    /// Decoded frames not yet read, interleaved: the rest of the packet the
+    /// last read ended in.
     queue: VecDeque<f32>,
     /// The file's frame at the front of `queue`.
     from: usize,
     ended: bool,
-    forward: usize,
 }
 
 impl Decoded {
-    fn read(&mut self, first: usize, out: &mut [f32]) -> Result<usize, String> {
+    fn read(&mut self, first: usize, out: &mut [f32], forward: usize) -> Result<usize, String> {
         let ch = self.channels;
-        let queued = self.queue.len() / ch;
-        if first < self.from || first > self.from + queued + self.forward {
-            self.coded.seek(first)?;
+        let (kept, queued) = (self.history.len() / ch, self.queue.len() / ch);
+        if first.saturating_add(kept) < self.from
+            || first > (self.from + queued).saturating_add(forward)
+        {
+            // From a little before, so a codec whose frames overlap decodes
+            // `first` as reading from the top does.
+            let from = first.saturating_sub(LEAD_IN);
+            self.coded.seek(from)?;
+            self.history.clear();
             self.queue.clear();
-            self.from = first;
+            self.from = from;
             self.ended = false;
         }
-        while self.from < first {
-            let queued = self.queue.len() / ch;
-            if queued == 0 {
-                if !self.decode()? {
-                    break;
-                }
-                continue;
-            }
-            let skip = (first - self.from).min(queued);
-            self.queue.drain(..skip * ch);
-            self.from += skip;
+        // A read that starts a little before the last one ended, as one
+        // whose steps overlap does, takes what it can from that one.
+        let back = self.from.saturating_sub(first);
+        let (behind, ahead) = out.split_at_mut((back * ch).min(out.len()));
+        let old = self.history.len() - back * ch;
+        for (o, s) in behind.iter_mut().zip(self.history.range(old..)) {
+            *o = *s;
         }
-        let wanted = out.len() / ch;
-        while self.queue.len() / ch < wanted && self.decode()? {}
-        let ready = (self.queue.len() / ch).min(wanted);
-        for (o, s) in out.iter_mut().zip(self.queue.drain(..ready * ch)) {
-            *o = s;
+        if ahead.is_empty() {
+            return Ok(behind.len() / ch);
         }
-        out[ready * ch..].fill(0.0);
-        self.from += ready;
-        Ok(ready)
+        if first > self.from {
+            self.history.clear();
+        }
+        let got = self.read_on(first + back, ahead)?;
+        let fresh = &ahead[..got * ch];
+        self.history
+            .extend(&fresh[fresh.len().saturating_sub(HISTORY * ch)..]);
+        let over = self.history.len().saturating_sub(HISTORY * ch);
+        self.history.drain(..over);
+        Ok(back + got)
     }
 
-    /// Queues the next packet's frames, or says the file has ended.
-    fn decode(&mut self) -> Result<bool, String> {
-        if self.ended {
-            return Ok(false);
+    /// [`Self::read`] from where the last read ended or later.
+    fn read_on(&mut self, first: usize, out: &mut [f32]) -> Result<usize, String> {
+        let ch = self.channels;
+        let skip = (first - self.from).min(self.queue.len() / ch);
+        self.queue.drain(..skip * ch);
+        self.from += skip;
+        let mut filled = 0;
+        if self.from == first {
+            filled = (self.queue.len() / ch).min(out.len() / ch);
+            for (o, s) in out.iter_mut().zip(self.queue.drain(..filled * ch)) {
+                *o = s;
+            }
+            self.from += filled;
         }
         let max_gap = MAX_GAP_SECONDS * self.coded.sample_rate as usize;
-        let Some(block) = self.coded.next()? else {
-            self.ended = true;
-            return Ok(false);
-        };
-        let ch = self.channels;
-        let end = self.from + self.queue.len() / ch;
-        // After a seek the first packet usually starts before `from`.
-        let skip = end.saturating_sub(block.at);
-        let silence = block.at.saturating_sub(end).min(max_gap);
-        self.queue.extend(std::iter::repeat_n(0.0, silence * ch));
-        let last = block.channels - 1;
-        for frame in block.samples.chunks_exact(block.channels).skip(skip) {
-            self.queue.extend((0..ch).map(|c| frame[c.min(last)]));
+        while (self.from < first || filled < out.len() / ch) && !self.ended {
+            let Some(block) = self.coded.next()? else {
+                self.ended = true;
+                break;
+            };
+            // After a seek the first packet usually starts before `from`.
+            let skip = self.from.saturating_sub(block.at);
+            let silence = block.at.saturating_sub(self.from).min(max_gap);
+            let mut sink = Sink {
+                first,
+                out: &mut *out,
+                filled,
+                channels: ch,
+                at: self.from,
+                queue: &mut self.queue,
+            };
+            sink.put(silence, None);
+            let samples = block
+                .samples
+                .get(skip * block.channels..)
+                .unwrap_or_default();
+            sink.put(
+                samples.len() / block.channels,
+                Some((samples, block.channels)),
+            );
+            (filled, self.from) = (sink.filled, sink.at);
         }
-        Ok(true)
+        out[filled * ch..].fill(0.0);
+        Ok(filled)
+    }
+}
+
+/// Where decoded frames go, in order from frame `at` on: those before
+/// `first` are dropped, then `out` fills, and the rest wait in `queue`.
+struct Sink<'a> {
+    first: usize,
+    out: &'a mut [f32],
+    filled: usize,
+    channels: usize,
+    /// The frame the next one handed out lands on, or the first in `queue`
+    /// once `out` is full.
+    at: usize,
+    queue: &'a mut VecDeque<f32>,
+}
+
+impl Sink<'_> {
+    /// Hands on `frames` frames: silence, or interleaved samples with their
+    /// own channel count.
+    fn put(&mut self, frames: usize, samples: Option<(&[f32], usize)>) {
+        let ch = self.channels;
+        let dropped = frames.min(self.first.saturating_sub(self.at));
+        let given = (frames - dropped).min(self.out.len() / ch - self.filled);
+        let out = &mut self.out[self.filled * ch..(self.filled + given) * ch];
+        match samples {
+            None => {
+                out.fill(0.0);
+                let kept = frames - dropped - given;
+                self.queue.extend(std::iter::repeat_n(0.0, kept * ch));
+            }
+            Some((samples, from)) => {
+                let (given_part, kept_part) = samples[dropped * from..].split_at(given * from);
+                if from == ch {
+                    out.copy_from_slice(given_part);
+                    self.queue.extend(kept_part);
+                } else {
+                    // Missing channels repeat the last one the file has.
+                    for (o, frame) in out.chunks_exact_mut(ch).zip(given_part.chunks_exact(from)) {
+                        for (c, o) in o.iter_mut().enumerate() {
+                            *o = frame[c.min(from - 1)];
+                        }
+                    }
+                    for frame in kept_part.chunks_exact(from) {
+                        self.queue.extend((0..ch).map(|c| frame[c.min(from - 1)]));
+                    }
+                }
+            }
+        }
+        self.filled += given;
+        self.at += dropped + given;
     }
 }
 
@@ -559,8 +829,9 @@ pub struct Coded {
     /// Where the next block starts, or `None` after a seek: then the first
     /// packet decoded says where it is.
     next: Option<usize>,
+    /// The packet a seek read to see where it landed.
+    pending: Option<Packet>,
     decoded: Vec<f32>,
-    block: Vec<f32>,
 }
 
 fn unsupported(e: DecodeError) -> String {
@@ -613,7 +884,9 @@ impl Coded {
             .time_base
             .map_or((1, sample_rate), |tb| (tb.numer.get(), tb.denom.get()));
         let frames_hint = usize::try_from(track.num_frames.unwrap_or(0)).unwrap_or(0);
-        let (track, start) = (track.id, track.start_ts.get());
+        // A track said to start before 0, as a Vorbis one does by its
+        // encoder's delay, still sounds from 0: the decoder drops the delay.
+        let (track, start) = (track.id, track.start_ts.get().max(0));
         let decoder = symphonia::default::get_codecs()
             .make_audio_decoder(&params, &AudioDecoderOptions::default())
             .map_err(unsupported)?;
@@ -636,15 +909,41 @@ impl Coded {
             bits: params.bits_per_sample.and_then(|b| u16::try_from(b).ok()),
             frames_hint,
             next: Some(0),
+            pending: None,
             decoded: Vec::new(),
-            block: Vec::new(),
         })
     }
 
-    fn frame_of(&self, ts: Timestamp) -> usize {
+    /// The frame of the timeline `ts` falls on, negative before the start.
+    fn frame_of(&self, ts: Timestamp) -> i64 {
         let (per, ticks) = self.frames_per_tick;
         let elapsed = i128::from(ts.get()) - i128::from(self.start);
-        usize::try_from(elapsed * per / ticks).unwrap_or(0)
+        (elapsed * per / ticks).clamp(i64::MIN.into(), i64::MAX.into()) as i64
+    }
+
+    /// Where the first frame decoded from `packet` falls: after what the
+    /// decoder trims off its start as the encoder's delay.
+    fn start_of(&self, packet: &Packet) -> i64 {
+        self.frame_of(
+            packet
+                .pts
+                .checked_add(packet.trim_start)
+                .unwrap_or(packet.pts),
+        )
+    }
+
+    /// The next packet of the track.
+    fn packet(&mut self) -> Result<Option<Packet>, String> {
+        if let Some(packet) = self.pending.take() {
+            return Ok(Some(packet));
+        }
+        loop {
+            match self.format.next_packet().map_err(unsupported)? {
+                Some(packet) if packet.track_id == self.track => return Ok(Some(packet)),
+                Some(_) => {}
+                None => return Ok(None),
+            }
+        }
     }
 
     fn timestamp_of(&self, frame: usize) -> Timestamp {
@@ -653,43 +952,65 @@ impl Coded {
         Timestamp::new(i64::try_from(elapsed + i128::from(self.start)).unwrap_or(i64::MAX))
     }
 
-    /// Continues from the packet that holds `frame`, or the nearest one
-    /// before it.
+    /// Continues from the packet that holds `frame`, or one before it.
     ///
-    /// Each seek starts from a freshly opened file. symphonia 0.6.1's FLAC
-    /// reader keeps stale parser state when a seek lands on a frame it has
-    /// seen before, and the next packet then fails with an unexpected end
-    /// of file (pdeljanov/Symphonia#564).
+    /// symphonia 0.6.1's FLAC reader keeps stale parser state when a seek
+    /// lands on a frame it has seen before, and the next packet then fails
+    /// with an unexpected end of file (pdeljanov/Symphonia#564), so a FLAC
+    /// seek starts from a freshly opened file, as one after a failed seek
+    /// does. Its Matroska reader lands up to a cluster past where it is
+    /// asked to, and fails in the last cluster: a seek that lands past
+    /// `frame` or fails is tried again from further back, and the frames on
+    /// to `frame` decoded.
     pub fn seek(&mut self, frame: usize) -> Result<(), String> {
-        *self = Self::open(&self.path)?;
-        if frame == 0 {
-            return Ok(());
+        let rate = self.sample_rate as usize;
+        let (mut back, mut failed) = (0, false);
+        loop {
+            let target = frame.saturating_sub(back);
+            if target == 0 || failed || self.format.format_info().format == FORMAT_ID_FLAC {
+                *self = Self::open(&self.path)?;
+            } else {
+                self.decoder.reset();
+                self.pending = None;
+            }
+            if target == 0 {
+                return Ok(());
+            }
+            let to = SeekTo::Timestamp {
+                ts: self.timestamp_of(target),
+                track_id: self.track,
+            };
+            let landed = match self.format.seek(SeekMode::Accurate, to) {
+                Ok(_) => {
+                    self.next = None;
+                    self.pending = self.packet()?;
+                    self.pending.as_ref().map(|p| self.start_of(p))
+                }
+                Err(e) if back >= MAX_BACK_SECONDS * rate => return Err(unsupported(e)),
+                Err(_) => {
+                    failed = true;
+                    Some(i64::MAX)
+                }
+            };
+            if landed.is_none_or(|at| at <= i64::try_from(frame).unwrap_or(i64::MAX)) {
+                return Ok(());
+            }
+            back = if back == 0 { rate } else { back * 2 };
         }
-        let to = SeekTo::Timestamp {
-            ts: self.timestamp_of(frame),
-            track_id: self.track,
-        };
-        self.format
-            .seek(SeekMode::Accurate, to)
-            .map_err(unsupported)?;
-        self.next = None;
-        Ok(())
     }
 
     /// The next stretch of decoded audio, or `None` at the end.
     ///
     /// Each packet lands at its own timestamp, so a damaged packet that
-    /// fails to decode leaves a silent gap instead of pulling everything
-    /// after it earlier, and overlapping audio is dropped.
+    /// fails to decode leaves a gap, which reads as silence, instead of
+    /// pulling everything after it earlier, and overlapping audio is
+    /// dropped.
     pub fn next(&mut self) -> Result<Option<Block<'_>>, String> {
         loop {
-            let Some(packet) = self.format.next_packet().map_err(unsupported)? else {
+            let Some(packet) = self.packet()? else {
                 return Ok(None);
             };
-            if packet.track_id != self.track {
-                continue;
-            }
-            let at = self.frame_of(packet.pts);
+            let at = self.start_of(&packet);
             let buffer = match self.decoder.decode(&packet) {
                 Ok(buffer) => buffer,
                 Err(DecodeError::DecodeError(_)) => continue,
@@ -698,7 +1019,14 @@ impl Coded {
             let channels = buffer.spec().channels().count().max(1);
             self.decoded.resize(buffer.samples_interleaved(), 0.0);
             buffer.copy_to_slice_interleaved(&mut self.decoded);
-            let frames = self.decoded.len() / channels;
+            // Frames before the start of the timeline are dropped.
+            let early = usize::try_from(at.saturating_neg())
+                .unwrap_or(0)
+                .min(self.decoded.len() / channels);
+            let (at, frames) = (
+                usize::try_from(at).unwrap_or(0),
+                self.decoded.len() / channels - early,
+            );
 
             let start = self.next.unwrap_or(at);
             let max_gap = MAX_GAP_SECONDS * self.sample_rate as usize;
@@ -707,15 +1035,11 @@ impl Coded {
                 Some(_) => (0, 0),
                 None => (0, (start - at).min(frames)),
             };
-            self.block.clear();
-            self.block.resize(gap * channels, 0.0);
-            self.block
-                .extend_from_slice(&self.decoded[skip * channels..]);
             self.next = Some(start + gap + frames - skip);
             return Ok(Some(Block {
-                at: start,
+                at: start + gap,
                 channels,
-                samples: &self.block,
+                samples: &self.decoded[(early + skip) * channels..],
             }));
         }
     }
@@ -829,6 +1153,66 @@ pub(crate) mod tests {
             assert_eq!(got, 700.min(30_000 - first));
             assert_eq!(out[0], expect(first), "reading from {first}");
             assert_eq!(out[got - 1], expect(first + got - 1));
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_compressed_file_decoded_in_pieces_side_by_side_reads_as_its_wav_does() {
+        // Several pieces long, in a format symphonia reads.
+        let samples: Vec<i16> = (0..1_700_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 16) as i16 / 3)
+            .collect();
+        let aiff = temp_file("side.aiff", &aiff(&samples, 48_000));
+        let wav = temp_file("side.wav", &wav::tests::build(false, &[], &samples));
+        let (cancel, progress) = idle();
+        let (coded, a) = load(&aiff, mix(), DEFAULT_COLUMNS, &cancel, &progress).unwrap();
+        let (pcm, b) = load(&wav, mix(), DEFAULT_COLUMNS, &cancel, &progress).unwrap();
+        assert!(matches!(coded.source, Source::Coded(_)));
+        assert_eq!(coded.info.frames, pcm.info.frames);
+        assert!(a.planes == b.planes && a.envelope == b.envelope);
+        for at in [0, 700_000, 1_699_999] {
+            assert_eq!(coded.levels.at(at, 4_800), pcm.levels.at(at, 4_800));
+        }
+        let range = 400_000..1_300_000;
+        let zoom = |l: &Loaded| {
+            analyse(
+                &l.source,
+                &l.info,
+                mix(),
+                range.clone(),
+                DEFAULT_COLUMNS,
+                &cancel,
+                &progress,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert!(zoom(&coded).planes == zoom(&pcm).planes);
+        std::fs::remove_file(&aiff).unwrap();
+        std::fs::remove_file(&wav).unwrap();
+    }
+
+    #[test]
+    fn reads_that_step_back_a_little_or_a_long_way_get_the_frames_they_ask_for() {
+        let samples: Vec<i16> = (0..200_000).map(|i| (i % 30_000) as i16).collect();
+        let path = temp_file("steps.aiff", &aiff(&samples, 48_000));
+        let mut reader = Reader::open(&Source::Coded(path.clone()), 1).unwrap();
+        let expect = |frame: usize| f32::from(samples[frame]) / 32_768.0;
+        let mut out = vec![0.0; 4_096];
+        // Steps overlapping by three quarters, as playback's band filter
+        // takes them, then back further than is kept, and to the end.
+        for first in [0, 1_024, 2_048, 3_072, 100_000, 101_024, 60_000, 199_000] {
+            let got = reader.read(first, &mut out).unwrap();
+            assert_eq!(got, 4_096.min(200_000 - first));
+            for i in [0, got / 2, got - 1] {
+                assert_eq!(
+                    out[i],
+                    expect(first + i),
+                    "frame {i} of the read from {first}"
+                );
+            }
+            assert!(out[got..].iter().all(|&v| v == 0.0));
         }
         std::fs::remove_file(&path).unwrap();
     }

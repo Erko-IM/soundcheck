@@ -9,6 +9,8 @@ mod explorer;
 mod export;
 mod finder;
 mod levels;
+#[cfg(target_os = "macos")]
+mod memory;
 mod meta;
 mod playback;
 mod probe;
@@ -22,6 +24,10 @@ mod views;
 mod wav;
 
 use eframe::egui;
+
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static MEMORY: memory::Allocator = memory::Allocator;
 
 fn main() -> eframe::Result {
     let initial = std::env::args_os().nth(1).map(std::path::PathBuf::from);
