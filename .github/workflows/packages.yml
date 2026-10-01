@@ -1,8 +1,9 @@
 name: Packages
 
 # Builds the installable packages on each platform's own runner, with the
-# same make targets as a build at home: a .dmg for Apple silicon Macs, an
-# NSIS installer .exe for Windows, and a .deb plus an AppImage for Linux.
+# same make targets as a build at home: a .dmg for Macs, Apple silicon and
+# Intel both, an NSIS installer .exe for Windows, and a .deb plus an AppImage
+# for Linux.
 # Run by hand, it leaves them as downloadable artifacts, which tries the
 # builds on real Windows and Linux. Releases come from `make release` on a
 # Mac instead, which builds its own.

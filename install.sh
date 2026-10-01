@@ -34,12 +34,13 @@ fetch() {
 }
 
 mac() {
-	if [ -z "$given" ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" != 1 ]; then
-		die "the releases have soundcheck for Apple silicon Macs only"
-	fi
 	fetch soundcheck.dmg
 	hdiutil attach -quiet -nobrowse -readonly -mountpoint "$tmp/volume" "$tmp/soundcheck.dmg"
 	mounted=$tmp/volume
+	if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" != 1 ] \
+		&& ! file "$mounted/soundcheck.app/Contents/MacOS/soundcheck" | grep -q x86_64; then
+		die "this soundcheck is for Apple silicon Macs only"
+	fi
 	apps=/Applications
 	[ -w "$apps" ] || apps=$HOME/Applications
 	mkdir -p "$apps"

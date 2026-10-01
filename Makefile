@@ -66,15 +66,28 @@ install: app
 	$(if $(SIGN),codesign --force --sign "$(SIGN)" "$(APPS)/soundcheck.app")
 	@echo "installed $(APPS)/soundcheck.app"
 
-# A plain image around the signed app. cargo-packager's dmg format signs the
-# image as well, and macOS blocks a downloaded image with an ad-hoc signature
-# outright; unsigned, it opens and macOS checks only the app. diskutil image
-# from macOS 26 on, which deprecates hdiutil; hdiutil before that, as on the
-# Packages workflow's runner.
+# Rust's name for the other kind of Mac: Intel on Apple silicon, Apple silicon
+# on Intel. target/release is built for this Mac's own kind. Worked out only
+# when a recipe uses it, once the rust target has made sure rustc is there.
+OTHER_MAC_TARGET = $(filter-out $(shell $(CARGO_BIN)rustc -vV | sed -n 's/^host: //p'),aarch64-apple-darwin x86_64-apple-darwin)
+
+# A plain image around the signed app, its binary joined in here with one
+# built for the other kind of Mac, so one download runs on Apple silicon and
+# Intel alike, while `make install` builds only for this Mac. cargo-packager's
+# dmg format signs the image as well, and macOS blocks a downloaded image with
+# an ad-hoc signature outright; unsigned, it opens and macOS checks only the
+# app. diskutil image from macOS 26 on, which deprecates hdiutil; hdiutil
+# before that, as on the Packages workflow's runner.
 dmg: app
+	@$(CARGO_BIN)rustup target list --installed | grep -qx $(OTHER_MAC_TARGET) \
+		|| $(CARGO_BIN)rustup target add $(OTHER_MAC_TARGET)
+	$(CARGO_BIN)cargo build --release --target $(OTHER_MAC_TARGET)
 	rm -rf target/dmg
 	mkdir target/dmg
 	ditto target/packages/soundcheck.app target/dmg/soundcheck.app
+	lipo -create -output target/dmg/soundcheck.app/Contents/MacOS/soundcheck \
+		target/release/soundcheck target/$(OTHER_MAC_TARGET)/release/soundcheck
+	codesign --force --sign - --options runtime target/dmg/soundcheck.app
 	ln -s /Applications target/dmg/Applications
 	if /usr/sbin/diskutil image create --help >/dev/null 2>&1; then \
 		/usr/sbin/diskutil image create from --format UDZO --volumeName soundcheck target/dmg soundcheck.dmg; \

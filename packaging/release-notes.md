@@ -1,4 +1,4 @@
-Installed with one line in a terminal, soundcheck opens without the macOS and Windows warnings about apps that aren't signed. On a Mac (Apple silicon) or Linux (x86_64):
+Installed with one line in a terminal, soundcheck opens without the macOS and Windows warnings about apps that aren't signed. On a Mac or Linux (x86_64):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Erko-IM/soundcheck/main/install.sh | sh
