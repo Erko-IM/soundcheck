@@ -4,7 +4,7 @@ The point of this is to have a fast sound check tool to quickly check your sound
 
 It was inspired by https://github.com/mrkva/sound-explorer/ - but rewritten in Rust, and made multiple useability improvements for myself and a friend of mine. Functionally it is a completely separate program, but it is very much inspired by this, but since I really... really don't like Javascript, then instead of forking and modifying, and having to use Javascript when I don't absolutely have to, a rewrite in Rust seemed like a better idea, because why not.
 
-Easiest way to install it is from a terminal. On a Mac (Apple silicon) or Linux (x86_64):
+Easiest way to install it is from a terminal. On a Mac or Linux (x86_64):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Erko-IM/soundcheck/main/install.sh | sh
