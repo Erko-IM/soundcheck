@@ -4,6 +4,8 @@
 
 mod app;
 mod audio;
+mod cpu;
+mod edit;
 mod edit;
 mod explorer;
 mod export;

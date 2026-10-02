@@ -284,6 +284,32 @@ impl Decoder {
         bytes: &[u8],
         out: &mut Vec<f32>,
     ) -> Result<Frame, Bad> {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::has_v3() {
+            // SAFETY: the processor runs the v3 copy, as just asked.
+            return unsafe { self.frame_v3(stream, bytes, out) };
+        }
+        self.frame_inner(stream, bytes, out)
+    }
+
+    crate::cpu::v3! {
+        fn frame_v3(
+            &mut self,
+            stream: &Stream,
+            bytes: &[u8],
+            out: &mut Vec<f32>,
+        ) -> Result<Frame, Bad> {
+            self.frame_inner(stream, bytes, out)
+        }
+    }
+
+    #[inline(always)]
+    fn frame_inner(
+        &mut self,
+        stream: &Stream,
+        bytes: &[u8],
+        out: &mut Vec<f32>,
+    ) -> Result<Frame, Bad> {
         let header = header(stream, bytes).ok_or(if bytes.len() < 16 {
             Bad::Short
         } else {
@@ -676,6 +702,22 @@ fn wide_subframe(bits: &mut Bits, residual_room: &mut [i32], out: &mut [i64]) ->
 
 /// Reads the residual after `order` warm-up samples into the rest of `out`.
 fn residual(bits: &mut Bits, order: usize, out: &mut [i32]) -> Result<(), Bad> {
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::has_v3() {
+        // SAFETY: the processor runs the v3 copy, as just asked.
+        return unsafe { residual_v3(bits, order, out) };
+    }
+    residual_inner(bits, order, out)
+}
+
+crate::cpu::v3! {
+    fn residual_v3(bits: &mut Bits, order: usize, out: &mut [i32]) -> Result<(), Bad> {
+        residual_inner(bits, order, out)
+    }
+}
+
+#[inline(always)]
+fn residual_inner(bits: &mut Bits, order: usize, out: &mut [i32]) -> Result<(), Bad> {
     let width = match bits.read(2) {
         0 => 4,
         1 => 5,
@@ -747,6 +789,22 @@ fn fixed_of<const N: usize>(out: &mut [i32], predict: impl Fn([i32; N]) -> i32) 
 /// in `out`. Common orders get a loop of their own, which the compiler
 /// unrolls.
 fn lpc(coefs: &[i32], shift: u32, out: &mut [i32]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::has_v3() {
+        // SAFETY: the processor runs the v3 copy, as just asked.
+        return unsafe { lpc_v3(coefs, shift, out) };
+    }
+    lpc_inner(coefs, shift, out)
+}
+
+crate::cpu::v3! {
+    fn lpc_v3(coefs: &[i32], shift: u32, out: &mut [i32]) {
+        lpc_inner(coefs, shift, out)
+    }
+}
+
+#[inline(always)]
+fn lpc_inner(coefs: &[i32], shift: u32, out: &mut [i32]) {
     macro_rules! orders {
         ($($n:literal)*) => {
             match coefs.len() {

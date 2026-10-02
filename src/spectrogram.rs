@@ -379,6 +379,42 @@ impl Plan {
         envelope: &mut [&mut [[f32; 2]]],
         room: &mut Room,
     ) {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::has_v3() {
+            // SAFETY: the processor runs the v3 copy, as just asked.
+            return unsafe { self.work_v3(columns, part, first, samples, planes, envelope, room) };
+        }
+        self.work_inner(columns, part, first, samples, planes, envelope, room)
+    }
+
+    crate::cpu::v3! {
+        #[allow(clippy::too_many_arguments)]
+        fn work_v3(
+            &self,
+            columns: Range<usize>,
+            part: &Part,
+            first: usize,
+            samples: &[f32],
+            planes: &mut [&mut [f32]],
+            envelope: &mut [&mut [[f32; 2]]],
+            room: &mut Room,
+        ) {
+            self.work_inner(columns, part, first, samples, planes, envelope, room)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn work_inner(
+        &self,
+        columns: Range<usize>,
+        part: &Part,
+        first: usize,
+        samples: &[f32],
+        planes: &mut [&mut [f32]],
+        envelope: &mut [&mut [[f32; 2]]],
+        room: &mut Room,
+    ) {
         let (ch, bins, layout) = (self.channels, self.bins, self.layout);
         let each = layout.windows;
         room.signal.resize(samples.len() / ch, 0.0);

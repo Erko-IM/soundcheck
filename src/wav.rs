@@ -48,6 +48,22 @@ impl SampleKind {
     /// Every sample in `bytes`, with the format chosen once rather than per
     /// sample.
     pub fn decode_all(self, bytes: &[u8], out: &mut [f32]) {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::has_v3() {
+            // SAFETY: the processor runs the v3 copy, as just asked.
+            return unsafe { self.decode_all_v3(bytes, out) };
+        }
+        self.decode_all_inner(bytes, out)
+    }
+
+    crate::cpu::v3! {
+        fn decode_all_v3(self, bytes: &[u8], out: &mut [f32]) {
+            self.decode_all_inner(bytes, out)
+        }
+    }
+
+    #[inline(always)]
+    fn decode_all_inner(self, bytes: &[u8], out: &mut [f32]) {
         fn each<const N: usize>(bytes: &[u8], out: &mut [f32], f: impl Fn([u8; N]) -> f32) {
             for (o, s) in out.iter_mut().zip(bytes.as_chunks::<N>().0) {
                 *o = f(*s);

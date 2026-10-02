@@ -22,6 +22,34 @@ pub struct Levels {
 /// a time, a row wide enough that the compiler takes many samples at once,
 /// each place in it adding up on its own in `peak` and `energy`.
 fn measure(block: &[f32], ch: usize, peak: &mut [f32], energy: &mut [f32], stats: &mut [[f32; 2]]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::has_v3() {
+        // SAFETY: the processor runs the v3 copy, as just asked.
+        return unsafe { measure_v3(block, ch, peak, energy, stats) };
+    }
+    measure_inner(block, ch, peak, energy, stats)
+}
+
+crate::cpu::v3! {
+    fn measure_v3(
+        block: &[f32],
+        ch: usize,
+        peak: &mut [f32],
+        energy: &mut [f32],
+        stats: &mut [[f32; 2]],
+    ) {
+        measure_inner(block, ch, peak, energy, stats)
+    }
+}
+
+#[inline(always)]
+fn measure_inner(
+    block: &[f32],
+    ch: usize,
+    peak: &mut [f32],
+    energy: &mut [f32],
+    stats: &mut [[f32; 2]],
+) {
     let width = peak.len();
     peak.fill(0.0);
     energy.fill(0.0);
