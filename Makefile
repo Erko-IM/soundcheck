@@ -76,8 +76,9 @@ OTHER_MAC_TARGET = $(filter-out $(shell $(CARGO_BIN)rustc -vV | sed -n 's/^host:
 # Intel alike, while `make install` builds only for this Mac. cargo-packager's
 # dmg format signs the image as well, and macOS blocks a downloaded image with
 # an ad-hoc signature outright; unsigned, it opens and macOS checks only the
-# app. diskutil image from macOS 26 on, which deprecates hdiutil; hdiutil
-# before that, as on the Packages workflow's runner.
+# app. diskutil image where it can name the volume, as from macOS 26 on, which
+# deprecates hdiutil; hdiutil elsewhere. The Packages workflow's macOS 15
+# runner has diskutil image, but without --volumeName.
 dmg: app
 	@$(CARGO_BIN)rustup target list --installed | grep -qx $(OTHER_MAC_TARGET) \
 		|| $(CARGO_BIN)rustup target add $(OTHER_MAC_TARGET)
@@ -89,7 +90,7 @@ dmg: app
 		target/release/soundcheck target/$(OTHER_MAC_TARGET)/release/soundcheck
 	codesign --force --sign - --options runtime target/dmg/soundcheck.app
 	ln -s /Applications target/dmg/Applications
-	if /usr/sbin/diskutil image create --help >/dev/null 2>&1; then \
+	if /usr/sbin/diskutil image create from --help 2>/dev/null | grep -q -- --volumeName; then \
 		/usr/sbin/diskutil image create from --format UDZO --volumeName soundcheck target/dmg soundcheck.dmg; \
 	else \
 		hdiutil create -volname soundcheck -srcfolder target/dmg -fs HFS+ -format UDZO -ov soundcheck.dmg; \
