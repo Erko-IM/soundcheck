@@ -13,7 +13,14 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError, mpsc};
 
 use rayon::prelude::*;
-use symphonia::core::codecs::audio::well_known::CODEC_ID_AAC;
+use symphonia::core::codecs::audio::well_known::{
+    CODEC_ID_AAC, CODEC_ID_ADPCM_G722, CODEC_ID_ADPCM_G726, CODEC_ID_ADPCM_G726LE,
+    CODEC_ID_ADPCM_IMA_QT, CODEC_ID_ADPCM_IMA_WAV, CODEC_ID_ADPCM_MS, CODEC_ID_ALAC, CODEC_ID_MP1,
+    CODEC_ID_MP2, CODEC_ID_MP3, CODEC_ID_OPUS, CODEC_ID_PCM_ALAW, CODEC_ID_PCM_F32BE,
+    CODEC_ID_PCM_F32BE_PLANAR, CODEC_ID_PCM_F32LE, CODEC_ID_PCM_F32LE_PLANAR, CODEC_ID_PCM_F64BE,
+    CODEC_ID_PCM_F64BE_PLANAR, CODEC_ID_PCM_F64LE, CODEC_ID_PCM_F64LE_PLANAR, CODEC_ID_PCM_MULAW,
+    CODEC_ID_VORBIS,
+};
 use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as DecodeError;
 use symphonia::core::formats::probe::Hint;
@@ -70,8 +77,21 @@ pub struct Info {
     pub sample_rate: u32,
     pub channels: u16,
     pub bits: Option<u16>,
+    pub coding: Coding,
     pub frames: usize,
     pub bytes: u64,
+}
+
+/// How a file keeps its samples, as far as writing them out again goes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Coding {
+    /// Whole numbers this many bits wide, as PCM, FLAC and ALAC keep them.
+    Int(u16),
+    Float,
+    /// What a lossy codec decodes to: as precise as a float, but nothing a
+    /// file of whole numbers held.
+    #[default]
+    Lossy,
 }
 
 impl Info {
@@ -153,6 +173,10 @@ pub fn open(path: &Path) -> Result<Opened, String> {
                     sample_rate: w.sample_rate,
                     channels: w.channels,
                     bits: Some(w.kind.bits()),
+                    coding: match w.kind {
+                        SampleKind::F32 | SampleKind::F64 => Coding::Float,
+                        kind => Coding::Int(kind.bits()),
+                    },
                     frames: w.frames(),
                     bytes,
                 },
@@ -207,6 +231,7 @@ pub fn open(path: &Path) -> Result<Opened, String> {
                     sample_rate: coded.sample_rate,
                     channels: coded.channels,
                     bits: coded.bits,
+                    coding: coded.coding(),
                     frames: coded.frames_hint,
                     bytes,
                 },
@@ -1221,6 +1246,22 @@ fn unsupported(e: DecodeError) -> String {
     format!("unsupported or damaged file: {e}")
 }
 
+/// An ALAC track's bit depth, from its magic cookie: an M4A's sample entry
+/// says 16 bits whatever the cookie holds, as Apple writes it.
+fn alac_bits(params: &AudioCodecParameters) -> Option<u16> {
+    if params.codec != CODEC_ID_ALAC {
+        return None;
+    }
+    let mut cookie = params.extra_data.as_deref()?;
+    // The cookie may come wrapped in `frma` and `alac` atom headers.
+    for wrapper in [b"frma", b"alac"] {
+        if cookie.get(4..8) == Some(wrapper.as_slice()) {
+            cookie = cookie.get(12..)?;
+        }
+    }
+    cookie.get(5).map(|&b| u16::from(b)).filter(|&b| b > 0)
+}
+
 fn decoder_for(params: &AudioCodecParameters) -> Result<Box<dyn AudioDecoder>, String> {
     symphonia::default::get_codecs()
         .make_audio_decoder(params, &AudioDecoderOptions::default())
@@ -1293,13 +1334,57 @@ impl Coded {
                 .as_ref()
                 .map_or(1, |c| u16::try_from(c.count()).unwrap_or(u16::MAX))
                 .max(1),
-            bits: params.bits_per_sample.and_then(|b| u16::try_from(b).ok()),
+            bits: alac_bits(&params)
+                .or_else(|| params.bits_per_sample.and_then(|b| u16::try_from(b).ok())),
             frames_hint,
             next: Some(0),
             pending: None,
             decoded: Vec::new(),
             params,
         })
+    }
+
+    /// How the track keeps its samples.
+    pub fn coding(&self) -> Coding {
+        let codec = self.params.codec;
+        let lossy = [
+            CODEC_ID_MP1,
+            CODEC_ID_MP2,
+            CODEC_ID_MP3,
+            CODEC_ID_AAC,
+            CODEC_ID_VORBIS,
+            CODEC_ID_OPUS,
+            CODEC_ID_ADPCM_G722,
+            CODEC_ID_ADPCM_G726,
+            CODEC_ID_ADPCM_G726LE,
+            CODEC_ID_ADPCM_MS,
+            CODEC_ID_ADPCM_IMA_WAV,
+            CODEC_ID_ADPCM_IMA_QT,
+        ];
+        let float = [
+            CODEC_ID_PCM_F32LE,
+            CODEC_ID_PCM_F32LE_PLANAR,
+            CODEC_ID_PCM_F32BE,
+            CODEC_ID_PCM_F32BE_PLANAR,
+            CODEC_ID_PCM_F64LE,
+            CODEC_ID_PCM_F64LE_PLANAR,
+            CODEC_ID_PCM_F64BE,
+            CODEC_ID_PCM_F64BE_PLANAR,
+        ];
+        if lossy.contains(&codec) {
+            Coding::Lossy
+        } else if float.contains(&codec) {
+            Coding::Float
+        } else {
+            // PCM in whole numbers, FLAC and ALAC. A-law and mu-law keep 8
+            // bits a sample, which decode to 13 and 14: 16 holds them.
+            let companded = [CODEC_ID_PCM_ALAW, CODEC_ID_PCM_MULAW].contains(&codec);
+            Coding::Int(if companded {
+                16
+            } else {
+                self.bits.unwrap_or(16)
+            })
+        }
     }
 
     /// Whether the decoder remembers more of what it decoded than a reset

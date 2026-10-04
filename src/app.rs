@@ -16,6 +16,7 @@ use eframe::egui::{
 use serde::{Deserialize, Serialize};
 
 use crate::audio::{self, Loaded};
+use crate::convert_ui::{self, Converter};
 use crate::edit::Edits;
 use crate::explorer::{Explorer, Parts, Shortcut};
 use crate::export;
@@ -145,6 +146,8 @@ struct Settings {
     pitch: f32,
     /// Folders and files kept at the top of the explorer.
     shortcuts: Vec<Shortcut>,
+    /// What the Convert view converts to, and from.
+    convert: convert_ui::Setup,
 }
 
 /// How the areas picked on the spectrogram are drawn, as the window the
@@ -211,6 +214,7 @@ impl Default for Settings {
             tools: Tools::default(),
             pitch: 0.0,
             shortcuts: Vec::new(),
+            convert: convert_ui::Setup::default(),
         }
     }
 }
@@ -264,6 +268,9 @@ struct Views {
     meters: bool,
     /// The short form for renaming the files in the explorer's folder.
     rename: bool,
+    /// Converting the file open, or files in the explorer's folder, to
+    /// another format.
+    convert: bool,
     /// The explorer's search, and its shortcuts.
     search: bool,
     shortcuts: bool,
@@ -279,6 +286,7 @@ impl Default for Views {
             metadata: false,
             meters: true,
             rename: false,
+            convert: false,
             search: true,
             shortcuts: true,
         }
@@ -542,6 +550,7 @@ pub struct App {
     /// A marker just made, whose name box takes the keyboard once drawn.
     name_next: Option<u32>,
     renamer: Renamer,
+    converter: Converter,
     /// The window with every rename rule is open.
     rename_window: bool,
     /// The window setting how areas look is open.
@@ -659,12 +668,14 @@ impl App {
             marker_grab: None,
             name_next: None,
             renamer: Renamer::default(),
+            converter: Converter::default(),
             rename_window: false,
             area_window: false,
             mute: Vec::new(),
             regions: Vec::new(),
             drawing: None,
         };
+        app.converter.setup = app.settings.convert;
         if let Some(path) = initial.or_else(|| app.inbox.latest()) {
             app.open_external(&cc.egui_ctx, path);
         }
@@ -2195,6 +2206,9 @@ impl App {
                 {
                     self.rename_window = !self.rename_window;
                 }
+                ui.checkbox(&mut views.convert, "Convert").on_hover_text(
+                    "Converts the file open, or files in the explorer's folder, to another format, taking every tag, picture and marker along wherever the format has a place for it. The originals stay as they are.",
+                );
             });
             ui.horizontal_wrapped(|ui| {
                 let tools = &mut self.settings.tools;
@@ -2746,6 +2760,7 @@ impl App {
             (views.markers, "markers", Self::markers_view),
             (views.metadata, "metadata", Self::metadata_view),
             (views.rename, "rename", Self::rename_view),
+            (views.convert, "convert", Self::convert_view),
         ]
         .into_iter()
         .filter(|(on, _, _)| *on)
@@ -2755,18 +2770,31 @@ impl App {
             return;
         };
         // Split only once a file is open: until then the column is taller
-        // than it will be with the meters beneath it, and a
-        // split keeps the size it is first given. Renaming needs no file,
-        // so it shows on its own until then.
-        if self.current.is_none() {
-            let alone = if views.rename {
-                Self::rename_view as View
-            } else {
-                top
-            };
-            alone(self, ui);
-            return;
-        }
+        // than it will be with the meters beneath it, and a split keeps
+        // the size it is first given. Renaming and converting need no
+        // file, so they show on their own until then, split between them
+        // when both are on.
+        let shown = if self.current.is_none() {
+            let fileless: Vec<(&str, View)> = shown
+                .iter()
+                .copied()
+                .filter(|(id, _)| matches!(*id, "rename" | "convert"))
+                .collect();
+            match fileless.len() {
+                0 => {
+                    top(self, ui);
+                    return;
+                }
+                1 => {
+                    (fileless[0].1)(self, ui);
+                    return;
+                }
+                _ => fileless,
+            }
+        } else {
+            shown
+        };
+        let top = shown[0].1;
         // Each set of views keeps splits of its own, so one switched on
         // starts with an even share rather than squeezing the others.
         let set: Vec<&str> = shown.iter().map(|(id, _)| *id).collect();
@@ -2782,6 +2810,13 @@ impl App {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| top(self, ui));
+    }
+
+    fn convert_view(&mut self, ui: &mut egui::Ui) {
+        Self::claim(ui);
+        ui.add_space(4.0);
+        let (dirty, locked) = (self.dirty(), self.saving.is_some());
+        self.converter.ui(ui, self.file.as_deref(), dirty, locked);
     }
 
     fn rename_view(&mut self, ui: &mut egui::Ui) {
@@ -3637,6 +3672,18 @@ impl eframe::App for App {
         if self.settings.views.rename || self.rename_window {
             self.renamer.follow(self.explorer.root(), &ctx);
         }
+        if self.settings.views.convert || self.converter.busy() {
+            let open = self.file.clone();
+            let grown = self
+                .converter
+                .follow(self.explorer.root(), open.as_deref(), &ctx);
+            for folder in &grown {
+                self.explorer.forget(folder);
+            }
+            if !grown.is_empty() && (self.settings.views.rename || self.rename_window) {
+                self.renamer.refresh(&ctx);
+            }
+        }
         self.input(&ctx);
         self.controls.clear();
         self.follow_playback(&ctx);
@@ -3659,7 +3706,7 @@ impl eframe::App for App {
             &self.saving,
             &self.exporting,
         ];
-        if busy.iter().any(|job| job.is_some()) {
+        if busy.iter().any(|job| job.is_some()) || self.converter.busy() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         if let Some(left) = self
@@ -3700,7 +3747,8 @@ impl eframe::App for App {
         }
         self.refresh_textures(&ctx);
         let central = views.spectrogram || views.waveform;
-        let side = views.spectrum || views.markers || views.metadata || views.rename;
+        let side =
+            views.spectrum || views.markers || views.metadata || views.rename || views.convert;
         if central && side {
             egui::Panel::right("side")
                 .resizable(true)
@@ -3745,6 +3793,7 @@ impl eframe::App for App {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.settings.folder = self.explorer.root().map(Path::to_owned);
+        self.settings.convert = self.converter.setup;
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
     }
 }

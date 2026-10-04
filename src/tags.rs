@@ -378,7 +378,7 @@ fn fourcc(key: &str) -> Option<[u8; 4]> {
     bytes.try_into().ok()
 }
 
-fn fourcc_key(code: &[u8; 4]) -> String {
+pub(crate) fn fourcc_key(code: &[u8; 4]) -> String {
     code.iter().map(|&b| char::from(b)).collect()
 }
 
@@ -450,7 +450,7 @@ pub fn wav_id3(path: &Path) -> Result<Option<Block>, String> {
     Ok(tag.as_ref().map(|t| id3v2_block(Some(t))))
 }
 
-fn wav_id3v2(path: &Path) -> Result<Option<Id3v2Tag>, String> {
+pub(crate) fn wav_id3v2(path: &Path) -> Result<Option<Id3v2Tag>, String> {
     let mut file = File::open(path).map_err(|e| format!("cannot open: {e}"))?;
     let wav = WavFile::read_from(&mut file, ParseOptions::new().read_properties(false))
         .map_err(|e| format!("its ID3 tag cannot be read: {e}"))?;
@@ -731,7 +731,7 @@ fn set_id3v2_text(frame: &mut Frame<'_>, value: &str, encoding: TextEncoding) {
     }
 }
 
-fn new_id3v2_frame(
+pub(crate) fn new_id3v2_frame(
     key: &str,
     value: &str,
     encoding: TextEncoding,
@@ -940,7 +940,7 @@ fn mp4_block(tag: Option<&Ilst>) -> Block {
     Block::new(Kind::Mp4, fields, other)
 }
 
-fn mp4_ident(key: &str) -> Result<AtomIdent<'static>, String> {
+pub(crate) fn mp4_ident(key: &str) -> Result<AtomIdent<'static>, String> {
     match key.strip_prefix("----:").and_then(|r| r.split_once(':')) {
         Some((mean, name)) => Ok(AtomIdent::Freeform {
             mean: mean.to_owned().into(),

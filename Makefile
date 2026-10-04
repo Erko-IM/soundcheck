@@ -205,12 +205,16 @@ fetch = mkdir -p $(@D) && curl -fsSL -o $@.part $(1) && echo "$(2)  $@.part" | s
 
 # Cross-built with MinGW, as Microsoft's tools run on Windows only, and
 # named as the Windows build names it. cargo-packager warns twice that it can
-# sign the exe only on Windows; it isn't signed there either.
+# sign the exe only on Windows; it isn't signed there either. LAME, which
+# writes MP3s, configures itself for the machine it builds on unless
+# MP3LAME_SYS_OVERRIDE_HOST names another; so here, and for the Linux
+# packages below, it is told what the packages are for.
 exe: packager
 	@$(CARGO_BIN)rustup target list --installed | grep -qx x86_64-pc-windows-gnu \
 		|| $(CARGO_BIN)rustup target add x86_64-pc-windows-gnu
 	rm -f target/packages/*-setup.exe
-	env CARGO_BUILD_TARGET=x86_64-pc-windows-gnu $(CARGO_BIN)cargo packager --release --formats nsis --target x86_64-pc-windows-gnu
+	env CARGO_BUILD_TARGET=x86_64-pc-windows-gnu MP3LAME_SYS_OVERRIDE_HOST=x86_64-w64-mingw32 \
+		$(CARGO_BIN)cargo packager --release --formats nsis --target x86_64-pc-windows-gnu
 	cp target/packages/*-setup.exe soundcheck-setup.exe
 	@echo "built $(CURDIR)/soundcheck-setup.exe"
 
@@ -227,7 +231,8 @@ linux: packager $(APPIMAGETOOL) $(APPIMAGE_RUNTIME)
 	@$(CARGO_BIN)rustup target list --installed | grep -qx $(LINUX_TARGET) \
 		|| $(CARGO_BIN)rustup target add $(LINUX_TARGET)
 	rm -f target/packages/*.deb
-	env CARGO_BUILD_TARGET=$(LINUX_TARGET) $(CARGO_BIN)cargo packager --release --formats deb --target $(LINUX_TARGET)
+	env CARGO_BUILD_TARGET=$(LINUX_TARGET) MP3LAME_SYS_OVERRIDE_HOST=$(LINUX_ARCH)-linux-gnu \
+		$(CARGO_BIN)cargo packager --release --formats deb --target $(LINUX_TARGET)
 	cp target/packages/*.deb soundcheck.deb
 	rm -rf $(BUILD)/AppDir
 	mkdir -p $(BUILD)/AppDir/usr/bin

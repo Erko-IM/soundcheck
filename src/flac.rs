@@ -1002,7 +1002,7 @@ const fn crc8_table() -> [u8; 256] {
 
 const CRC8: [u8; 256] = crc8_table();
 
-fn crc8(bytes: &[u8]) -> u8 {
+pub(crate) fn crc8(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0, |crc, &b| CRC8[usize::from(crc ^ b)])
 }
 
@@ -1041,7 +1041,7 @@ const fn crc16_tables() -> [[u16; 256]; 8] {
 const CRC16: [[u16; 256]; 8] = crc16_tables();
 
 /// The checksum a frame ends with.
-fn crc16(bytes: &[u8]) -> u16 {
+pub(crate) fn crc16(bytes: &[u8]) -> u16 {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("aes") {
         // SAFETY: the processor multiplies without carrying, as just asked.

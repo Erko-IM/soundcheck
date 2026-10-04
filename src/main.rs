@@ -4,6 +4,8 @@
 
 mod app;
 mod audio;
+mod convert;
+mod convert_ui;
 mod cpu;
 mod edit;
 mod explorer;
