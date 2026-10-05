@@ -1,0 +1,75 @@
+name: CI
+
+# Every check `make ci` runs on a Mac, here on each platform's own runner:
+# each step past the setup is a make target, the same command in both places,
+# and lefthook (lefthook.yml) runs the ones for what a push changes before it
+# goes out. Run by hand, as the Mac checks each push; what it adds is
+# Windows, whose tests run nowhere else.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml names the version, mise.toml the other tools.
+      - name: Install Rust
+        run: rustup toolchain install --no-self-update
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+
+      # For the Intel build's tests.
+      - name: Install Rosetta
+        run: softwareupdate --install-rosetta --agree-to-license
+
+      - name: Workflows
+        run: make ci.workflows
+      - name: Install script
+        run: make ci.scripts
+      - name: Dependencies
+        run: make ci.deps
+      - name: Formatting and lints
+        run: make ci.lint
+      - name: Tests on Apple silicon and Intel
+        run: make ci.test.mac
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install --no-self-update
+      - name: Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      # GitHub's x86 runners have AVX2 and the rest of what the second copies
+      # of the hot code take (src/cpu.rs), so a test fails if they go unrun.
+      - name: Lints and tests on Linux
+        env:
+          SOUNDCHECK_V3: "1"
+        run: make ci.test.linux
+
+  windows:
+    runs-on: windows-2025
+    # make's recipes need Git Bash, which PowerShell, the default, isn't.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install --no-self-update
+      - name: Install make
+        run: choco install make --no-progress -y
+      - name: Lints and tests on Windows
+        run: make ci.test.windows

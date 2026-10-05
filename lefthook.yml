@@ -1,0 +1,59 @@
+# The git hook `make hooks` installs: before each push, the checks for what
+# the push changes, as the make targets the CI workflow
+# (.github/workflows/ci.yml) runs too. `make ci` runs them all.
+#
+# Skip them for one push with: LEFTHOOK=0 git push
+
+pre-push:
+  # One at a time, each one's output as it comes, stopping at the first to
+  # fail.
+  piped: true
+  follow: true
+  commands:
+    # Anything that isn't text for people, the workflows, the install
+    # scripts or these hooks' own settings goes into the build or its tests.
+    rust:
+      priority: 1
+      exclude:
+        - "*.md"
+        - "**/*.md"
+        - "LICENSE"
+        - ".gitignore"
+        - ".github/**"
+        - "install.sh"
+        - "install.ps1"
+        - "lefthook.yml"
+        - "mise.toml"
+        - "deny.toml"
+      run: make ci.committed ci.rust
+    deps:
+      priority: 2
+      glob:
+        - "Cargo.toml"
+        - "Cargo.lock"
+        - "deny.toml"
+        - "mise.toml"
+      run: make ci.committed ci.deps
+    workflows:
+      priority: 3
+      glob:
+        - ".github/workflows/*"
+        - "mise.toml"
+      run: make ci.committed ci.workflows
+    scripts:
+      priority: 4
+      glob:
+        - "install.sh"
+        - "mise.toml"
+      run: make ci.committed ci.scripts
+    # What builds the installers. A release builds them itself, so its
+    # version bump in Cargo.toml doesn't count here.
+    packages:
+      priority: 5
+      glob:
+        - "Makefile"
+        - "build.rs"
+        - "packaging/*"
+      exclude:
+        - "packaging/*.md"
+      run: make ci.committed packages
