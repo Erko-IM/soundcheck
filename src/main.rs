@@ -41,9 +41,7 @@ fn main() -> eframe::Result {
             .with_title("soundcheck")
             .with_inner_size([1440.0, 880.0])
             .with_min_inner_size([900.0, 520.0])
-            // Empty, so eframe keeps its own logo out of the Dock: putting it
-            // there holds up the first frame by about 16 ms.
-            .with_icon(egui::IconData::default()),
+            .with_icon(window_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -51,4 +49,26 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc, initial, inbox)))),
     )
+}
+
+/// Empty on a Mac, where the Dock shows the app bundle's icon: that keeps
+/// eframe's own logo out of the Dock, as putting it there holds up the first
+/// frame by about 16 ms.
+#[cfg(target_os = "macos")]
+fn window_icon() -> egui::IconData {
+    egui::IconData::default()
+}
+
+/// The window's icon on Windows and Linux, as build.rs made it from
+/// packaging/icon.png.
+#[cfg(not(target_os = "macos"))]
+fn window_icon() -> egui::IconData {
+    let rgba = include_bytes!(concat!(env!("OUT_DIR"), "/window-icon.rgba")).to_vec();
+    // Square, at four bytes a pixel.
+    let side = ((rgba.len() / 4) as f64).sqrt() as u32;
+    egui::IconData {
+        rgba,
+        width: side,
+        height: side,
+    }
 }

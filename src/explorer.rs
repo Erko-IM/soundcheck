@@ -38,10 +38,24 @@ struct Entry {
     is_dir: bool,
 }
 
-/// Why a folder could not be read: short enough for a row, and in full.
+/// Why a folder could not be read: short enough for a row, and in full,
+/// and the place in System Settings that lets soundcheck in, if any.
 struct Unreadable {
     label: &'static str,
     why: String,
+    settings: Option<&'static str>,
+}
+
+/// System Settings at Full Disk Access, which lets an app into every folder.
+/// No app can turn it on for itself, nor have macOS ask about it.
+const FULL_DISK_ACCESS: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
+
+/// A folder as read: what the tree shows of it, and how many other files
+/// are there, none a recording soundcheck opens.
+struct Listing {
+    entries: Vec<Entry>,
+    others: usize,
 }
 
 /// EPERM: what macOS refuses an app a folder with until its privacy
@@ -51,20 +65,23 @@ const NOT_PERMITTED: i32 = 1;
 
 /// Folders and audio files directly inside `dir`: folders first, then in
 /// file-manager order, dotfiles hidden. Or why it could not be read.
-fn list(dir: &Path) -> Result<Vec<Entry>, Unreadable> {
+fn list(dir: &Path) -> Result<Listing, Unreadable> {
     let entries = std::fs::read_dir(dir).map_err(|e| {
         if cfg!(target_os = "macos") && e.raw_os_error() == Some(NOT_PERMITTED) {
             Unreadable {
                 label: "Not allowed to read this folder",
-                why: "macOS keeps soundcheck out of it. In System Settings, Privacy & Security, Files & Folders lets soundcheck into Downloads, Desktop, Documents and cards; anything else macOS guards, as the Photos library or Mail, only Full Disk Access opens. It is read again on coming back to soundcheck".into(),
+                why: "macOS keeps soundcheck out of it. Click to open System Settings at Full Disk Access, and turn soundcheck on there, adding it with + if it isn't listed: then it can read every folder. macOS lets no app turn that on for itself. Back in soundcheck, the folder is read again".into(),
+                settings: Some(FULL_DISK_ACCESS),
             }
         } else {
             Unreadable {
                 label: "Can't read this folder",
                 why: e.to_string(),
+                settings: None,
             }
         }
     })?;
+    let mut others = 0;
     let mut listed: Vec<(String, Entry)> = entries
         .flatten()
         .filter_map(|e| {
@@ -80,7 +97,11 @@ fn list(dir: &Path) -> Result<Vec<Entry>, Unreadable> {
                 Ok(t) => t.is_dir(),
                 Err(_) => false,
             };
-            (is_dir || is_audio(&path)).then(|| (name.to_lowercase(), Entry { path, name, is_dir }))
+            if !is_dir && !is_audio(&path) {
+                others += 1;
+                return None;
+            }
+            Some((name.to_lowercase(), Entry { path, name, is_dir }))
         })
         .collect();
     listed.sort_by(|(a, ea), (b, eb)| {
@@ -89,7 +110,10 @@ fn list(dir: &Path) -> Result<Vec<Entry>, Unreadable> {
             .then_with(|| natural(a, b))
             .then_with(|| ea.name.cmp(&eb.name))
     });
-    Ok(listed.into_iter().map(|(_, entry)| entry).collect())
+    Ok(Listing {
+        entries: listed.into_iter().map(|(_, entry)| entry).collect(),
+        others,
+    })
 }
 
 /// How far a two-finger swipe goes, in points, to count.
@@ -237,6 +261,12 @@ enum Row<'a> {
         depth: usize,
         why: &'a Unreadable,
     },
+    /// A folder with no folder or recording in it, and how many other
+    /// files it holds.
+    Nothing {
+        depth: usize,
+        others: usize,
+    },
 }
 
 enum Action {
@@ -267,7 +297,7 @@ pub struct Explorer {
     /// `None` is the list of drives on Windows, and nothing elsewhere.
     root: Option<PathBuf>,
     /// Folders read so far; `None` while a read is under way.
-    listings: HashMap<PathBuf, Option<Result<Vec<Entry>, Unreadable>>>,
+    listings: HashMap<PathBuf, Option<Result<Listing, Unreadable>>>,
     open: HashSet<PathBuf>,
     /// The file open, or the folder the arrow keys last moved to.
     pub selected: Option<PathBuf>,
@@ -278,8 +308,8 @@ pub struct Explorer {
     /// How far down the rows were scrolled last frame, and how much of
     /// them showed.
     scrolled: (f32, f32),
-    tx: mpsc::Sender<(PathBuf, Result<Vec<Entry>, Unreadable>)>,
-    rx: mpsc::Receiver<(PathBuf, Result<Vec<Entry>, Unreadable>)>,
+    tx: mpsc::Sender<(PathBuf, Result<Listing, Unreadable>)>,
+    rx: mpsc::Receiver<(PathBuf, Result<Listing, Unreadable>)>,
     search: Search,
     /// The search's matches show in place of the tree.
     searching: bool,
@@ -400,7 +430,7 @@ impl Explorer {
             .iter()
             .filter_map(|row| match row {
                 Row::Entry { entry, .. } => Some(*entry),
-                Row::Loading { .. } | Row::Unreadable { .. } => None,
+                Row::Loading { .. } | Row::Unreadable { .. } | Row::Nothing { .. } => None,
             })
             .collect();
         let at = self
@@ -431,7 +461,14 @@ impl Explorer {
         unread: &mut Vec<PathBuf>,
     ) {
         let entries = match self.listings.get(dir) {
-            Some(Some(Ok(entries))) => entries,
+            Some(Some(Ok(listing))) if listing.entries.is_empty() => {
+                rows.push(Row::Nothing {
+                    depth,
+                    others: listing.others,
+                });
+                return;
+            }
+            Some(Some(Ok(listing))) => &listing.entries,
             Some(Some(Err(why))) => {
                 rows.push(Row::Unreadable { depth, why });
                 return;
@@ -772,7 +809,32 @@ impl Explorer {
                     Row::Unreadable { depth, why } => {
                         let (response, _) =
                             draw_row(ui, *depth, height, why.label, None, false, true);
-                        response.on_hover_text(&why.why);
+                        let response = response.on_hover_text(&why.why);
+                        if let Some(settings) = why.settings {
+                            let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if response.clicked() {
+                                // open is part of macOS, and System Settings
+                                // shows itself, or its own error.
+                                let _ = std::process::Command::new("/usr/bin/open")
+                                    .arg(settings)
+                                    .spawn();
+                            }
+                        }
+                        continue;
+                    }
+                    Row::Nothing { depth, others } => {
+                        let label = if *others == 0 {
+                            "Empty folder"
+                        } else {
+                            "No sound files in this folder"
+                        };
+                        let (response, _) = draw_row(ui, *depth, height, label, None, false, true);
+                        if *others > 0 {
+                            let files = if *others == 1 { "file" } else { "files" };
+                            response.on_hover_text(format!(
+                                "{others} other {files} here, none a recording soundcheck opens: it opens WAV, FLAC, MP3, M4A, AAC, Ogg, AIFF, CAF, MKA and WebM files"
+                            ));
+                        }
                         continue;
                     }
                 };
@@ -1205,14 +1267,11 @@ mod tests {
         for name in ["ZOOM0010.WAV", "zoom0002.wav", "notes.txt", ".hidden.wav"] {
             std::fs::write(dir.join(name), b"").unwrap();
         }
-        let names: Vec<String> = list(&dir)
-            .ok()
-            .unwrap()
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
+        let listing = list(&dir).ok().unwrap();
+        let names: Vec<String> = listing.entries.into_iter().map(|e| e.name).collect();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(names, ["Day 9", "Day 10", "zoom0002.wav", "ZOOM0010.WAV"]);
+        assert_eq!(listing.others, 1, "notes.txt, the dotfile hidden");
     }
 
     #[cfg(unix)]
@@ -1242,6 +1301,39 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_with_nothing_to_show_says_so() {
+        let dir = std::env::temp_dir().join(format!("soundcheck-nothing-{}", std::process::id()));
+        let (empty, others) = (dir.join("empty"), dir.join("catalog"));
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&others).unwrap();
+        for name in [
+            "MusicCatalogData.db",
+            "MusicCatalogData.db-shm",
+            ".DS_Store",
+        ] {
+            std::fs::write(others.join(name), b"").unwrap();
+        }
+        let mut explorer = Explorer::default();
+        explorer.set_root(&dir);
+        for folder in [&dir, &empty, &others] {
+            explorer.open.insert(folder.clone());
+            explorer.listings.insert(folder.clone(), Some(list(folder)));
+        }
+        let (rows, _) = explorer.listed(&[]);
+        let nothing: Vec<usize> = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Nothing { others, .. } => Some(*others),
+                _ => None,
+            })
+            .collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        // The catalog first, as the tree sorts it: two files, the dotfile
+        // left out as the tree leaves it out.
+        assert_eq!(nothing, [2, 0]);
+    }
+
+    #[test]
     fn a_folder_kept_out_is_read_again_on_coming_back_to_the_window() {
         let dir = std::env::temp_dir().join(format!("soundcheck-back-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1250,6 +1342,7 @@ mod tests {
         let kept_out = Unreadable {
             label: "Not allowed to read this folder",
             why: String::new(),
+            settings: None,
         };
         explorer.listings.insert(dir.clone(), Some(Err(kept_out)));
         let ctx = egui::Context::default();
