@@ -56,7 +56,7 @@ fn list(dir: &Path) -> Result<Vec<Entry>, Unreadable> {
         if cfg!(target_os = "macos") && e.raw_os_error() == Some(NOT_PERMITTED) {
             Unreadable {
                 label: "Not allowed to read this folder",
-                why: "macOS keeps soundcheck out of it until soundcheck is turned on for it in System Settings, Privacy & Security, Files & Folders. It is read again on coming back to soundcheck".into(),
+                why: "macOS keeps soundcheck out of it. In System Settings, Privacy & Security, Files & Folders lets soundcheck into Downloads, Desktop, Documents and cards; anything else macOS guards, as the Photos library or Mail, only Full Disk Access opens. It is read again on coming back to soundcheck".into(),
             }
         } else {
             Unreadable {
@@ -90,6 +90,87 @@ fn list(dir: &Path) -> Result<Vec<Entry>, Unreadable> {
             .then_with(|| ea.name.cmp(&eb.name))
     });
     Ok(listed.into_iter().map(|(_, entry)| entry).collect())
+}
+
+/// How far a two-finger swipe goes, in points, to count.
+const SWIPE: f32 = 100.0;
+
+/// A run of scrolling that starts this soon after the fingers lift is the
+/// slide macOS goes on with, not a swipe of its own.
+const SLIDE: f64 = 0.1;
+
+/// Whether a trackpad moves what it scrolls the way the fingers go, as
+/// macOS's natural scrolling does unless switched off. Elsewhere there is no
+/// one setting to ask, and it is taken to.
+pub fn natural_scrolling() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_foundation::{NSUserDefaults, ns_string};
+        let defaults = NSUserDefaults::standardUserDefaults();
+        let key = ns_string!("com.apple.swipescrolldirection");
+        defaults.objectForKey(key).is_none() || defaults.boolForKey(key)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// Two-finger swipes on a trackpad, told apart from scrolling. One with the
+/// fingers going right, as a browser goes back on, counts as they lift; the
+/// slide on after them does not count again.
+#[derive(Default)]
+pub struct Swipe {
+    /// How far the fingers have gone since they went down.
+    travel: Vec2,
+    touching: bool,
+    /// When the fingers last lifted.
+    lifted: Option<f64>,
+}
+
+impl Swipe {
+    /// Takes in a frame's `events`, at `now`, and says whether a swipe
+    /// right ended among them. `natural` says whether what scrolls moves
+    /// the way the fingers go.
+    pub fn right(&mut self, events: &[egui::Event], now: f64, natural: impl Fn() -> bool) -> bool {
+        let mut swiped = false;
+        for event in events {
+            let egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta,
+                phase,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            match phase {
+                egui::TouchPhase::Start => {
+                    self.touching = self.lifted.is_none_or(|t| now - t > SLIDE);
+                    self.travel = Vec2::ZERO;
+                }
+                egui::TouchPhase::Move => {
+                    if self.touching {
+                        self.travel += *delta;
+                    }
+                }
+                egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                    if std::mem::take(&mut self.touching) {
+                        self.lifted = Some(now);
+                        if *phase == egui::TouchPhase::End {
+                            let right = if natural() {
+                                self.travel.x
+                            } else {
+                                -self.travel.x
+                            };
+                            swiped |= right >= SWIPE && right > 2.0 * self.travel.y.abs();
+                        }
+                    }
+                }
+            }
+        }
+        swiped
+    }
 }
 
 /// Compares names the way file managers do: a run of digits by its value,
@@ -923,6 +1004,160 @@ fn paint_triangle(painter: &egui::Painter, rect: Rect, open: bool, color: Color3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_swipe_right_counts_once_and_scrolling_never() {
+        let wheel = |phase, x: f32, y: f32| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: Vec2::new(x, y),
+            phase,
+            modifiers: egui::Modifiers::NONE,
+        };
+        use egui::TouchPhase::{End, Move, Start};
+        let natural = || true;
+        let mut swipe = Swipe::default();
+        assert!(!swipe.right(
+            &[wheel(Start, 0.0, 0.0), wheel(Move, 60.0, 4.0)],
+            1.0,
+            natural
+        ));
+        assert!(swipe.right(
+            &[wheel(Move, 70.0, -3.0), wheel(End, 0.0, 0.0)],
+            1.05,
+            natural
+        ));
+        // The slide macOS goes on with as the fingers lift is not a second.
+        assert!(!swipe.right(
+            &[wheel(Start, 0.0, 0.0), wheel(Move, 400.0, 0.0)],
+            1.08,
+            natural
+        ));
+        assert!(!swipe.right(&[wheel(End, 0.0, 0.0)], 1.6, natural));
+        // A swipe of its own counts again.
+        assert!(swipe.right(
+            &[
+                wheel(Start, 0.0, 0.0),
+                wheel(Move, 150.0, 0.0),
+                wheel(End, 0.0, 0.0)
+            ],
+            3.0,
+            natural
+        ));
+        // Scrolling the list, swiping left, or the fingers lifting short.
+        for moved in [(20.0, 300.0), (-150.0, 0.0), (60.0, 0.0)] {
+            assert!(!swipe.right(
+                &[
+                    wheel(Start, 0.0, 0.0),
+                    wheel(Move, moved.0, moved.1),
+                    wheel(End, 0.0, 0.0)
+                ],
+                5.0,
+                natural
+            ));
+        }
+        // A mouse wheel's notches are no swipe, however far they go.
+        let notches = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: Vec2::new(500.0, 0.0),
+            phase: Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert!(!swipe.right(&[notches], 9.0, natural));
+        // With natural scrolling off, the fingers going right move what
+        // scrolls to the left.
+        let swiped = |x| {
+            Swipe::default().right(
+                &[
+                    wheel(Start, 0.0, 0.0),
+                    wheel(Move, x, 0.0),
+                    wheel(End, 0.0, 0.0),
+                ],
+                1.0,
+                || false,
+            )
+        };
+        assert!(swiped(-150.0) && !swiped(150.0));
+    }
+
+    /// Two clicks on the folder `name`, the second coming `apart` seconds
+    /// after the first, with egui told double-clicks come within `system`
+    /// seconds: where the explorer is rooted after.
+    fn double_click(name: &str, apart: f64, system: f64) -> Option<PathBuf> {
+        let dir = std::env::temp_dir().join(format!(
+            "soundcheck-double-{}-{}",
+            std::process::id(),
+            (system * 1000.0) as u32
+        ));
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        ctx.options_mut(|o| o.input_options.max_double_click_delay = system);
+        let mut explorer = Explorer::default();
+        explorer.set_root(&dir);
+        let frame = |explorer: &mut Explorer, time: f64, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                time: Some(time),
+                events,
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                explorer.ui(
+                    ui,
+                    Parts {
+                        shortcuts: None,
+                        search: false,
+                    },
+                );
+            });
+            output.textures_delta.clear();
+            output
+        };
+        // Its row, once the folder around it is read.
+        let mut time = 0.0;
+        let at = loop {
+            let output = frame(&mut explorer, time, Vec::new());
+            let row = output.platform_output.accesskit_update.and_then(|update| {
+                update
+                    .nodes
+                    .into_iter()
+                    .find(|(_, node)| node.label() == Some(name))
+                    .and_then(|(_, node)| node.bounds())
+            });
+            if let Some(b) = row {
+                break egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+            }
+            assert!(time < 10.0, "the folder never showed");
+            time += 0.01;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            &mut explorer,
+            time + 1.0,
+            vec![egui::Event::PointerMoved(at), button(true)],
+        );
+        frame(&mut explorer, time + 1.05, vec![button(false)]);
+        frame(&mut explorer, time + 1.0 + apart, vec![button(true)]);
+        frame(&mut explorer, time + 1.05 + apart, vec![button(false)]);
+        let root = explorer.root().map(Path::to_owned);
+        std::fs::remove_dir_all(&dir).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_folder_double_clicked_at_the_pace_the_system_takes_opens_as_the_root() {
+        // 0.35 s apart, slower than egui's own 0.3 s: two single clicks to
+        // it, which opened the folder and closed it again.
+        let opened = double_click("Day 1", 0.35, 0.5).unwrap();
+        assert!(opened.ends_with("Day 1"), "{opened:?}");
+        let not = double_click("Day 2", 0.35, 0.3).unwrap();
+        assert!(!not.ends_with("Day 2"), "{not:?}");
+    }
 
     #[test]
     fn numbers_sort_by_value() {

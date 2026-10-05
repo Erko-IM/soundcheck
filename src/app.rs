@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::audio::{self, Loaded};
 use crate::convert_ui::{self, Converter};
 use crate::edit::Edits;
-use crate::explorer::{Explorer, Parts, Shortcut};
+use crate::explorer::{self, Explorer, Parts, Shortcut, Swipe};
 use crate::export;
 use crate::finder::Inbox;
 use crate::levels::{FLOOR_DB, Level};
@@ -470,6 +470,7 @@ struct Released {
 pub struct App {
     settings: Settings,
     explorer: Explorer,
+    swipe: Swipe,
     inbox: Inbox,
     tx: mpsc::Sender<Job>,
     rx: mpsc::Receiver<Job>,
@@ -605,9 +606,32 @@ impl FreqAxis {
     }
 }
 
+/// How far apart two clicks may come and still make a double-click, as the
+/// system is set: egui's own 0.3 s, from release to release, is quicker than
+/// many people click, so a folder double-clicked opened and closed again.
+fn double_click_delay() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        objc2_app_kit::NSEvent::doubleClickInterval()
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: takes no arguments and only returns a number.
+        let ms = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
+        f64::from(ms) / 1000.0
+    }
+    // GNOME's and KDE's own, as Linux keeps no one setting for it.
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        0.4
+    }
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>, inbox: Inbox) -> Self {
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
+        cc.egui_ctx
+            .options_mut(|o| o.input_options.max_double_click_delay = double_click_delay());
         inbox.connect(&cc.egui_ctx);
         let settings = cc
             .storage
@@ -618,6 +642,7 @@ impl App {
         let mut app = Self {
             settings,
             explorer: Explorer::default(),
+            swipe: Swipe::default(),
             inbox,
             tx,
             rx,
@@ -1896,6 +1921,26 @@ impl App {
             self.open_external(ctx, path);
         }
         self.pick(ctx);
+        // The mouse's back button and a two-finger swipe to the right take
+        // the explorer a folder up, as they go back in a browser, while it
+        // is under the pointer or picked; Backspace does too, below.
+        let over_explorer = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
+            self.controls
+                .iter()
+                .any(|(c, r)| *c == Control::Explorer && r.contains(p))
+        });
+        let swiped = ctx.input(|i| {
+            self.swipe
+                .right(&i.events, i.time, explorer::natural_scrolling)
+        });
+        let back = ctx.input(|i| {
+            i.pointer.button_pressed(PointerButton::Extra1) || i.key_pressed(Key::BrowserBack)
+        });
+        if (swiped && over_explorer)
+            || (back && (over_explorer || self.picked == Some(Control::Explorer)))
+        {
+            self.explorer.go_up();
+        }
         // egui takes the keyboard from the name box on Esc before the box
         // is drawn, so the box never sees the key itself.
         if self.renaming.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
