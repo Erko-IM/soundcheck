@@ -10,15 +10,29 @@
     $ErrorActionPreference = 'Stop'
     # Windows PowerShell's progress bar slows its downloads to a crawl.
     $ProgressPreference = 'SilentlyContinue'
-    $setup = Join-Path ([IO.Path]::GetTempPath()) 'soundcheck-setup.exe'
-    Invoke-WebRequest 'https://github.com/Erko-IM/soundcheck/releases/latest/download/soundcheck-setup.exe' -OutFile $setup -UseBasicParsing
+    # A folder of its own each time, so an installer from an earlier run that
+    # Windows still holds open never stands in the way of this one.
+    $dir = Join-Path ([IO.Path]::GetTempPath()) "soundcheck-$([guid]::NewGuid())"
+    New-Item -ItemType Directory -Path $dir | Out-Null
+    $setup = Join-Path $dir 'soundcheck-setup.exe'
     try {
+        Invoke-WebRequest 'https://github.com/Erko-IM/soundcheck/releases/latest/download/soundcheck-setup.exe' -OutFile $setup -UseBasicParsing
         $run = Start-Process $setup -ArgumentList '/S' -Wait -PassThru
+        if ($run.ExitCode -ne 0) {
+            throw "soundcheck's installer failed with exit code $($run.ExitCode)"
+        }
+        Write-Host "installed soundcheck, it's in the Start menu"
     } finally {
-        Remove-Item $setup
+        # Windows' virus scanner and its check on installers keep a finished
+        # installer open for a moment. Still held after ten seconds, it stays
+        # in the temp folder rather than fail an install that worked.
+        foreach ($attempt in 1..20) {
+            try {
+                Remove-Item $dir -Recurse -Force
+                break
+            } catch {
+                Start-Sleep -Milliseconds 500
+            }
+        }
     }
-    if ($run.ExitCode -ne 0) {
-        throw "soundcheck's installer failed with exit code $($run.ExitCode)"
-    }
-    Write-Host "installed soundcheck, it's in the Start menu"
 }
