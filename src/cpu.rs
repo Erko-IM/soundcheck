@@ -28,9 +28,9 @@ macro_rules! v3 {
     };
 }
 pub(crate) use v3;
-pub(crate) use v3;
 
 #[cfg(test)]
+
 mod tests {
     /// Run with SOUNDCHECK_V3 set, the tests are on a processor meant to run
     /// the second copies, as `make ci.test.mac` asks of Rosetta: finding it
