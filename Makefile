@@ -23,10 +23,6 @@
 #   sudo apt-get install -y build-essential curl file pkg-config libasound2-dev gcc-mingw-w64-x86-64 nsis
 PACKAGER_VERSION := 0.11.8
 APPS ?= /Applications
-# A code-signing identity from your keychain. Without one, every build is a
-# new app to macOS, and it asks again for access to Documents and to memory
-# cards after each install.
-SIGN ?=
 
 ifeq ($(OS),Windows_NT)
 SYSTEM := Windows
@@ -52,18 +48,30 @@ endif
 ifeq ($(SYSTEM),macOS)
 .PHONY: app install dmg exe linux packages builder release
 
-# Signed ad hoc, which seals the whole app: without it a downloaded copy is
-# "damaged". Here rather than by cargo-packager, which then warns on every
-# build that it could not notarize the app, and never will.
+# A code-signing identity from your keychain to sign the app with, the same
+# for every build: one named soundcheck when the keychain has it. A
+# self-signed one is free (Keychain Access, Certificate Assistant, Create a
+# Certificate, type Code Signing). macOS then knows each build, a release
+# too, as the same app, and the folders and cards it was let into stay open
+# to it through updates. Without one each build is signed ad hoc, a new app
+# to macOS, which asks again.
+SIGN ?= $(shell security find-identity -p codesigning 2>/dev/null | grep -qF '"soundcheck"' && echo soundcheck)
+
+# Signed with SIGN, or ad hoc, which seals the whole app: without it a
+# downloaded copy is "damaged". Here rather than by cargo-packager, which then
+# warns on every build that it could not notarize the app, and never will.
+# Once installed or put in the image, the app built goes: Finder opens
+# recordings with the newest soundcheck.app it has seen, which one left in
+# target would be, rather than the one installed.
 app: packager
 	$(CARGO_BIN)cargo packager --release --formats app
 	xattr -cr target/packages/soundcheck.app
-	codesign --force --sign - --options runtime target/packages/soundcheck.app
+	codesign --force --sign "$(or $(SIGN),-)" --options runtime target/packages/soundcheck.app
 
 install: app
 	rm -rf "$(APPS)/soundcheck.app"
 	ditto target/packages/soundcheck.app "$(APPS)/soundcheck.app"
-	$(if $(SIGN),codesign --force --sign "$(SIGN)" "$(APPS)/soundcheck.app")
+	rm -rf target/packages/soundcheck.app
 	@echo "installed $(APPS)/soundcheck.app"
 
 # Rust's name for the other kind of Mac: Intel on Apple silicon, Apple silicon
@@ -88,13 +96,14 @@ dmg: app
 	ditto target/packages/soundcheck.app target/dmg/soundcheck.app
 	lipo -create -output target/dmg/soundcheck.app/Contents/MacOS/soundcheck \
 		target/release/soundcheck target/$(OTHER_MAC_TARGET)/release/soundcheck
-	codesign --force --sign - --options runtime target/dmg/soundcheck.app
+	codesign --force --sign "$(or $(SIGN),-)" --options runtime target/dmg/soundcheck.app
 	ln -s /Applications target/dmg/Applications
 	if /usr/sbin/diskutil image create from --help 2>/dev/null | grep -q -- --volumeName; then \
 		/usr/sbin/diskutil image create from --format UDZO --volumeName soundcheck target/dmg soundcheck.dmg; \
 	else \
 		hdiutil create -volname soundcheck -srcfolder target/dmg -fs HFS+ -format UDZO -ov soundcheck.dmg; \
 	fi
+	rm -rf target/dmg target/packages/soundcheck.app
 	@echo "built $(CURDIR)/soundcheck.dmg"
 
 # cargo-packager builds the Linux packages on Linux only, so these two run the

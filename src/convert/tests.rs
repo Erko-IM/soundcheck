@@ -204,13 +204,14 @@ fn plan(from: &Path, target: &Target) -> Plan {
         to: path_for(from, target.format, &HashSet::new()),
         shape,
         changes,
+        replaces: false,
     }
 }
 
 fn run(from: &Path, target: &Target) -> PathBuf {
     let plan = plan(from, target);
     let gain = if plan.shape.needs_peak() {
-        fit(peak(from, &AtomicBool::new(false)).unwrap())
+        fit(peak(from, plan.shape.rate, &AtomicBool::new(false)).unwrap())
     } else {
         None
     };
@@ -404,7 +405,7 @@ fn lossy_formats_keep_the_length_the_tags_and_the_markers() {
 #[test]
 fn a_float_file_past_full_scale_is_lowered_to_fit_whole_numbers_and_says_so() {
     let from = tagged_wav("loud-float.wav", 48_000, 2, Kind::Float, 2.0);
-    let peak = peak(&from, &AtomicBool::new(false)).unwrap();
+    let peak = peak(&from, 48_000, &AtomicBool::new(false)).unwrap();
     assert!(peak > 1.5 && peak < 2.1, "{peak}");
     let gain = fit(peak).unwrap();
     let flac = run(&from, &target(Format::Flac));
@@ -428,6 +429,193 @@ fn a_float_file_past_full_scale_is_lowered_to_fit_whole_numbers_and_says_so() {
     for p in [&from, &flac, &wav] {
         fs::remove_file(p).unwrap();
     }
+}
+
+#[test]
+fn a_rate_picked_resamples_into_every_format_with_the_markers_moved_to_match() {
+    let from = tagged_wav("resample.wav", 48_000, 2, Kind::Int(24), 0.5);
+    let (original, ..) = frames(&from);
+    let mut made = Vec::new();
+    for (format, rate) in [
+        (Format::Wav, 44_100),
+        (Format::Aiff, 96_000),
+        (Format::Caf, 22_050),
+        (Format::Flac, 32_000),
+        (Format::M4a, 88_200),
+        (Format::Mka, 16_000),
+        (Format::Mp3, 44_100),
+        (Format::Ogg, 22_050),
+        (Format::Webm, 44_100),
+    ] {
+        let to = run(
+            &from,
+            &Target {
+                rate: Rate::Hz(rate),
+                ..target(format)
+            },
+        );
+        let (samples, channels, got) = frames(&to);
+        assert_eq!((got, channels), (rate, 2), "{format:?}");
+        // A second at the new rate, give or take what a lossy one runs over.
+        let length = samples.len() / channels;
+        let slack = if format.lossy() { 4096 } else { 0 };
+        assert!(
+            (rate as usize..=rate as usize + slack).contains(&length),
+            "{format:?}: {length}"
+        );
+        // The sweep is well under half of every new rate, so its level
+        // stays, as near as the format keeps it.
+        let (was, now) = (rms(&original), rms(&samples));
+        let near = if format.lossy() { 0.06 } else { 0.01 };
+        assert!((was - now).abs() / was < near, "{format:?}: {was} {now}");
+        let opened = audio::open(&to).unwrap();
+        let back = carry::read(&to, &opened).unwrap().markers;
+        let moved: Vec<usize> = markers()
+            .iter()
+            .map(|m| m.frame * rate as usize / 48_000)
+            .collect();
+        assert_eq!(back.len(), moved.len(), "{format:?}");
+        for (b, m) in back.iter().zip(moved) {
+            assert!(
+                b.frame.abs_diff(m) * 1000 <= rate as usize,
+                "{format:?}: {} {m}",
+                b.frame
+            );
+        }
+        made.push(to);
+    }
+    for p in made.iter().chain([&from]) {
+        fs::remove_file(p).unwrap();
+    }
+}
+
+#[test]
+fn a_rate_change_counts_every_chunk_s_samples_again_and_names_the_new_rate() {
+    let ixml = b"<BWFXML><SPEED><FILE_SAMPLE_RATE>48000</FILE_SAMPLE_RATE>\
+        <TIMESTAMP_SAMPLE_RATE>48000</TIMESTAMP_SAMPLE_RATE>\
+        <TIMESTAMP_SAMPLES_SINCE_MIDNIGHT_LO>96000</TIMESTAMP_SAMPLES_SINCE_MIDNIGHT_LO></SPEED>\
+        <BEXT><BWF_TIME_REFERENCE_LOW>77000</BWF_TIME_REFERENCE_LOW>\
+        <BWF_TIME_REFERENCE_HIGH>0</BWF_TIME_REFERENCE_HIGH></BEXT>\
+        <SYNC_POINT_LIST><SYNC_POINT_COUNT>1</SYNC_POINT_COUNT><SYNC_POINT>\
+        <SYNC_POINT_TYPE>RELATIVE</SYNC_POINT_TYPE><SYNC_POINT_LOW>24000</SYNC_POINT_LOW>\
+        <SYNC_POINT_HIGH>0</SYNC_POINT_HIGH><SYNC_POINT_EVENT_DURATION>9600</SYNC_POINT_EVENT_DURATION>\
+        </SYNC_POINT></SYNC_POINT_LIST></BWFXML>"
+        .to_vec();
+    let guano = b"GUANO|Version: 1.0\nSamplerate: 48000\nLength: 1.0\n".to_vec();
+    let (cue, adtl) = wav::mark_bodies(&markers(), &wav::StoredMarks::default());
+    let from = temp_file(
+        "rated.wav",
+        &wav_file(
+            48_000,
+            1,
+            Kind::Int(16),
+            &samples(48_000, 1, 48_000, 0.5),
+            &[(b"bext", bext("rain", 77_000))],
+            &[
+                (b"cue ", cue),
+                (b"LIST", adtl.unwrap()),
+                (b"iXML", ixml),
+                (b"guan", guano),
+            ],
+        ),
+    );
+    let at = |format| Target {
+        rate: Rate::Hz(44_100),
+        ..target(format)
+    };
+    // A WAV keeps the original's chunks, a FLAC them as foreign metadata,
+    // and an MP3 what they hold as fields.
+    let wav = run(&from, &at(Format::Wav));
+    let flac = run(&from, &at(Format::Flac));
+    let mp3 = run(&from, &at(Format::Mp3));
+    for to in [&wav, &flac, &mp3] {
+        let values = values(to);
+        let ixml = values.iter().find(|v| v.starts_with("<BWFXML>")).unwrap();
+        for counted in [
+            "<FILE_SAMPLE_RATE>44100<",
+            "<BWF_TIME_REFERENCE_LOW>70743<",
+            "<SYNC_POINT_LOW>22050<",
+            "<SYNC_POINT_EVENT_DURATION>8820<",
+            "<TIMESTAMP_SAMPLE_RATE>48000<",
+            "<TIMESTAMP_SAMPLES_SINCE_MIDNIGHT_LO>96000<",
+        ] {
+            assert!(ixml.contains(counted), "{to:?}: {counted} not in {ixml}");
+        }
+        for value in ["70743", "44100", "1.0"] {
+            assert!(
+                values.contains(&value.to_owned()),
+                "{to:?}: {value} in {values:?}"
+            );
+        }
+    }
+    for p in [&from, &wav, &flac, &mp3] {
+        fs::remove_file(p).unwrap();
+    }
+}
+
+#[test]
+fn a_recording_resampled_into_whole_numbers_is_lowered_where_it_would_clip() {
+    // A square wave at full scale overshoots between its samples once
+    // resampled, as a loud master does.
+    let rate = 44_100;
+    let s: Vec<f64> = (0..rate)
+        .flat_map(|i| {
+            let s = if i / 22 % 2 == 0 { 1.0 } else { -1.0 };
+            [s, s]
+        })
+        .collect();
+    let from = temp_file(
+        "square.wav",
+        &wav_file(rate as u32, 2, Kind::Int(16), &s, &[], &[]),
+    );
+    let flac = Target {
+        rate: Rate::Hz(48_000),
+        ..target(Format::Flac)
+    };
+    assert!(plan(&from, &flac).shape.needs_peak());
+    assert!(!plan(&from, &target(Format::Flac)).shape.needs_peak());
+    let gain = fit(peak(&from, 48_000, &AtomicBool::new(false)).unwrap()).unwrap();
+    assert!(gain < 0.99, "{gain}");
+    let to = run(&from, &flac);
+    let (got, ..) = frames(&to);
+    let loudest = got.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(loudest <= 1.0 && loudest > 0.99, "{loudest}");
+    assert!(values(&to).contains(&decibels(gain)));
+    for p in [&from, &to] {
+        fs::remove_file(p).unwrap();
+    }
+}
+
+#[test]
+fn a_rate_is_said_before_converting_and_one_a_format_lacks_is_brought_to_its_nearest() {
+    let header = |rate| Header {
+        rate,
+        channels: 2,
+        coding: Coding::Int(24),
+        ..Header::default()
+    };
+    let to = |format, rate| Target {
+        rate,
+        ..target(format)
+    };
+    let (planned, changes) = shape(&header(44_100), &to(Format::Flac, Rate::Hz(48_000))).unwrap();
+    assert_eq!(planned.rate, 48_000);
+    assert!(
+        changes.contains(&"48 kHz from 44.1 kHz".to_owned()),
+        "{changes:?}"
+    );
+    let (planned, changes) = shape(&header(44_100), &to(Format::Mp3, Rate::Hz(96_000))).unwrap();
+    assert_eq!(planned.rate, 48_000);
+    assert!(
+        changes.contains(&"48 kHz from 44.1 kHz (MP3 keeps 8 to 48 kHz, in steps)".to_owned()),
+        "{changes:?}"
+    );
+    let why = shape(&header(705_600), &to(Format::Flac, Rate::AsFile)).unwrap_err();
+    assert!(why.contains("pick a lower rate"), "{why}");
+    let (planned, _) = shape(&header(705_600), &to(Format::Flac, Rate::Hz(384_000))).unwrap();
+    assert_eq!(planned.rate, 384_000);
+    let (planned, changes) = shape(&header(48_000), &to(Format::Wav, Rate::Hz(48_000))).unwrap();
+    assert!(!planned.needs_peak() && changes.is_empty(), "{changes:?}");
 }
 
 #[test]

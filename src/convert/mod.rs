@@ -110,6 +110,17 @@ impl Format {
         !matches!(self, Self::Caf | Self::Webm)
     }
 
+    /// Whether a new file of the format can be at `rate`. What symphonia
+    /// reads of a FLAC sets FLAC's limit, as soundcheck opens one through it.
+    pub fn keeps_rate(self, rate: u32) -> bool {
+        match self {
+            Self::Mp3 => MP3_RATES.contains(&rate),
+            Self::Ogg | Self::Webm => rate <= VORBIS_MOST,
+            Self::Flac | Self::Mka => rate <= FLAC_MOST,
+            Self::Wav | Self::Aiff | Self::Caf | Self::M4a => true,
+        }
+    }
+
     /// The most channels it holds.
     fn most_channels(self) -> usize {
         match self {
@@ -176,6 +187,31 @@ impl Mp3 {
     }
 }
 
+/// The rate the new file is at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Rate {
+    /// The original's, or the nearest an MP3 or a Vorbis stream keeps.
+    #[default]
+    AsFile,
+    Hz(u32),
+}
+
+impl Rate {
+    /// The rates to pick from, as recorders, players and bat detectors use
+    /// them.
+    pub const OFFERED: [u32; 15] = [
+        8_000, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000,
+        250_000, 256_000, 384_000, 500_000,
+    ];
+
+    pub fn name(self) -> String {
+        match self {
+            Self::AsFile => "As the file".into(),
+            Self::Hz(rate) => khz(rate),
+        }
+    }
+}
+
 /// libvorbis's quality scale, as its usual steps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Vorbis {
@@ -210,8 +246,8 @@ impl Vorbis {
     }
 }
 
-/// What to convert to: the format, and the one setting that matters for
-/// it, the others kept for when the format changes back.
+/// What to convert to: the format, the one setting that matters for it,
+/// the others kept for when the format changes back, and the rate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Target {
@@ -219,6 +255,7 @@ pub struct Target {
     pub depth: Depth,
     pub mp3: Mp3,
     pub vorbis: Vorbis,
+    pub rate: Rate,
 }
 
 impl Default for Target {
@@ -228,6 +265,7 @@ impl Default for Target {
             depth: Depth::AsFile,
             mp3: Mp3::V0,
             vorbis: Vorbis::Q6,
+            rate: Rate::AsFile,
         }
     }
 }
@@ -273,15 +311,18 @@ pub struct Shape {
     pub rate: u32,
     pub channels: usize,
     pub sample: Sample,
-    /// How the original keeps its samples.
+    /// How the original keeps its samples, and at what rate.
     pub from: Coding,
+    pub from_rate: u32,
 }
 
 impl Shape {
     /// Whether making whole numbers of the original's samples can need its
-    /// level lowered: a float or a lossy decode can run past full scale.
+    /// level lowered: a float or a lossy decode can run past full scale,
+    /// and so can a resampled recording, between the original's samples.
     pub fn needs_peak(&self) -> bool {
-        matches!(self.sample, Sample::Int(_)) && !matches!(self.from, Coding::Int(_))
+        matches!(self.sample, Sample::Int(_))
+            && (!matches!(self.from, Coding::Int(_)) || self.rate != self.from_rate)
     }
 }
 
@@ -296,6 +337,9 @@ pub struct Plan {
     /// What will change, said before anything is made: another rate or
     /// depth, and whatever the format has no place for.
     pub changes: Vec<String>,
+    /// The original goes to the Trash once the new file is checked. A new
+    /// file of the original's format then takes its name.
+    pub replaces: bool,
 }
 
 /// The new file's shape for an original with `header`, or why there can be
@@ -310,21 +354,29 @@ pub fn shape(header: &Header, target: &Target) -> Result<(Shape, Vec<String>), S
             header.channels
         ));
     }
-    // What symphonia reads of a FLAC, which soundcheck opens one through.
-    if matches!(format, Format::Flac | Format::Mka) && header.rate > 655_350 {
+    let wanted = match target.rate {
+        Rate::AsFile => header.rate,
+        Rate::Hz(rate) => rate,
+    };
+    if matches!(format, Format::Flac | Format::Mka) && !format.keeps_rate(wanted) {
         return Err(format!(
-            "FLAC keeps rates up to 655.35 kHz; this file is {}: WAV, CAF or M4A keep it",
-            khz(header.rate)
+            "FLAC keeps rates up to 655.35 kHz; this file is {}: pick a lower rate, or WAV, CAF or M4A keep it",
+            khz(wanted)
         ));
     }
     let mut changes = Vec::new();
     let (rate, why) = match format {
-        Format::Mp3 => (mp3_rate(header.rate), "MP3 keeps 8 to 48 kHz, in steps"),
-        Format::Ogg | Format::Webm => (vorbis_rate(header.rate), "Vorbis keeps up to 200 kHz"),
-        _ => (header.rate, ""),
+        Format::Mp3 => (mp3_rate(wanted), "MP3 keeps 8 to 48 kHz, in steps"),
+        Format::Ogg | Format::Webm => (vorbis_rate(wanted), "Vorbis keeps up to 200 kHz"),
+        _ => (wanted, ""),
     };
     if rate != header.rate {
-        changes.push(format!("{} from {} ({why})", khz(rate), khz(header.rate)));
+        let why = if rate == wanted {
+            String::new()
+        } else {
+            format!(" ({why})")
+        };
+        changes.push(format!("{} from {}{why}", khz(rate), khz(header.rate)));
     }
     let sample = if format.lossy() {
         Sample::Float
@@ -400,6 +452,7 @@ pub fn shape(header: &Header, target: &Target) -> Result<(Shape, Vec<String>), S
             channels: header.channels,
             sample,
             from: header.coding,
+            from_rate: header.rate,
         },
         changes,
     ))
@@ -409,6 +462,12 @@ pub fn shape(header: &Header, target: &Target) -> Result<(Shape, Vec<String>), S
 const MP3_RATES: [u32; 9] = [
     8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000,
 ];
+
+/// The fastest rate libvorbis takes.
+const VORBIS_MOST: u32 = 200_000;
+
+/// The fastest rate symphonia reads a FLAC at.
+const FLAC_MOST: u32 = 655_350;
 
 /// The rate an MP3 of a `rate` original is written at: its own where MP3
 /// has it, the next one up below 48 kHz, and past that whichever of 44.1
@@ -425,7 +484,7 @@ fn mp3_rate(rate: u32) -> u32 {
 /// keeps what is heard and a little more, and the ratio simple.
 fn vorbis_rate(rate: u32) -> u32 {
     let mut r = rate;
-    while r > 200_000 {
+    while r > VORBIS_MOST {
         r /= 2;
     }
     r
@@ -457,27 +516,53 @@ pub fn path_for(from: &Path, format: Format, taken: &HashSet<PathBuf>) -> PathBu
         .expect("some number is free")
 }
 
-/// The level a file peaks at: the largest sample, at full scale 1.
-pub fn peak(path: &Path, cancel: &AtomicBool) -> Result<f32, String> {
+/// The level a file peaks at, at full scale 1: its largest sample, or
+/// resampled to `rate` where that is another, the largest the resampler
+/// gives.
+pub fn peak(path: &Path, rate: u32, cancel: &AtomicBool) -> Result<f32, String> {
     let opened = audio::open(path)?;
+    let mut resampler = (rate != opened.info.sample_rate)
+        .then(|| {
+            Resample::new(
+                opened.info.sample_rate,
+                rate,
+                usize::from(opened.info.channels),
+            )
+        })
+        .transpose()?;
     let mut input = Input::open(&opened)?;
+    let most = |peak: f32, samples: &[f32]| samples.iter().fold(peak, |p, s| p.max(s.abs()));
     let mut peak = 0.0f32;
-    let mut buffer = Vec::new();
+    let (mut buffer, mut floats, mut out) = (Vec::new(), Vec::new(), Vec::new());
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
         let Some(piece) = input.next(&mut buffer)? else {
-            return Ok(peak);
+            break;
         };
-        peak = match piece {
-            Piece::Float(samples) => samples.iter().fold(peak, |p, s| p.max(s.abs())),
-            Piece::Int(samples, bits) => {
-                let most = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-                peak.max(most as f32 / (1u64 << (bits - 1)) as f32)
-            }
+        let Some(resampler) = &mut resampler else {
+            peak = match piece {
+                Piece::Float(samples) => most(peak, samples),
+                Piece::Int(samples, bits) => {
+                    let top = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+                    peak.max(top as f32 / (1u64 << (bits - 1)) as f32)
+                }
+            };
+            continue;
         };
+        floats.clear();
+        piece.floats_onto(&mut floats);
+        out.clear();
+        resampler.push(&floats, &mut out)?;
+        peak = most(peak, &out);
     }
+    if let Some(resampler) = &mut resampler {
+        out.clear();
+        resampler.finish(&mut out)?;
+        peak = most(peak, &out);
+    }
+    Ok(peak)
 }
 
 /// The gain that brings a file peaking at `peak` down to full scale, as
@@ -492,7 +577,8 @@ pub fn decibels(gain: f32) -> String {
 
 /// Converts `plan`'s original to `target`, its level lowered by `gain` on
 /// the way, and puts the new file where the plan says or, if a file has
-/// taken that name since, under the next free one. Returns where it went.
+/// taken that name since, under the next free one, the original going to
+/// the Trash first where the plan replaces it. Returns where it went.
 pub fn convert(
     plan: &Plan,
     target: &Target,
@@ -509,6 +595,7 @@ pub fn convert(
     let temp = temp_path(&plan.to);
     // Only ever a conversion of ours that was cut off.
     let _ = fs::remove_file(&temp);
+    let mut discarded = false;
     let done = (|| {
         let written = write(
             &opened, &carried, plan, target, gain, &temp, cancel, progress,
@@ -518,13 +605,56 @@ pub fn convert(
         }
         verify(&temp, plan, target, &written, &carried, cancel, progress)?;
         keep_dates_and_finder_tags(&plan.from, &temp)?;
-        place(&temp, &plan.to)
+        if plan.replaces {
+            discard(&plan.from).map_err(|e| {
+                format!("the original could not go to the Trash, so it stays as it was and nothing was made: {e}")
+            })?;
+            discarded = true;
+        }
+        place(&temp, &plan.to).map_err(|e| {
+            if discarded {
+                format!(
+                    "{e}; the original is in the Trash, and the new file at {}",
+                    temp.display()
+                )
+            } else {
+                e
+            }
+        })
     })();
-    if done.is_err() {
+    // Once the original is in the Trash, the new file is the one copy
+    // outside it.
+    if done.is_err() && !discarded {
         let _ = fs::remove_file(&temp);
     }
     progress.store(1000, Ordering::Relaxed);
     done
+}
+
+/// Moves the original to the Trash, the Recycle Bin on Windows.
+#[cfg(not(test))]
+fn discard(path: &Path) -> Result<(), String> {
+    // Through Finder would take Apple Events, which macOS keeps from an app
+    // with the hardened runtime, as soundcheck is.
+    #[cfg(target_os = "macos")]
+    let bin = {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut bin = trash::TrashContext::new();
+        bin.set_delete_method(DeleteMethod::NsFileManager);
+        bin
+    };
+    #[cfg(not(target_os = "macos"))]
+    let bin = trash::TrashContext::new();
+    bin.delete(path).map_err(|e| e.to_string())
+}
+
+/// The tests' own Trash, beside their temporary files, so that running them
+/// fills nobody's.
+#[cfg(test)]
+fn discard(path: &Path) -> Result<(), String> {
+    let bin = std::env::temp_dir().join(format!("soundcheck-trash-{}", std::process::id()));
+    fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
+    fs::rename(path, bin.join(path.file_name().unwrap_or_default())).map_err(|e| e.to_string())
 }
 
 /// A hidden name in the same folder, keeping the new file's extension so
@@ -540,6 +670,19 @@ enum Piece<'a> {
     /// Whole numbers this many bits wide, read straight from a WAV.
     Int(&'a [i32], u32),
     Float(&'a [f32]),
+}
+
+impl Piece<'_> {
+    /// The samples as floats at full scale 1, onto the end of `out`.
+    fn floats_onto(&self, out: &mut Vec<f32>) {
+        match self {
+            Self::Int(samples, bits) => {
+                let scale = 1.0 / (1u64 << (bits - 1)) as f32;
+                out.extend(samples.iter().map(|&s| s as f32 * scale));
+            }
+            Self::Float(samples) => out.extend_from_slice(samples),
+        }
+    }
 }
 
 /// The original's samples, in pieces from the top: a WAV's whole numbers as
@@ -788,8 +931,8 @@ impl Hash {
 }
 
 /// Turns the original's samples into what the encoder takes: lowered to
-/// fit, resampled for a format that keeps no such rate, and made whole
-/// numbers, with dither wherever that drops bits the original had.
+/// fit, resampled where the rate changes, and made whole numbers, with
+/// dither wherever that drops bits the original had.
 struct Feed {
     channels: usize,
     sample: Sample,
@@ -840,6 +983,18 @@ impl Feed {
             Piece::Int(s, _) => s.len(),
             Piece::Float(s) => s.len(),
         } / self.channels;
+        if self.resampler.is_some() {
+            let mut floats = std::mem::take(&mut self.floats);
+            floats.clear();
+            piece.floats_onto(&mut floats);
+            let mut out = Vec::new();
+            if let Some(resampler) = &mut self.resampler {
+                resampler.push(&floats, &mut out)?;
+            }
+            self.floats = floats;
+            self.hand_resampled(&out, encoder)?;
+            return Ok(read);
+        }
         match (piece, self.sample) {
             (Piece::Int(samples, bits), Sample::Int(to)) => {
                 self.ints.clear();
@@ -855,26 +1010,16 @@ impl Feed {
                 }
                 self.hand_ints(to, encoder)?;
             }
-            (Piece::Int(samples, bits), Sample::Float) => {
-                let scale = 1.0 / (1u64 << (bits - 1)) as f32;
-                self.floats.clear();
-                self.floats
-                    .extend(samples.iter().map(|&s| s as f32 * scale));
-                let floats = std::mem::take(&mut self.floats);
+            (piece @ Piece::Int(..), Sample::Float) => {
+                let mut floats = std::mem::take(&mut self.floats);
+                floats.clear();
+                piece.floats_onto(&mut floats);
                 self.hand_floats(&floats, encoder)?;
                 self.floats = floats;
             }
             (Piece::Float(samples), Sample::Int(to)) => {
-                let full = (1u64 << (to - 1)) as f64;
-                let top = full as i64 - 1;
-                let gain = f64::from(self.gain);
                 let dither = to < self.precision || self.gain != 1.0;
-                self.ints.clear();
-                for &s in samples {
-                    let noise = if dither { self.dither.next() } else { 0.0 };
-                    let q = (f64::from(s) * gain * full + noise).round() as i64;
-                    self.ints.push(q.clamp(-top - 1, top) as i32);
-                }
+                self.quantize(samples, to, dither);
                 self.hand_ints(to, encoder)?;
             }
             (Piece::Float(samples), Sample::Float) => {
@@ -889,6 +1034,36 @@ impl Feed {
         Ok(read)
     }
 
+    /// Resampled samples as the new file keeps them. They fall between the
+    /// original's steps, so whole numbers of them always take dither.
+    fn hand_resampled(&mut self, samples: &[f32], encoder: &mut dyn Encode) -> Result<(), String> {
+        match self.sample {
+            Sample::Int(to) => {
+                self.quantize(samples, to, true);
+                self.hand_ints(to, encoder)
+            }
+            Sample::Float if self.gain == 1.0 => self.hand_floats(samples, encoder),
+            Sample::Float => {
+                let floats: Vec<f32> = samples.iter().map(|s| s * self.gain).collect();
+                self.hand_floats(&floats, encoder)
+            }
+        }
+    }
+
+    /// Floats at full scale 1, lowered by the gain, as whole numbers `to`
+    /// bits wide in `ints`.
+    fn quantize(&mut self, samples: &[f32], to: u32, dither: bool) {
+        let full = (1u64 << (to - 1)) as f64;
+        let top = full as i64 - 1;
+        let gain = f64::from(self.gain);
+        self.ints.clear();
+        for &s in samples {
+            let noise = if dither { self.dither.next() } else { 0.0 };
+            let q = (f64::from(s) * gain * full + noise).round() as i64;
+            self.ints.push(q.clamp(-top - 1, top) as i32);
+        }
+    }
+
     fn hand_ints(&mut self, bits: u32, encoder: &mut dyn Encode) -> Result<(), String> {
         if let Some(hash) = &mut self.hash {
             let scale = 1.0 / (1u64 << (bits - 1)) as f32;
@@ -900,14 +1075,6 @@ impl Feed {
     }
 
     fn hand_floats(&mut self, samples: &[f32], encoder: &mut dyn Encode) -> Result<(), String> {
-        let mut out = Vec::new();
-        let samples = match &mut self.resampler {
-            Some(resampler) => {
-                resampler.push(samples, &mut out)?;
-                &out[..]
-            }
-            None => samples,
-        };
         if let Some(hash) = &mut self.hash {
             hash.add(samples);
         }
@@ -916,13 +1083,13 @@ impl Feed {
     }
 
     fn finish(&mut self, encoder: &mut dyn Encode) -> Result<(), String> {
+        let mut out = Vec::new();
         if let Some(resampler) = &mut self.resampler {
-            let mut out = Vec::new();
             resampler.finish(&mut out)?;
-            self.frames += out.len() / self.channels;
-            encoder.push(Frames::Float(&out))?;
+        } else {
+            return Ok(());
         }
-        Ok(())
+        self.hand_resampled(&out, encoder)
     }
 }
 
@@ -945,9 +1112,9 @@ impl Dither {
     }
 }
 
-/// A sample rate change, for an MP3 or a Vorbis stream of a recording made
-/// at a rate it does not keep: the frames come out in step with the
-/// original's, with none lost at either end.
+/// A sample rate change, to the rate picked or one an MP3 or a Vorbis
+/// stream keeps: the frames come out in step with the original's, with
+/// none lost at either end.
 struct Resample {
     resampler: Fft<f32>,
     channels: usize,

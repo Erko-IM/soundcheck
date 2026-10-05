@@ -15,7 +15,7 @@ use std::time::SystemTime;
 use eframe::egui::{self, Color32, RichText, Ui, Vec2};
 use serde::{Deserialize, Serialize};
 
-use crate::convert::{self, Depth, Format, Header, Mp3, Plan, Target, Vorbis};
+use crate::convert::{self, Depth, Format, Header, Mp3, Plan, Rate, Target, Vorbis};
 use crate::explorer::{is_audio, natural};
 use crate::views;
 
@@ -30,6 +30,8 @@ pub struct Setup {
     pub target: Target,
     /// The files chosen in the explorer's folder, rather than the file open.
     pub folder: bool,
+    /// Each original goes to the Trash once its new file is checked.
+    pub replace: bool,
 }
 
 /// A file listed, with what converting it needs to know, once read.
@@ -55,6 +57,10 @@ enum Level {
 /// A file as the list shows it: its plan, or why there is none.
 type Row = (PathBuf, Result<Plan, String>);
 
+/// A file, and the rate its level is read at: the new file's, as a
+/// recording resampled can peak higher than it did.
+type LevelOf = (PathBuf, u32);
+
 /// The files converting, and how far each is, in thousandths.
 type UnderWay = Arc<Mutex<Vec<(PathBuf, Arc<AtomicU32>)>>>;
 
@@ -70,6 +76,7 @@ struct Job {
     total: usize,
     finished: usize,
     workers: Vec<JoinHandle<()>>,
+    replaces: bool,
 }
 
 impl Drop for Job {
@@ -100,9 +107,9 @@ pub struct Converter {
     reading: bool,
     tx: mpsc::Sender<Read>,
     rx: mpsc::Receiver<Read>,
-    levels: HashMap<PathBuf, (Option<SystemTime>, Level)>,
-    level_tx: mpsc::Sender<(PathBuf, Result<f32, String>)>,
-    level_rx: mpsc::Receiver<(PathBuf, Result<f32, String>)>,
+    levels: HashMap<LevelOf, (Option<SystemTime>, Level)>,
+    level_tx: mpsc::Sender<(LevelOf, Result<f32, String>)>,
+    level_rx: mpsc::Receiver<(LevelOf, Result<f32, String>)>,
     checking: bool,
     rows: Vec<Row>,
     planned_from: Option<Planned>,
@@ -111,6 +118,9 @@ pub struct Converter {
     message: Option<(String, bool)>,
     /// Folders new files went into since the window last asked.
     grown: HashSet<PathBuf>,
+    /// Originals gone to the Trash since the window last asked, with the
+    /// files that replace them.
+    replaced: Vec<(PathBuf, PathBuf)>,
 }
 
 impl Default for Converter {
@@ -138,6 +148,7 @@ impl Default for Converter {
             results: HashMap::new(),
             message: None,
             grown: HashSet::new(),
+            replaced: Vec::new(),
         }
     }
 }
@@ -187,13 +198,13 @@ impl Converter {
                 }
             }
         }
-        for (path, level) in self.level_rx.try_iter() {
-            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        for (of, level) in self.level_rx.try_iter() {
+            let modified = std::fs::metadata(&of.0).and_then(|m| m.modified()).ok();
             let level = match level {
                 Ok(peak) => Level::Peak(peak),
                 Err(e) => Level::Failed(e),
             };
-            self.levels.insert(path, (modified, level));
+            self.levels.insert(of, (modified, level));
         }
         if self.checking
             && !self
@@ -223,6 +234,12 @@ impl Converter {
         }
         self.take_finished(ctx);
         self.grown.drain().collect()
+    }
+
+    /// The originals gone to the Trash since the last call, each with the
+    /// file that replaces it.
+    pub fn replaced(&mut self) -> Vec<(PathBuf, PathBuf)> {
+        std::mem::take(&mut self.replaced)
     }
 
     /// Reads the folder again.
@@ -268,22 +285,36 @@ impl Converter {
         };
         for (from, result) in job.done.try_iter() {
             job.finished += 1;
-            if let Ok(to) = &result
-                && let Some(dir) = to.parent()
-            {
-                self.grown.insert(dir.to_owned());
+            if let Ok(to) = &result {
+                if let Some(dir) = to.parent() {
+                    self.grown.insert(dir.to_owned());
+                }
+                if job.replaces {
+                    self.replaced.push((from.clone(), to.clone()));
+                }
             }
             self.results.insert(from, result);
         }
         if job.finished < job.total {
             return;
         }
-        let cancelled = job.cancel.load(Ordering::Relaxed);
+        let (cancelled, replaced) = (job.cancel.load(Ordering::Relaxed), job.replaces);
         self.job = None;
+        if replaced {
+            // A file replaced under its own name is not one to convert again.
+            for (e, chosen) in self.files.iter().zip(&mut self.chosen) {
+                if self.results.get(&e.path).is_some_and(Result::is_ok) {
+                    *chosen = false;
+                }
+            }
+        }
         let made = self.results.values().filter(|r| r.is_ok()).count();
         let failed = self.results.values().filter(|r| r.is_err()).count();
         let files = |n: usize| if n == 1 { "file" } else { "files" };
         let mut text = format!("{made} {} converted", files(made));
+        if replaced && made > 0 {
+            text.push_str(", the originals in the Trash");
+        }
         if failed > 0 {
             text.push_str(&format!(", {failed} not: hover the red ones for why"));
         }
@@ -330,13 +361,22 @@ impl Converter {
             .map(|e| {
                 let plan = e.header.clone().and_then(|header| {
                     let (shape, changes) = convert::shape(&header, &target)?;
-                    let to = convert::path_for(&e.path, target.format, &taken);
+                    let same_format = e
+                        .path
+                        .extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case(target.format.extension()));
+                    let to = if self.setup.replace && same_format {
+                        e.path.clone()
+                    } else {
+                        convert::path_for(&e.path, target.format, &taken)
+                    };
                     taken.insert(to.clone());
                     Ok(Plan {
                         from: e.path.clone(),
                         to,
                         shape,
                         changes,
+                        replaces: self.setup.replace,
                     })
                 });
                 (e.path.clone(), plan)
@@ -350,34 +390,29 @@ impl Converter {
     /// Reads the level of each file listed that needs it and has none yet,
     /// on a thread of its own.
     fn check_levels(&mut self, ctx: &egui::Context) {
-        let wanted: Vec<(PathBuf, Option<SystemTime>)> = self
+        let wanted: Vec<(LevelOf, Option<SystemTime>)> = self
             .rows
             .iter()
             .filter_map(|(path, plan)| plan.as_ref().ok().map(|p| (path, p)))
             .filter(|(_, plan)| plan.shape.needs_peak())
-            .map(|(path, _)| {
+            .map(|(path, plan)| {
                 let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-                (path.clone(), modified)
+                ((path.clone(), plan.shape.rate), modified)
             })
-            .filter(|(path, modified)| {
-                self.levels
-                    .get(path)
-                    .is_none_or(|(when, _)| when != modified)
-            })
+            .filter(|(of, modified)| self.levels.get(of).is_none_or(|(when, _)| when != modified))
             .collect();
         if wanted.is_empty() {
             return;
         }
-        for (path, modified) in &wanted {
-            self.levels
-                .insert(path.clone(), (*modified, Level::Reading));
+        for (of, modified) in &wanted {
+            self.levels.insert(of.clone(), (*modified, Level::Reading));
         }
         self.checking = true;
         let (tx, ctx) = (self.level_tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            for (path, _) in wanted {
-                let peak = convert::peak(&path, &AtomicBool::new(false));
-                let _ = tx.send((path, peak));
+            for ((path, rate), _) in wanted {
+                let peak = convert::peak(&path, rate, &AtomicBool::new(false));
+                let _ = tx.send(((path, rate), peak));
                 ctx.request_repaint();
             }
         });
@@ -388,7 +423,7 @@ impl Converter {
         if !plan.shape.needs_peak() {
             return Some(None);
         }
-        match self.levels.get(&plan.from) {
+        match self.levels.get(&(plan.from.clone(), plan.shape.rate)) {
             Some((_, Level::Peak(peak))) => Some(convert::fit(*peak)),
             _ => None,
         }
@@ -445,7 +480,11 @@ impl Converter {
                             // A level not read yet is read now.
                             let gain = match gain {
                                 Some(gain) => gain,
-                                None => convert::fit(convert::peak(&plan.from, &cancel)?),
+                                None => convert::fit(convert::peak(
+                                    &plan.from,
+                                    plan.shape.rate,
+                                    &cancel,
+                                )?),
                             };
                             convert::convert(&plan, &target, gain, &cancel, &progress)
                         })
@@ -467,6 +506,7 @@ impl Converter {
             total,
             finished: 0,
             workers,
+            replaces: self.setup.replace,
         });
     }
 
@@ -499,6 +539,16 @@ impl Converter {
                     ui.label("To");
                     ui.horizontal(|ui| target_boxes(ui, &mut self.setup.target));
                     ui.end_row();
+                    ui.label("Rate");
+                    rate_box(ui, &mut self.setup.target);
+                    ui.end_row();
+                    ui.label("Original");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.setup.replace, false, "Keep it");
+                        ui.radio_value(&mut self.setup.replace, true, "Replace it")
+                            .on_hover_text("Each original goes to the Trash once its new file is made and checked; a new file in the original's own format takes its name");
+                    });
+                    ui.end_row();
                 });
         });
         self.replan(&ctx);
@@ -513,8 +563,16 @@ impl Converter {
                 }
             } else {
                 let label = format!("Convert {ready}");
+                let replacing_unsaved = self.setup.replace
+                    && dirty
+                    && self
+                        .rows
+                        .iter()
+                        .any(|(path, plan)| plan.is_ok() && Some(path.as_path()) == open);
                 let why = if locked {
                     Some("Not while a save is under way")
+                } else if replacing_unsaved {
+                    Some("Save or undo the file open's metadata changes first: replacing it would lose them")
                 } else if ready == 0 {
                     Some("Nothing to convert")
                 } else {
@@ -661,8 +719,15 @@ impl Converter {
         match plan {
             Ok(plan) => {
                 let mut notes = plan.changes.clone();
+                if plan.replaces {
+                    notes.push("the original goes to the Trash".into());
+                }
                 if plan.shape.needs_peak() {
-                    match self.levels.get(path).map(|(_, l)| l) {
+                    match self
+                        .levels
+                        .get(&(path.to_owned(), plan.shape.rate))
+                        .map(|(_, l)| l)
+                    {
                         Some(Level::Peak(peak)) => {
                             if let Some(gain) = convert::fit(*peak) {
                                 notes.push(format!(
@@ -805,6 +870,27 @@ fn target_boxes(ui: &mut Ui, target: &mut Target) {
     }
 }
 
+/// The rate box, with the rates the format picked keeps.
+fn rate_box(ui: &mut Ui, target: &mut Target) {
+    let format = target.format;
+    if let Rate::Hz(rate) = target.rate
+        && !format.keeps_rate(rate)
+    {
+        target.rate = Rate::AsFile;
+    }
+    egui::ComboBox::from_id_salt("convert-rate")
+        .width(110.0)
+        .selected_text(target.rate.name())
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut target.rate, Rate::AsFile, Rate::AsFile.name());
+            for rate in Rate::OFFERED.into_iter().filter(|&r| format.keeps_rate(r)) {
+                ui.selectable_value(&mut target.rate, Rate::Hz(rate), Rate::Hz(rate).name());
+            }
+        })
+        .response
+        .on_hover_text("As the file: the original's rate, or the nearest an MP3 or a Vorbis stream keeps. Another rate is resampled to, with the markers moved to match, and nothing above half the new rate kept; a recording that resampled would run past full scale in whole numbers is lowered to fit");
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -899,6 +985,7 @@ mod tests {
                     ..Target::default()
                 },
                 folder: true,
+                replace: false,
             },
             ..Converter::default()
         };
@@ -954,6 +1041,86 @@ mod tests {
             .map(|(e, _)| file_name(&e.path))
             .collect();
         assert_eq!(chosen, ["a.wav", "b.wav", "loud.wav"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replacing_puts_each_original_in_the_trash_and_its_new_file_in_its_place() {
+        let dir =
+            std::env::temp_dir().join(format!("soundcheck-convert-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (float, whole) = (dir.join("swap-float.wav"), dir.join("swap-whole.wav"));
+        wav(&float, 0.5, true);
+        wav(&whole, 0.5, false);
+        let ctx = egui::Context::default();
+        let mut converter = Converter {
+            setup: Setup {
+                target: Target {
+                    format: Format::Wav,
+                    depth: Depth::Int24,
+                    ..Target::default()
+                },
+                folder: true,
+                replace: true,
+            },
+            ..Converter::default()
+        };
+        until(&ctx, &mut converter, &dir, |c| {
+            !c.reading && c.files.len() == 2
+        });
+        until(&ctx, &mut converter, &dir, |c| {
+            !c.checking && !c.levels.is_empty()
+        });
+        converter.start(&ctx);
+        until(&ctx, &mut converter, &dir, |c| {
+            c.job.is_none() && !c.reading
+        });
+        assert!(
+            converter.results.values().all(Result::is_ok),
+            "{:?}",
+            converter.results
+        );
+        assert_eq!(
+            converter.message.as_ref().map(|(m, _)| m.as_str()),
+            Some("2 files converted, the originals in the Trash")
+        );
+        let mut replaced = converter.replaced();
+        replaced.sort();
+        assert_eq!(
+            replaced,
+            [
+                (float.clone(), float.clone()),
+                (whole.clone(), whole.clone())
+            ]
+        );
+        // Each new file has its original's name, and nothing else is there.
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["swap-float.wav", "swap-whole.wav"]);
+        until(&ctx, &mut converter, &dir, |c| c.files.len() == 2);
+        assert!(
+            converter.chosen.iter().all(|&c| !c),
+            "files replaced are not chosen again"
+        );
+        let kind = |p: &Path| {
+            crate::wav::parse(&mut std::fs::File::open(p).unwrap())
+                .unwrap()
+                .kind
+        };
+        let bin = std::env::temp_dir().join(format!("soundcheck-trash-{}", std::process::id()));
+        for (path, was) in [
+            (&float, crate::wav::SampleKind::F32),
+            (&whole, crate::wav::SampleKind::I16),
+        ] {
+            assert_eq!(kind(path), crate::wav::SampleKind::I24);
+            let original = bin.join(path.file_name().unwrap());
+            assert_eq!(kind(&original), was);
+            std::fs::remove_file(original).unwrap();
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

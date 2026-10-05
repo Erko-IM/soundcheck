@@ -3683,6 +3683,15 @@ impl eframe::App for App {
             if !grown.is_empty() && (self.settings.views.rename || self.rename_window) {
                 self.renamer.refresh(&ctx);
             }
+            // The file open went to the Trash: the one replacing it opens.
+            let replacing = self
+                .converter
+                .replaced()
+                .into_iter()
+                .find(|(from, _)| open.as_deref() == Some(from.as_path()));
+            if let Some((_, to)) = replacing {
+                self.request_open(&ctx, to);
+            }
         }
         self.input(&ctx);
         self.controls.clear();

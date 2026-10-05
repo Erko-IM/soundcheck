@@ -38,12 +38,33 @@ struct Entry {
     is_dir: bool,
 }
 
+/// Why a folder could not be read: short enough for a row, and in full.
+struct Unreadable {
+    label: &'static str,
+    why: String,
+}
+
+/// EPERM: what macOS refuses an app a folder with until its privacy
+/// settings let the app in, as they ask for Downloads, Desktop, Documents
+/// and cards.
+const NOT_PERMITTED: i32 = 1;
+
 /// Folders and audio files directly inside `dir`: folders first, then in
-/// file-manager order, dotfiles hidden. An unreadable folder lists as empty.
-fn list(dir: &Path) -> Vec<Entry> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
+/// file-manager order, dotfiles hidden. Or why it could not be read.
+fn list(dir: &Path) -> Result<Vec<Entry>, Unreadable> {
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        if cfg!(target_os = "macos") && e.raw_os_error() == Some(NOT_PERMITTED) {
+            Unreadable {
+                label: "Not allowed to read this folder",
+                why: "macOS keeps soundcheck out of it until soundcheck is turned on for it in System Settings, Privacy & Security, Files & Folders. It is read again on coming back to soundcheck".into(),
+            }
+        } else {
+            Unreadable {
+                label: "Can't read this folder",
+                why: e.to_string(),
+            }
+        }
+    })?;
     let mut listed: Vec<(String, Entry)> = entries
         .flatten()
         .filter_map(|e| {
@@ -68,7 +89,7 @@ fn list(dir: &Path) -> Vec<Entry> {
             .then_with(|| natural(a, b))
             .then_with(|| ea.name.cmp(&eb.name))
     });
-    listed.into_iter().map(|(_, entry)| entry).collect()
+    Ok(listed.into_iter().map(|(_, entry)| entry).collect())
 }
 
 /// Compares names the way file managers do: a run of digits by its value,
@@ -131,6 +152,10 @@ enum Row<'a> {
     Loading {
         depth: usize,
     },
+    Unreadable {
+        depth: usize,
+        why: &'a Unreadable,
+    },
 }
 
 enum Action {
@@ -161,7 +186,7 @@ pub struct Explorer {
     /// `None` is the list of drives on Windows, and nothing elsewhere.
     root: Option<PathBuf>,
     /// Folders read so far; `None` while a read is under way.
-    listings: HashMap<PathBuf, Option<Vec<Entry>>>,
+    listings: HashMap<PathBuf, Option<Result<Vec<Entry>, Unreadable>>>,
     open: HashSet<PathBuf>,
     /// The file open, or the folder the arrow keys last moved to.
     pub selected: Option<PathBuf>,
@@ -172,8 +197,8 @@ pub struct Explorer {
     /// How far down the rows were scrolled last frame, and how much of
     /// them showed.
     scrolled: (f32, f32),
-    tx: mpsc::Sender<(PathBuf, Vec<Entry>)>,
-    rx: mpsc::Receiver<(PathBuf, Vec<Entry>)>,
+    tx: mpsc::Sender<(PathBuf, Result<Vec<Entry>, Unreadable>)>,
+    rx: mpsc::Receiver<(PathBuf, Result<Vec<Entry>, Unreadable>)>,
     search: Search,
     /// The search's matches show in place of the tree.
     searching: bool,
@@ -184,6 +209,8 @@ pub struct Explorer {
     looking: bool,
     there_tx: mpsc::Sender<Vec<(PathBuf, bool)>>,
     there_rx: mpsc::Receiver<Vec<(PathBuf, bool)>>,
+    /// The window had the keyboard last frame.
+    focused: bool,
 }
 
 impl Default for Explorer {
@@ -207,6 +234,7 @@ impl Default for Explorer {
             looking: false,
             there_tx,
             there_rx,
+            focused: true,
         }
     }
 }
@@ -291,7 +319,7 @@ impl Explorer {
             .iter()
             .filter_map(|row| match row {
                 Row::Entry { entry, .. } => Some(*entry),
-                Row::Loading { .. } => None,
+                Row::Loading { .. } | Row::Unreadable { .. } => None,
             })
             .collect();
         let at = self
@@ -321,12 +349,21 @@ impl Explorer {
         rows: &mut Vec<Row<'a>>,
         unread: &mut Vec<PathBuf>,
     ) {
-        let Some(Some(entries)) = self.listings.get(dir) else {
-            if !self.listings.contains_key(dir) {
-                unread.push(dir.to_owned());
+        let entries = match self.listings.get(dir) {
+            Some(Some(Ok(entries))) => entries,
+            Some(Some(Err(why))) => {
+                rows.push(Row::Unreadable { depth, why });
+                return;
             }
-            rows.push(Row::Loading { depth });
-            return;
+            Some(None) => {
+                rows.push(Row::Loading { depth });
+                return;
+            }
+            None => {
+                unread.push(dir.to_owned());
+                rows.push(Row::Loading { depth });
+                return;
+            }
         };
         for entry in entries {
             let open = entry.is_dir && self.open.contains(&entry.path);
@@ -358,6 +395,14 @@ impl Explorer {
                 *slot = Some(entries);
             }
         }
+        // Back from answering macOS, or from its settings, a folder it kept
+        // soundcheck out of may be open to it now.
+        let focused = ui.input(|i| i.focused);
+        if focused && !self.focused {
+            self.listings
+                .retain(|_, listing| !matches!(listing, Some(Err(_))));
+        }
+        self.focused = focused;
         let Parts {
             mut shortcuts,
             search,
@@ -643,6 +688,12 @@ impl Explorer {
                         draw_row(ui, *depth, height, "Reading…", None, false, false);
                         continue;
                     }
+                    Row::Unreadable { depth, why } => {
+                        let (response, _) =
+                            draw_row(ui, *depth, height, why.label, None, false, true);
+                        response.on_hover_text(&why.why);
+                        continue;
+                    }
                 };
                 let toggle = entry.is_dir.then_some(open);
                 let chosen = selected == Some(entry.path.as_path());
@@ -919,8 +970,78 @@ mod tests {
         for name in ["ZOOM0010.WAV", "zoom0002.wav", "notes.txt", ".hidden.wav"] {
             std::fs::write(dir.join(name), b"").unwrap();
         }
-        let names: Vec<String> = list(&dir).into_iter().map(|e| e.name).collect();
+        let names: Vec<String> = list(&dir)
+            .ok()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(names, ["Day 9", "Day 10", "zoom0002.wav", "ZOOM0010.WAV"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_read_says_so_rather_than_showing_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("soundcheck-shut-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("take 1.wav"), b"").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let listed = list(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let Err(why) = listed else {
+            panic!("a folder shut to everyone listed as read");
+        };
+        assert_eq!(why.label, "Can't read this folder");
+        let mut explorer = Explorer::default();
+        explorer.set_root(&dir);
+        explorer.listings.insert(dir.clone(), Some(Err(why)));
+        let (rows, unread) = explorer.listed(&[]);
+        assert!(matches!(
+            rows.as_slice(),
+            [Row::Unreadable { depth: 0, .. }]
+        ));
+        assert!(unread.is_empty(), "it is not read again until reloaded");
+    }
+
+    #[test]
+    fn a_folder_kept_out_is_read_again_on_coming_back_to_the_window() {
+        let dir = std::env::temp_dir().join(format!("soundcheck-back-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut explorer = Explorer::default();
+        explorer.set_root(&dir);
+        let kept_out = Unreadable {
+            label: "Not allowed to read this folder",
+            why: String::new(),
+        };
+        explorer.listings.insert(dir.clone(), Some(Err(kept_out)));
+        let ctx = egui::Context::default();
+        for focused in [false, true] {
+            let input = egui::RawInput {
+                focused,
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                explorer.ui(
+                    ui,
+                    Parts {
+                        shortcuts: None,
+                        search: false,
+                    },
+                );
+            });
+            // No window to hand the fonts' texture to.
+            output.textures_delta.clear();
+            if !focused {
+                assert!(matches!(explorer.listings.get(&dir), Some(Some(Err(_)))));
+            }
+        }
+        assert!(
+            !matches!(explorer.listings.get(&dir), Some(Some(Err(_)))),
+            "it is read again"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

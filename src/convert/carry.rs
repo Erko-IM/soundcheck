@@ -70,6 +70,9 @@ const BWF_CODING_HISTORY: &str = "BWF_CODING_HISTORY";
 const BWF_UMID: &str = "BWF_UMID";
 const IXML: &str = "IXML";
 const GUANO: &str = "GUANO|";
+/// The rate GUANO says a recording was made at: the file's, or for a time
+/// expanded one the rate before.
+const GUANO_RATE: &str = "GUANO|Samplerate";
 /// The gain a conversion lowered a file by to fit whole numbers.
 const GAIN: &str = "SOUNDCHECK_GAIN";
 
@@ -194,6 +197,167 @@ fn digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// A WAV chunk of the original with what it counts in samples counted by
+/// `at` instead, and the rate it says the file is at as `rate`: the
+/// Broadcast WAV time reference, the cue points and the lengths of the
+/// stretches they start, a sampler's loops, iXML and GUANO. The rest of
+/// each stays as it was, byte for byte.
+fn chunk_at(id: &[u8; 4], body: &mut Vec<u8>, at: &impl Fn(u64) -> u64, rate: u32) {
+    let u32_at = |body: &mut [u8], offset: usize, to: &dyn Fn(u32) -> u32| {
+        if let Some(bytes) = body.get_mut(offset..offset + 4) {
+            let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            bytes.copy_from_slice(&to(n).to_le_bytes());
+        }
+    };
+    let scaled = |n: u32| u32::try_from(at(u64::from(n))).unwrap_or(u32::MAX);
+    match id {
+        b"bext" => {
+            if let Some(bytes) = body.get_mut(338..346) {
+                let mut reference = [0; 8];
+                reference.copy_from_slice(bytes);
+                bytes.copy_from_slice(&at(u64::from_le_bytes(reference)).to_le_bytes());
+            }
+        }
+        b"cue " => {
+            let points = body
+                .get(..4)
+                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            for point in 0..points as usize {
+                let start = 4 + point * 24;
+                // Its place in the play order, and in the samples.
+                u32_at(body, start + 4, &scaled);
+                u32_at(body, start + 20, &scaled);
+            }
+        }
+        b"LIST" if body.starts_with(b"adtl") => {
+            let mut at_sub = 4;
+            while at_sub + 8 <= body.len() {
+                let size = u32::from_le_bytes([
+                    body[at_sub + 4],
+                    body[at_sub + 5],
+                    body[at_sub + 6],
+                    body[at_sub + 7],
+                ]) as usize;
+                if &body[at_sub..at_sub + 4] == b"ltxt" {
+                    u32_at(body, at_sub + 12, &scaled);
+                }
+                at_sub += 8 + size + (size & 1);
+            }
+        }
+        b"smpl" => {
+            u32_at(body, 8, &|_| (1e9 / f64::from(rate)).round() as u32);
+            let loops = body
+                .get(28..32)
+                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            for n in 0..loops as usize {
+                let start = 36 + n * 24;
+                u32_at(body, start + 8, &scaled);
+                u32_at(body, start + 12, &scaled);
+            }
+        }
+        b"iXML" => {
+            if let Ok(text) = std::str::from_utf8(body) {
+                *body = ixml_at(text, at, rate).into_bytes();
+            }
+        }
+        b"guan" => {
+            if let Ok(text) = std::str::from_utf8(body) {
+                *body = guano_at(text, at).into_bytes();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// iXML with what it counts in samples counted by `at` instead: its sync
+/// points, the Broadcast WAV time reference it repeats, and the file's rate
+/// as `rate`. Its timestamp names the rate it counts at itself, so it
+/// stays, as does everything else, byte for byte.
+fn ixml_at(xml: &str, at: &impl Fn(u64) -> u64, rate: u32) -> String {
+    use crate::meta::{self, Element, Span};
+    let Some(root) = meta::parse_xml(xml) else {
+        return xml.to_owned();
+    };
+    let number = |e: Option<&Element>| {
+        let e = e?;
+        match &e.span {
+            Some(Span::Content(range)) => Some((e.text.trim().parse::<u64>().ok()?, range.clone())),
+            _ => None,
+        }
+    };
+    // A count kept as its low 32 bits and, beside them, its high ones.
+    let split = |low: Option<&Element>, high: Option<&Element>| {
+        let Some((low, low_at)) = number(low) else {
+            return Vec::new();
+        };
+        match number(high) {
+            Some((high, high_at)) => {
+                let n = at((high << 32) | low);
+                vec![
+                    (low_at, (n & 0xffff_ffff).to_string()),
+                    (high_at, (n >> 32).to_string()),
+                ]
+            }
+            None => {
+                let n = at(low);
+                if n <= u64::from(u32::MAX) {
+                    vec![(low_at, n.to_string())]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    };
+    let mut edits = Vec::new();
+    if let Some(bext) = root.child("BEXT") {
+        edits.extend(split(
+            bext.child("BWF_TIME_REFERENCE_LOW"),
+            bext.child("BWF_TIME_REFERENCE_HIGH"),
+        ));
+    }
+    if let Some(list) = root.child("SYNC_POINT_LIST") {
+        for point in list.children.iter().filter(|c| c.name == "SYNC_POINT") {
+            edits.extend(split(
+                point.child("SYNC_POINT_LOW"),
+                point.child("SYNC_POINT_HIGH"),
+            ));
+            if let Some((length, range)) = number(point.child("SYNC_POINT_EVENT_DURATION")) {
+                edits.push((range, at(length).to_string()));
+            }
+        }
+    }
+    if let Some((_, range)) = number(
+        root.child("SPEED")
+            .and_then(|s| s.child("FILE_SAMPLE_RATE")),
+    ) {
+        edits.push((range, rate.to_string()));
+    }
+    // From the end back, so the places still to change stay where they were.
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    let mut out = xml.to_owned();
+    for (range, text) in edits {
+        out.replace_range(range, &text);
+    }
+    out
+}
+
+/// GUANO's text with its Samplerate counted by `at` instead.
+fn guano_at(text: &str, at: &impl Fn(u64) -> u64) -> String {
+    let rate = &GUANO_RATE[GUANO.len()..];
+    text.split_inclusive('\n')
+        .map(|line| {
+            let (body, end) = line.split_at(line.trim_end_matches(['\r', '\n']).len());
+            match body.split_once(':') {
+                Some((key, value)) if key.trim() == rate => match value.trim().parse::<u64>() {
+                    Ok(n) => format!("{key}: {}{end}", at(n)),
+                    Err(_) => line.to_owned(),
+                },
+                _ => line.to_owned(),
+            }
+        })
+        .collect()
+}
+
 /// Whether a tag kept whole holds a field already, as reading it with
 /// `read` gives it.
 fn holds(read: impl FnOnce(&mut Carried)) -> impl Fn(&Field) -> bool {
@@ -265,23 +429,33 @@ impl Carried {
             .push(Field::custom(GAIN, super::decibels(gain), Origin::Other));
     }
 
-    /// Positions counted at `rate` instead, for a new file at that rate.
+    /// Positions counted at `rate` instead, for a new file at that rate:
+    /// the markers', and every count of samples the tags and the WAV chunks
+    /// keep, with the rate they say the file is at.
     pub fn rescale(&mut self, rate: u32) {
         if rate == self.rate || self.rate == 0 {
             return;
         }
-        let at =
-            |frames: usize| (frames as u128 * u128::from(rate) / u128::from(self.rate)) as usize;
+        let from = self.rate;
+        let at = |samples: u64| (u128::from(samples) * u128::from(rate) / u128::from(from)) as u64;
         for m in &mut self.markers {
-            m.frame = at(m.frame);
-            m.length = at(m.length);
+            m.frame = at(m.frame as u64) as usize;
+            m.length = at(m.length as u64) as usize;
         }
         for f in &mut self.fields {
-            if f.own_name() == BWF_TIME_REFERENCE
-                && let Ok(samples) = f.value.parse::<u64>()
-            {
-                f.value =
-                    (u128::from(samples) * u128::from(rate) / u128::from(self.rate)).to_string();
+            match f.own_name() {
+                BWF_TIME_REFERENCE | GUANO_RATE => {
+                    if let Ok(samples) = f.value.trim().parse::<u64>() {
+                        f.value = at(samples).to_string();
+                    }
+                }
+                IXML => f.value = ixml_at(&f.value, &at, rate),
+                _ => {}
+            }
+        }
+        if let Some(riff) = &mut self.riff {
+            for (id, body) in riff.before.iter_mut().chain(riff.after.iter_mut()) {
+                chunk_at(id, body, &at, rate);
             }
         }
         self.rate = rate;
