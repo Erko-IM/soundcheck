@@ -8,6 +8,15 @@
 # missing: rustup (except on Windows), the Rust version rust-toolchain.toml
 # names, and cargo-packager.
 #
+# `make ci` runs every check: formatting and lints, the tests on each kind of
+# machine a Mac reaches (Apple silicon, Intel under Rosetta, and Linux and the
+# Windows build's lints in the container), the dependencies against
+# deny.toml, the workflows and install.sh. `make hooks` has the git hook run,
+# before each push, the ones for what the push changes (lefthook.yml). Each
+# check installs what it takes that's missing, the same way: the tools in
+# mise.toml through mise, mise too, and on a Mac Rosetta, and Docker Desktop
+# started for the container.
+#
 # The dmg needs a Mac. The exe builds on Windows, Linux or a Mac, and the
 # Linux packages on Linux or a Mac. A Mac builds those two in a Linux
 # container, so Docker Desktop has to be running for them.
@@ -43,10 +52,10 @@ CARGO_BIN := $(or $(CARGO_HOME),$(HOME)/.cargo)/bin/
 export PATH := $(CARGO_BIN):$(PATH)
 endif
 
-.PHONY: check packager rust
+.PHONY: check fmt packager rust tools ci ci.rust ci.lint ci.deps ci.workflows ci.scripts ci.committed hooks
 
 ifeq ($(SYSTEM),macOS)
-.PHONY: app install dmg exe linux packages builder release
+.PHONY: app install dmg exe linux packages builder docker release ci.test.mac ci.test.linux ci.test.windows
 
 # A code-signing identity from your keychain to sign the app with, the same
 # for every build: one named soundcheck when the keychain has it. A
@@ -106,23 +115,49 @@ dmg: app
 	rm -rf target/dmg target/packages/soundcheck.app
 	@echo "built $(CURDIR)/soundcheck.dmg"
 
-# cargo-packager builds the Linux packages on Linux only, so these two run the
-# Linux targets below in a container from packaging/Dockerfile. Its Rust,
-# cargo-packager and build caches stay between runs in the Docker volume
-# soundcheck-build, rather than in the repo, where macOS's file times would
-# have part of the Windows build redone every time; `docker volume rm
-# soundcheck-build` clears them. A cache for each of the two, as they'd
-# rebuild much of a shared one for each other.
-exe linux: builder
+# cargo-packager builds the Linux packages on Linux only, so these run the
+# Linux targets below in a container from packaging/Dockerfile, as do the
+# checks on Linux and of the Windows build. Its Rust, cargo-packager and
+# build caches stay between runs in the Docker volume soundcheck-build,
+# rather than in the repo, where macOS's file times would have part of the
+# Windows build redone every time; `docker volume rm soundcheck-build` clears
+# them. A cache for each, as they'd rebuild much of a shared one for each
+# other.
+exe linux ci.test.linux ci.test.windows: builder
 	docker run --rm --volume "$(CURDIR)":/src --volume soundcheck-build:/build --workdir /src \
 		--env CARGO_HOME=/build/cargo --env RUSTUP_HOME=/build/rustup \
 		--env CARGO_TARGET_DIR=/build/$@ --env XDG_CACHE_HOME=/build/cache \
 		soundcheck-builder make $@
 
-builder:
+builder: docker
 	docker build --tag soundcheck-builder packaging
 
+# Docker Desktop, started if it isn't running, and waited for.
+docker:
+	@docker info >/dev/null 2>&1 && exit 0; \
+	test -d /Applications/Docker.app \
+		|| { echo "Docker Desktop is missing: https://www.docker.com/products/docker-desktop" >&2; exit 1; }; \
+	echo "starting Docker Desktop"; open -a Docker; \
+	for i in $$(seq 60); do sleep 1; docker info >/dev/null 2>&1 && exit 0; done; \
+	echo "Docker Desktop didn't start within a minute" >&2; exit 1
+
 packages: dmg exe linux
+
+# The tests on this Mac, and on Apple silicon the Intel build's too, under
+# Rosetta told to show AVX2 and the rest of its generation, which it hides
+# otherwise: so the second copies of the hot code (src/cpu.rs) run as well,
+# and SOUNDCHECK_V3 has a test fail if they don't.
+ci.test.mac: rust
+	$(CARGO_BIN)cargo test --locked
+ifeq ($(shell uname -m),arm64)
+	@arch -x86_64 /usr/bin/true 2>/dev/null || softwareupdate --install-rosetta --agree-to-license \
+		|| { echo "Rosetta didn't install: sudo softwareupdate --install-rosetta --agree-to-license" >&2; exit 1; }
+	@$(CARGO_BIN)rustup target list --installed | grep -qx x86_64-apple-darwin \
+		|| $(CARGO_BIN)rustup target add x86_64-apple-darwin
+	env SOUNDCHECK_V3=1 ROSETTA_ADVERTISE_AVX=1 $(CARGO_BIN)cargo test --locked --target x86_64-apple-darwin
+endif
+
+ci.rust: ci.lint ci.test.mac ci.test.linux ci.test.windows
 
 # Builds the four packages and publishes them as a GitHub release, which
 # install.sh and install.ps1 download from, named after the version in
@@ -188,6 +223,13 @@ install: export MSYS_NO_PATHCONV := 1
 install: exe
 	./soundcheck-setup.exe /S
 	@echo "installed soundcheck, it's in the Start menu"
+
+.PHONY: ci.test.windows
+ci.test.windows: rust
+	cargo clippy --all-targets --locked -- -D warnings
+	cargo test --locked
+
+ci.rust: ci.lint ci.test.windows
 endif
 
 ifeq ($(SYSTEM),Linux)
@@ -263,12 +305,83 @@ $(APPIMAGE_RUNTIME):
 # The same install as the one-line one, from the AppImage just built.
 install: linux
 	sh install.sh soundcheck.AppImage
+
+.PHONY: ci.test.linux ci.test.windows
+
+# The lints and tests on Linux. Under root, as in a Mac's container, the tests
+# run as an ordinary user, whom a folder shut to everyone keeps out.
+ci.test.linux: rust
+	$(CARGO_BIN)cargo clippy --all-targets --locked -- -D warnings
+ifeq ($(shell id -u),0)
+	@built=$$($(CARGO_BIN)cargo test --locked --no-run --message-format=json) || exit 1; \
+	tests=$$(printf '%s\n' "$$built" | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p'); \
+	test -n "$$tests" || { echo "no tests were built" >&2; exit 1; }; \
+	for t in $$tests; do su nobody -s /bin/sh -c "$$t" || exit 1; done
+else
+	$(CARGO_BIN)cargo test --locked
 endif
 
-check: rust
+# The Windows build's lints, through MinGW as `make exe` builds it. Its tests
+# run on Windows only, in the CI workflow.
+ci.test.windows: rust
+	@$(CARGO_BIN)rustup target list --installed | grep -qx x86_64-pc-windows-gnu \
+		|| $(CARGO_BIN)rustup target add x86_64-pc-windows-gnu
+	env MP3LAME_SYS_OVERRIDE_HOST=x86_64-w64-mingw32 \
+		$(CARGO_BIN)cargo clippy --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
+
+ci.rust: ci.lint ci.test.linux ci.test.windows
+endif
+
+# Each check is a target, run alike three ways: before a push by the git hook,
+# the ones for what the push changes (lefthook.yml); all at once by `make ci`;
+# and on each platform's own runner by the CI workflow, run by hand
+# (.github/workflows/ci.yml).
+
+# mise from the PATH, or where its installer puts it.
+MISE := $(or $(shell command -v mise),$(HOME)/.local/bin/mise)
+
+# The tools mise.toml names, mise itself first if it's missing: installed once,
+# and again whenever mise.toml changes a version.
+tools:
+	@command -v $(MISE) >/dev/null || curl -fsSL https://mise.run | sh
+	@$(MISE) trust -q
+	@$(MISE) install -q
+
+ci: ci.workflows ci.scripts ci.deps ci.rust
+
+ci.lint: rust
 	$(CARGO_BIN)cargo fmt --check
-	$(CARGO_BIN)cargo clippy --all-targets -- -D warnings
-	$(CARGO_BIN)cargo test
+	$(CARGO_BIN)cargo clippy --all-targets --locked -- -D warnings
+
+# What the dependencies may be, as deny.toml says, and none left unused.
+ci.deps: rust tools
+	$(MISE) x -- cargo deny check
+	$(MISE) x -- cargo machete
+
+ci.workflows: tools
+	$(MISE) x -- actionlint
+
+ci.scripts: tools
+	$(MISE) x -- shellcheck install.sh
+
+# A push is checked from the files here, so they have to be what it pushes:
+# nothing changed or added since the last commit.
+ci.committed:
+	@test -z "$$(git status --porcelain)" || { git status --short; \
+		echo "commit or stash those first, as the checks would test them rather than what's being pushed (LEFTHOOK=0 git push skips the checks)" >&2; \
+		exit 1; }
+
+# The git hook lefthook.yml describes, once per clone.
+hooks: tools
+	$(MISE) x -- lefthook install
+
+# The quick round while working: formatting, lints and this machine's tests.
+check: ci.lint
+	$(CARGO_BIN)cargo test --locked
+
+# The Rust formatted, as the git hook does before each commit.
+fmt: rust
+	$(CARGO_BIN)cargo fmt
 
 # Installed on first use, and again whenever PACKAGER_VERSION changes.
 packager: rust

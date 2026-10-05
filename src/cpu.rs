@@ -28,3 +28,24 @@ macro_rules! v3 {
     };
 }
 pub(crate) use v3;
+pub(crate) use v3;
+
+#[cfg(test)]
+mod tests {
+    /// Run with SOUNDCHECK_V3 set, the tests are on a processor meant to run
+    /// the second copies, as `make ci.test.mac` asks of Rosetta: finding it
+    /// lacks what they need, they'd all pass without running them.
+    #[test]
+    fn the_second_copies_run_where_they_are_meant_to() {
+        if std::env::var_os("SOUNDCHECK_V3").is_none() {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        assert!(
+            super::has_v3(),
+            "SOUNDCHECK_V3 is set, but this processor lacks AVX2, BMI1, BMI2, FMA, LZCNT, MOVBE or POPCNT"
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        panic!("SOUNDCHECK_V3 is set on a processor that isn't x86");
+    }
+}

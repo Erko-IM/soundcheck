@@ -1,8 +1,17 @@
-# The git hook `make hooks` installs: before each push, the checks for what
-# the push changes, as the make targets the CI workflow
-# (.github/workflows/ci.yml) runs too. `make ci` runs them all.
+# The git hooks `make hooks` installs. Before each commit, the Rust files it
+# takes in formatted, and taken in again as formatted, so a push never stops
+# on formatting. Before each push, the checks for what the push changes, as
+# the make targets the CI workflow (.github/workflows/ci.yml) runs too; `make
+# ci` runs them all.
 #
-# Skip them for one push with: LEFTHOOK=0 git push
+# Skip them once with: LEFTHOOK=0 git commit, or LEFTHOOK=0 git push
+
+pre-commit:
+  commands:
+    rustfmt:
+      glob: "*.rs"
+      run: make fmt
+      stage_fixed: true
 
 pre-push:
   # One at a time, each one's output as it comes, stopping at the first to

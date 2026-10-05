@@ -1,0 +1,64 @@
+# What the dependencies may be, as `cargo deny check` checks: `make ci.deps`
+# runs it, with `cargo machete` for any no longer used.
+
+[graph]
+# What soundcheck is built for, so a crate only another platform takes asks
+# for nothing.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+# RustSec's security advisories, and crates taken back from crates.io. One
+# no longer kept up counts where soundcheck takes it in itself: deeper down,
+# as egui's ttf-parser, it's for the crate taking it in to replace.
+yanked = "deny"
+unmaintained = "workspace"
+
+[licenses]
+# What GPL-3.0 takes in: LAME's LGPL, symphonia's MPL, the fonts egui draws
+# with, and permissive ones. soundcheck's own is left out, as it's private.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "LGPL-3.0-only",
+    "MIT",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+private = { ignore = true }
+
+# LAME's two crates name their license by an identifier SPDX has since
+# retired.
+[[licenses.clarify]]
+crate = "mp3lame-encoder"
+expression = "LGPL-3.0-only"
+license-files = []
+
+[[licenses.clarify]]
+crate = "mp3lame-sys"
+expression = "LGPL-3.0-only"
+license-files = []
+
+[bans]
+# Two versions of one crate cost build time, not correctness.
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
